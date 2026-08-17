@@ -11,6 +11,15 @@ import java.io.File
 
 class BloomLargeSquareWidgetProvider : AppWidgetProvider() {
     override fun onReceive(context: Context, intent: Intent) {
+        if (intent.getBooleanExtra(BLOOM_CAROUSEL_REFILL_EXTRA, false)) {
+            BloomCarouselSchedule.applyLatestDueEntry(context, intent)
+            val pending = goAsync()
+            super.onReceive(context, intent)
+            BloomFlutterSync.start(context, intent.getIntExtra("planId", -1)) {
+                pending.finish()
+            }
+            return
+        }
         if (intent.getBooleanExtra(BLOOM_CAROUSEL_ALARM_EXTRA, false)) {
             BloomCarouselSchedule.applyLatestDueEntry(context, intent)
         }

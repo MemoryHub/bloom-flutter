@@ -83,6 +83,8 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 }
             }
             "clearCarouselSchedule" -> {
+                val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                cancelRefillAlarm(alarmManager)
                 context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
                     .edit().putInt("scheduledCarouselPlanId", -1).apply()
                 result.success(null)
@@ -174,6 +176,10 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             if (widgetIds.isEmpty()) null else Triple(familyIndex, component, widgetIds)
         }
         val now = System.currentTimeMillis()
+        cancelRefillAlarm(alarmManager)
+        val futureEntries = (0 until entries.length())
+            .mapNotNull { entries.optJSONObject(it) }
+            .filter { it.optLong("displayAtMillis", 0L) > now + 5_000L }
         for (entryIndex in 0 until entries.length()) {
             val entry = entries.optJSONObject(entryIndex) ?: continue
             val itemId = entry.optInt("itemId", 0)
@@ -231,6 +237,63 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 }
             }
         }
+        // Ask the provider to start the Dart sync while one future item is
+        // still available. This mirrors the iOS refill boundary and avoids
+        // waiting for the final cached image before requesting a new batch.
+        // The provider-targeted broadcast can start even when MIUI rejects
+        // WorkManager's SystemJobService after the app was swiped away.
+        if (futureEntries.size >= 2 && widgetProviders.isNotEmpty()) {
+            val refillEntry = futureEntries[futureEntries.size - 2]
+            val (familyIndex, component, widgetIds) = widgetProviders.first()
+            val refillIntent = Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE)
+                .setComponent(component)
+                .putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, widgetIds)
+                .putExtra("bloomCarouselAlarm", true)
+                .putExtra("bloomCarouselRefill", true)
+                .putExtra("planId", planId)
+                .putExtra("itemId", refillEntry.optInt("itemId", 0))
+            val refillPending = PendingIntent.getBroadcast(
+                context,
+                REFILL_REQUEST_CODE,
+                refillIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            val refillAt = refillEntry.optLong("displayAtMillis", 0L)
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarmManager.canScheduleExactAlarms()) {
+                alarmManager.setExactAndAllowWhileIdle(
+                    AlarmManager.RTC_WAKEUP,
+                    refillAt,
+                    refillPending,
+                )
+            } else {
+                alarmManager.setAndAllowWhileIdle(
+                    AlarmManager.RTC_WAKEUP,
+                    refillAt,
+                    refillPending,
+                )
+            }
+            Log.i(TAG, "Scheduled provider refill plan=$planId item=${refillEntry.optInt("itemId", 0)} at=$refillAt family=$familyIndex")
+        }
+    }
+
+    private fun cancelRefillAlarm(alarmManager: AlarmManager) {
+        listOf(
+            "BloomPortraitWidgetProvider",
+            "BloomSquareWidgetProvider",
+            "BloomLargeSquareWidgetProvider",
+        ).forEach { className ->
+            val component = ComponentName(context.packageName, "${context.packageName}.$className")
+            val intent = Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE).setComponent(component)
+            PendingIntent.getBroadcast(
+                context,
+                REFILL_REQUEST_CODE,
+                intent,
+                PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE,
+            )?.let { pending ->
+                alarmManager.cancel(pending)
+                pending.cancel()
+            }
+        }
     }
 
     private fun refreshWidgets() {
@@ -250,5 +313,6 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     private companion object {
         const val TAG = "BloomCarousel"
+        const val REFILL_REQUEST_CODE = 0xB10
     }
 }
