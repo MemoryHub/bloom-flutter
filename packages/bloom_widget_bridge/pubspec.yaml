@@ -1,0 +1,19 @@
+name: bloom_widget_bridge
+description: Native bridge for Bloom widget cache and refresh.
+version: 0.0.1
+publish_to: none
+
+environment:
+  sdk: ^3.7.2
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.bloom.widget_bridge
+        pluginClass: BloomWidgetBridgePlugin
