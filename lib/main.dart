@@ -154,6 +154,27 @@ class _BloomHomePageState extends State<BloomHomePage> {
         }
         if (status?.hasAssets == true) {
           final repository = DailyContentRepository(api: _api);
+          // Show the last complete local render immediately. A carousel
+          // refresh may download and render up to four originals before it
+          // completes; the photo page should not remain behind a spinner
+          // during that network/CPU work.
+          final cachedBeforeSync = await repository.cachedContent();
+          final cachedPortraitBeforeSync = await repository.cached('portrait');
+          if (cachedBeforeSync != null &&
+              cachedPortraitBeforeSync != null &&
+              mounted) {
+            final cachedOriginal = await repository.originalPhotoPath();
+            setState(() {
+              _paired = true;
+              _portrait = cachedPortraitBeforeSync;
+              _content = cachedBeforeSync;
+              _originalPhotoPath = cachedOriginal;
+              _date = cachedBeforeSync.date;
+              _displaySettings = displaySettings;
+              _loading = false;
+              _message = null;
+            });
+          }
           try {
             content =
                 displaySettings.mode == BloomDisplayMode.carousel
