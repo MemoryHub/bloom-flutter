@@ -175,6 +175,43 @@ class _BloomHomePageState extends State<BloomHomePage> {
               _message = null;
             });
           }
+          // A widget alarm can advance the shared native cache while the
+          // carousel plan is still being downloaded. Seed the photo page from
+          // that newer native item immediately, instead of briefly showing
+          // the older daily.json image until the network/render pass finishes.
+          final nativeBeforeSync = await WidgetBridge().readCurrentState();
+          final nativeBeforePortrait = nativeBeforeSync?.portraitPath;
+          final nativeBeforeIsCurrent =
+              nativeBeforeSync != null &&
+              nativeBeforeSync.mode == 'carousel' &&
+              nativeBeforePortrait != null &&
+              await File(nativeBeforePortrait).exists() &&
+              (cachedBeforeSync == null ||
+                  nativeBeforeSync.recommendationId >=
+                      cachedBeforeSync.recommendationId);
+          if (nativeBeforeIsCurrent && mounted) {
+            final nativeBefore = nativeBeforeSync;
+            setState(() {
+              _portrait = CachedWidgetImage(
+                path: nativeBeforePortrait,
+                orientation: 'portrait',
+                date: nativeBefore.date,
+                recommendationId: nativeBefore.recommendationId,
+              );
+              _content = DailyContent(
+                date: nativeBefore.date ?? '',
+                recommendationId: nativeBefore.recommendationId,
+                captionZh: nativeBefore.captionZh,
+                captionEn: nativeBefore.captionEn,
+                capturedDateText: nativeBefore.capturedDateText,
+                locationText: nativeBefore.locationText,
+              );
+              _originalPhotoPath = nativeBefore.originalPhotoPath;
+              _date = nativeBefore.date;
+              _displaySettings = displaySettings;
+              _loading = false;
+            });
+          }
           try {
             content =
                 displaySettings.mode == BloomDisplayMode.carousel
