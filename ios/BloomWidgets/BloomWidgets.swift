@@ -269,11 +269,17 @@ private enum BloomWidgetRemoteLoader {
           let plan = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
       return nil
     }
-    let imageKey = family == "square" ? "squarePath" : "largeSquarePath"
     let now = Date()
     let resolved = plan.compactMap { item -> (Date, BloomEntry)? in
       guard let millis = (item["displayAtMillis"] as? NSNumber)?.doubleValue,
-            let path = item[imageKey] as? String,
+            // Host-app plans contain family-specific rendered paths, while
+            // plans refreshed by this extension contain the downloaded
+            // `photoPath`. Accept both formats so a network-refilled plan
+            // remains usable on the next WidgetKit timeline request.
+            let path = ((family == "square"
+              ? item["squarePath"]
+              : item["largeSquarePath"]) as? String)
+              ?? (item["photoPath"] as? String),
             FileManager.default.fileExists(atPath: path),
             let image = UIImage(contentsOfFile: path) else { return nil }
       let scheduled = Date(timeIntervalSince1970: millis / 1000)
@@ -294,9 +300,11 @@ private enum BloomWidgetRemoteLoader {
 
     let current = resolved.last { $0.0 <= now }
     let future = resolved.filter { $0.0 > now }
-    // Once every prefetched entry is due, fall back to the extension network
-    // loader so it can request the next batch.
-    guard !future.isEmpty else { return nil }
+    // Refill before the local timeline is exhausted. WidgetKit may delay a
+    // policy boundary while the phone is locked or under power management;
+    // asking for the next batch while one future item remains leaves a local
+    // fallback entry even if the network request takes a little longer.
+    guard future.count >= 2 else { return nil }
     var entries: [BloomEntry] = []
     if let current {
       entries.append(BloomEntry(
@@ -311,7 +319,8 @@ private enum BloomWidgetRemoteLoader {
     }
     entries.append(contentsOf: future.map { $0.1 })
     guard !entries.isEmpty else { return nil }
-    return (entries, normalizedNext(future.last?.0))
+    let refillAt = future[future.count - 2].0
+    return (entries, normalizedNext(refillAt))
   }
 
   private static func carouselTimeline(
