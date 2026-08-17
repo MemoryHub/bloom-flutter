@@ -289,10 +289,10 @@ private enum BloomWidgetRemoteLoader {
           date: scheduled,
           compositeImage: image,
           photoImage: nil,
-          captionZh: nil,
-          captionEn: nil,
-          capturedDateText: nil,
-          locationText: nil
+          captionZh: item["captionZh"] as? String,
+          captionEn: item["captionEn"] as? String,
+          capturedDateText: item["capturedDateText"] as? String,
+          locationText: item["locationText"] as? String
         )
       )
     }.sorted { $0.0 < $1.0 }
