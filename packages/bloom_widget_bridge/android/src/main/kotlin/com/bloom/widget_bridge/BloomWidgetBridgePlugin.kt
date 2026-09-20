@@ -16,6 +16,7 @@ import android.os.Build
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Calendar
 
 class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private lateinit var context: Context
@@ -237,13 +238,18 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 }
             }
         }
-        // Ask the provider to start the Dart sync while one future item is
-        // still available. This mirrors the iOS refill boundary and avoids
-        // waiting for the final cached image before requesting a new batch.
-        // The provider-targeted broadcast can start even when MIUI rejects
-        // WorkManager's SystemJobService after the app was swiped away.
-        if (futureEntries.size >= 2 && widgetProviders.isNotEmpty()) {
-            val refillEntry = futureEntries[futureEntries.size - 2]
+        // Ask the provider to refill before the cached plan is exhausted.
+        // Near the end of the active window the server may return fewer than
+        // four items, so a "second-to-last only" rule can leave no refill
+        // alarm at all. Use the final item when only one remains, and when no
+        // future item remains schedule a short in-window retry or the next
+        // configured active start.
+        if (widgetProviders.isNotEmpty()) {
+            val refillEntry = when {
+                futureEntries.size >= 2 -> futureEntries[futureEntries.size - 2]
+                futureEntries.size == 1 -> futureEntries.last()
+                else -> null
+            }
             val (familyIndex, component, widgetIds) = widgetProviders.first()
             val refillIntent = Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE)
                 .setComponent(component)
@@ -251,14 +257,15 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 .putExtra("bloomCarouselAlarm", true)
                 .putExtra("bloomCarouselRefill", true)
                 .putExtra("planId", planId)
-                .putExtra("itemId", refillEntry.optInt("itemId", 0))
+                .putExtra("itemId", refillEntry?.optInt("itemId", 0) ?: 0)
             val refillPending = PendingIntent.getBroadcast(
                 context,
                 REFILL_REQUEST_CODE,
                 refillIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
-            val refillAt = refillEntry.optLong("displayAtMillis", 0L)
+            val refillAt = refillEntry?.optLong("displayAtMillis", 0L)
+                ?: nextCarouselRecoveryAt(now)
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarmManager.canScheduleExactAlarms()) {
                 alarmManager.setExactAndAllowWhileIdle(
                     AlarmManager.RTC_WAKEUP,
@@ -272,8 +279,41 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     refillPending,
                 )
             }
-            Log.i(TAG, "Scheduled provider refill plan=$planId item=${refillEntry.optInt("itemId", 0)} at=$refillAt family=$familyIndex")
+            Log.i(TAG, "Scheduled provider refill plan=$planId item=${refillEntry?.optInt("itemId", 0) ?: 0} at=$refillAt family=$familyIndex")
         }
+    }
+
+    private fun nextCarouselRecoveryAt(now: Long): Long {
+        val settings = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+        val startMinutes = parseClockMinutes(
+            settings.getString("flutter.bloom.carousel_active_start", "06:00"),
+            6 * 60,
+        )
+        val endMinutes = parseClockMinutes(
+            settings.getString("flutter.bloom.carousel_active_end", "22:00"),
+            22 * 60,
+        )
+        val calendar = Calendar.getInstance().apply { timeInMillis = now }
+        val currentMinutes = calendar.get(Calendar.HOUR_OF_DAY) * 60 + calendar.get(Calendar.MINUTE)
+        if (currentMinutes in startMinutes until endMinutes) {
+            return now + 5 * 60_000L
+        }
+        if (currentMinutes >= endMinutes) {
+            calendar.add(Calendar.DAY_OF_YEAR, 1)
+        }
+        calendar.set(Calendar.HOUR_OF_DAY, startMinutes / 60)
+        calendar.set(Calendar.MINUTE, startMinutes % 60)
+        calendar.set(Calendar.SECOND, 0)
+        calendar.set(Calendar.MILLISECOND, 0)
+        return calendar.timeInMillis
+    }
+
+    private fun parseClockMinutes(value: String?, fallback: Int): Int {
+        val parts = value?.split(":") ?: return fallback
+        val hour = parts.getOrNull(0)?.toIntOrNull() ?: return fallback
+        val minute = parts.getOrNull(1)?.toIntOrNull() ?: return fallback
+        if (hour !in 0..23 || minute !in 0..59) return fallback
+        return hour * 60 + minute
     }
 
     private fun cancelRefillAlarm(alarmManager: AlarmManager) {

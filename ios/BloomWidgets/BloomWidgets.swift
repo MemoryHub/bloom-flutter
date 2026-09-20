@@ -121,14 +121,15 @@ private enum BloomWidgetNetworkError: Error {
 
 private enum BloomWidgetRemoteLoader {
   static func timeline(family: String) async -> ([BloomEntry], Date) {
-    let fallbackNext = Date().addingTimeInterval(30 * 60)
+    let missingCredentialsNext = Date().addingTimeInterval(30 * 60)
+    let networkRetryNext = Date().addingTimeInterval(5 * 60)
     guard
       let defaults = UserDefaults(suiteName: bloomAppGroup),
       let deviceID = defaults.string(forKey: "bloom.device_id"),
       let token = defaults.string(forKey: "bloom.device_token"),
       token.count >= 32
     else {
-      return ([cachedEntry(family: family)], fallbackNext)
+      return ([cachedEntry(family: family)], missingCredentialsNext)
     }
 
     let mode = defaults.string(forKey: "bloom.display_mode") ?? "recommendation"
@@ -163,7 +164,14 @@ private enum BloomWidgetRemoteLoader {
         defaults: defaults
       )
     } catch {
-      return ([cachedEntry(family: family)], fallbackNext)
+      // A timeline request can coincide with a temporary loss of network.
+      // Ask WidgetKit for another opportunity soon after connectivity is
+      // likely to have returned instead of leaving an exhausted carousel on
+      // screen for another half hour.
+      let next = mode == "carousel"
+        ? nextCarouselCheck(proposed: nil, defaults: defaults)
+        : networkRetryNext
+      return ([cachedEntry(family: family)], next)
     }
   }
 
@@ -271,24 +279,36 @@ private enum BloomWidgetRemoteLoader {
     }
     let now = Date()
     let resolved = plan.compactMap { item -> (Date, BloomEntry)? in
-      guard let millis = (item["displayAtMillis"] as? NSNumber)?.doubleValue,
-            // Host-app plans contain family-specific rendered paths, while
-            // plans refreshed by this extension contain the downloaded
-            // `photoPath`. Accept both formats so a network-refilled plan
-            // remains usable on the next WidgetKit timeline request.
-            let path = ((family == "square"
-              ? item["squarePath"]
-              : item["largeSquarePath"]) as? String)
-              ?? (item["photoPath"] as? String),
-            FileManager.default.fileExists(atPath: path),
-            let image = UIImage(contentsOfFile: path) else { return nil }
+      guard let millis = (item["displayAtMillis"] as? NSNumber)?.doubleValue else {
+        return nil
+      }
+      // Host-app paths are complete pre-rendered compositions. Extension
+      // `photoPath` values are raw photos and must still pass through the
+      // SwiftUI letter-paper layout. Treating both as `compositeImage` made
+      // captions disappear whenever a native plan was replayed from disk.
+      let compositePath = (family == "square"
+        ? item["squarePath"]
+        : item["largeSquarePath"]) as? String
+      let photoPath = item["photoPath"] as? String
+      let selected: (path: String, isComposite: Bool)?
+      if let compositePath,
+         FileManager.default.fileExists(atPath: compositePath) {
+        selected = (compositePath, true)
+      } else if let photoPath,
+                FileManager.default.fileExists(atPath: photoPath) {
+        selected = (photoPath, false)
+      } else {
+        selected = nil
+      }
+      guard let selected,
+            let image = UIImage(contentsOfFile: selected.path) else { return nil }
       let scheduled = Date(timeIntervalSince1970: millis / 1000)
       return (
         scheduled,
         BloomEntry(
           date: scheduled,
-          compositeImage: image,
-          photoImage: nil,
+          compositeImage: selected.isComposite ? image : nil,
+          photoImage: selected.isComposite ? nil : image,
           captionZh: item["captionZh"] as? String,
           captionEn: item["captionEn"] as? String,
           capturedDateText: item["capturedDateText"] as? String,
@@ -320,7 +340,7 @@ private enum BloomWidgetRemoteLoader {
     entries.append(contentsOf: future.map { $0.1 })
     guard !entries.isEmpty else { return nil }
     let refillAt = future[future.count - 2].0
-    return (entries, normalizedNext(refillAt))
+    return (entries, nextCarouselCheck(proposed: refillAt, defaults: defaults))
   }
 
   private static func carouselTimeline(
@@ -351,10 +371,14 @@ private enum BloomWidgetRemoteLoader {
     var entries: [BloomEntry] = []
     var sharedPlan: [[String: Any]] = []
     for item in payload.items {
-      let isCurrent = item.itemID == payload.currentItemID
       guard let displayAt = parseDate(item.displayAt),
-            isCurrent || displayAt > now.addingTimeInterval(-60),
             let photoPath = item.photo.postURL else { continue }
+      // Outside the active window the API may identify tomorrow's first item
+      // as `currentItemID`. It is still a future entry and must not replace
+      // tonight's final photo before its scheduled display time.
+      let isCurrent = item.itemID == payload.currentItemID &&
+        displayAt <= now.addingTimeInterval(60)
+      guard isCurrent || displayAt > now.addingTimeInterval(-60) else { continue }
       // A single unsupported/corrupt asset must not discard the rest of the
       // already-prefetchable timeline.
       do {
@@ -400,23 +424,38 @@ private enum BloomWidgetRemoteLoader {
         if let value = item.capturedDateText { sharedItem["capturedDateText"] = value }
         if let value = item.locationText { sharedItem["locationText"] = value }
         sharedPlan.append(sharedItem)
+        // Persist every usable item immediately. Widget extensions have a
+        // short execution budget and can be terminated between downloads;
+        // keeping partial progress prevents a successful first/second image
+        // from being discarded with the rest of the unfinished batch.
+        persistCarouselPlan(sharedPlan, defaults: defaults)
       } catch {
         continue
       }
     }
     guard !entries.isEmpty else { throw BloomWidgetNetworkError.invalidResponse }
-    if let planData = try? JSONSerialization.data(withJSONObject: sharedPlan),
-       let planString = String(data: planData, encoding: .utf8) {
-      defaults.set(planString, forKey: "iosCarouselPlan")
-      defaults.synchronize()
-    }
+    persistCarouselPlan(sharedPlan, defaults: defaults)
     entries.sort { $0.date < $1.date }
     // Refill while one prefetched entry is still available. WidgetKit may
     // delay networking, but the already-created timeline keeps switching.
-    let refill = entries.count >= 3
-      ? entries[entries.count - 2].date
-      : normalizedNext(parseDate(payload.nextCheckAt))
-    return (entries, normalizedNext(refill))
+    let refill: Date? = if entries.count >= 3 {
+      entries[entries.count - 2].date
+    } else if entries.count == 2 {
+      entries.last?.date
+    } else {
+      parseDate(payload.nextCheckAt)
+    }
+    return (entries, nextCarouselCheck(proposed: refill, defaults: defaults))
+  }
+
+  private static func persistCarouselPlan(
+    _ plan: [[String: Any]],
+    defaults: UserDefaults
+  ) {
+    guard let data = try? JSONSerialization.data(withJSONObject: plan),
+          let encoded = String(data: data, encoding: .utf8) else { return }
+    defaults.set(encoded, forKey: "iosCarouselPlan")
+    defaults.synchronize()
   }
 
   private static func entry(
@@ -571,6 +610,49 @@ private enum BloomWidgetRemoteLoader {
     let minimum = Date().addingTimeInterval(15 * 60)
     guard let proposed, proposed > minimum else { return minimum }
     return proposed
+  }
+
+  private static func nextCarouselCheck(
+    proposed: Date?,
+    defaults: UserDefaults
+  ) -> Date {
+    let now = Date()
+    let minimum = now.addingTimeInterval(5 * 60)
+    if let proposed, proposed > minimum { return proposed }
+
+    let start = clockMinutes(
+      defaults.string(forKey: "bloom.carousel_active_start") ?? "06:00",
+      fallback: 6 * 60
+    )
+    let end = clockMinutes(
+      defaults.string(forKey: "bloom.carousel_active_end") ?? "22:00",
+      fallback: 22 * 60
+    )
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
+    let parts = calendar.dateComponents([.hour, .minute], from: now)
+    let current = (parts.hour ?? 0) * 60 + (parts.minute ?? 0)
+    if current >= start && current < end { return minimum }
+
+    var startParts = calendar.dateComponents([.year, .month, .day], from: now)
+    startParts.hour = start / 60
+    startParts.minute = start % 60
+    startParts.second = 0
+    guard var nextStart = calendar.date(from: startParts) else { return minimum }
+    if current >= end || nextStart <= now {
+      nextStart = calendar.date(byAdding: .day, value: 1, to: nextStart) ?? minimum
+    }
+    return nextStart
+  }
+
+  private static func clockMinutes(_ value: String, fallback: Int) -> Int {
+    let pieces = value.split(separator: ":")
+    guard pieces.count == 2,
+          let hour = Int(pieces[0]), hour >= 0, hour <= 23,
+          let minute = Int(pieces[1]), minute >= 0, minute <= 59 else {
+      return fallback
+    }
+    return hour * 60 + minute
   }
 
   private static func pruneRemoteImages(in directory: URL, keeping: URL) {

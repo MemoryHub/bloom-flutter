@@ -399,6 +399,7 @@ class _BloomHomePageState extends State<BloomHomePage> {
     try {
       final settings = _displaySettings.copyWith(mode: mode);
       await _displayPreferences.write(settings);
+      if (Platform.isAndroid) await configureBackgroundSync(settings);
       if (!mounted) return;
       setState(() => _displaySettings = settings);
       await _load();
@@ -648,6 +649,7 @@ class _BloomHomePageState extends State<BloomHomePage> {
       return;
     }
     await _displayPreferences.write(result);
+    if (Platform.isAndroid) await configureBackgroundSync(result);
     if (!mounted) return;
     setState(() => _displaySettings = result);
     await HapticFeedback.mediumImpact();

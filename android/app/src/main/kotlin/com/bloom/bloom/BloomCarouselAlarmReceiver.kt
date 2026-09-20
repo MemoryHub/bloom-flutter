@@ -10,6 +10,17 @@ import org.json.JSONArray
 
 class BloomCarouselAlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == Intent.ACTION_MY_PACKAGE_REPLACED ||
+            intent.action == Intent.ACTION_BOOT_COMPLETED) {
+            // App upgrades and device reboots must rebuild the refill chain
+            // without waiting for the user to open Bloom. The persisted Dart
+            // callback and device credentials are enough for WorkManager to
+            // fetch/schedule the next plan once connectivity is available.
+            try {
+                BloomWidgetRefresh.prepareCarouselRecoveryAfterRestart(context)
+                BloomWidgetRefresh.enqueueRecoveryAfterRestart(context)
+            } catch (_: Exception) { }
+        }
         if (!BloomCarouselSchedule.applyLatestDueEntry(context, intent)) return
 
         val manager = AppWidgetManager.getInstance(context)

@@ -13,11 +13,8 @@ class BloomSquareWidgetProvider : AppWidgetProvider() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.getBooleanExtra(BLOOM_CAROUSEL_REFILL_EXTRA, false)) {
             BloomCarouselSchedule.applyLatestDueEntry(context, intent)
-            val pending = goAsync()
             super.onReceive(context, intent)
-            BloomFlutterSync.start(context, intent.getIntExtra("planId", -1)) {
-                pending.finish()
-            }
+            try { BloomWidgetRefresh.enqueueRecovery(context) } catch (_: Exception) { }
             return
         }
         if (intent.getBooleanExtra(BLOOM_CAROUSEL_ALARM_EXTRA, false)) {

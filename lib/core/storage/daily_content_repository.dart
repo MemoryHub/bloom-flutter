@@ -1,6 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import '../api/bloom_api_client.dart';
 import '../models/device_models.dart';
 import '../../platform/widget_bridge.dart';
@@ -177,15 +177,33 @@ class DailyContentRepository {
       // WorkManager and the foreground app can wake at the same time. Let the
       // existing owner finish rather than downloading and rendering the same
       // four large photos in two Flutter engines.
+      var removedStaleLock = false;
       for (var attempt = 0; attempt < 180 && await lock.exists(); attempt++) {
         final age = DateTime.now().difference((await lock.stat()).modified);
         if (age > const Duration(minutes: 3)) {
           try {
             await lock.delete();
+            removedStaleLock = true;
           } catch (_) {}
           break;
         }
         await Future<void>.delayed(const Duration(milliseconds: 500));
+      }
+      // The previous process may have been killed while downloading a batch.
+      // Deleting its stale lock and then returning the old cache reports a
+      // false success to WorkManager and can leave the carousel stuck. Take
+      // ownership again and perform the sync for real.
+      if (removedStaleLock) {
+        return _syncCarouselPlan(credentials, settings);
+      }
+      // The other task did not finish within the wait window. Returning the
+      // previous cache here reports SUCCESS to WorkManager even though no new
+      // plan was downloaded, so the stale lock can leave the widget frozen
+      // indefinitely. Fail this attempt and let WorkManager retry; a later
+      // attempt will either observe the real owner finishing or remove the
+      // lock once it passes the stale threshold above.
+      if (await lock.exists()) {
+        throw StateError('轮播计划同步仍在进行，等待后台重试');
       }
       final cached = await cachedContent();
       if (cached != null) return cached;
@@ -197,6 +215,7 @@ class DailyContentRepository {
         credentials,
         settings,
         dir,
+        lock,
       );
     } finally {
       if (ownsLock && await lock.exists()) {
@@ -211,55 +230,132 @@ class DailyContentRepository {
     DeviceCredentials credentials,
     BloomDisplaySettings settings,
     Directory dir,
+    File lock,
   ) async {
     final plan = await api.carouselPlan(credentials, settings);
     if (plan.items.isEmpty) throw StateError('轮播计划为空');
+    debugPrint(
+      '[BloomSync] carousel plan=${plan.planId} items=${plan.items.length} '
+      'current=${plan.currentItemId}',
+    );
     final scheduledEntries = <Map<String, Object?>>[];
     DailyContent? currentManifest;
-    String? currentEtag;
     Uint8List? currentPhotoBytes;
 
     for (final item in plan.items) {
-      final response = await api.carouselPhoto(credentials, item.itemId);
-      if (response.statusCode != 200) {
-        throw StateError('轮播计划照片下载失败');
-      }
-      final photoBytes = response.bodyBytes;
-      final manifest = item.asDailyContent();
-      final originalPath = '${dir.path}/carousel-original-${item.itemId}.photo';
-      final originalTemp = File('$originalPath.tmp');
-      await originalTemp.writeAsBytes(photoBytes, flush: true);
-      await originalTemp.rename(originalPath);
-      final paths = <String, String>{};
-      for (final family in ['portrait', 'square', 'largeSquare']) {
-        final output = _versionedImage(dir, family, item.itemId);
-        final rendered = await MobileLetterRenderer.render(
-          photoBytes,
-          manifest,
-          family,
+      try {
+        final manifest = item.asDailyContent();
+        final originalPath =
+            '${dir.path}/carousel-original-${item.itemId}.photo';
+        final original = File(originalPath);
+        final outputs = <String, File>{
+          for (final family in ['portrait', 'square', 'largeSquare'])
+            family: _versionedImage(dir, family, item.itemId),
+        };
+        Uint8List photoBytes;
+        String? itemEtag;
+        if (await original.exists()) {
+          photoBytes = await original.readAsBytes();
+          debugPrint('[BloomSync] reusing cached photo item=${item.itemId}');
+        } else {
+          debugPrint('[BloomSync] downloading photo item=${item.itemId}');
+          final response = await api.carouselPhoto(credentials, item.itemId);
+          if (response.statusCode != 200) {
+            throw StateError('轮播计划照片下载失败');
+          }
+          photoBytes = response.bodyBytes;
+          itemEtag = response.headers['etag'];
+          final originalTemp = File('$originalPath.tmp');
+          await originalTemp.writeAsBytes(photoBytes, flush: true);
+          await originalTemp.rename(originalPath);
+        }
+        final paths = <String, String>{};
+        for (final family in ['portrait', 'square', 'largeSquare']) {
+          final output = outputs[family]!;
+          if (!await output.exists()) {
+            final rendered = await MobileLetterRenderer.render(
+              photoBytes,
+              manifest,
+              family,
+            );
+            final temp = File('${output.path}.tmp');
+            await temp.writeAsBytes(rendered, flush: true);
+            await temp.rename(output.path);
+          }
+          paths[family] = output.path;
+        }
+        scheduledEntries.add({
+          'itemId': item.itemId,
+          'displayAtMillis': item.displayAt.toLocal().millisecondsSinceEpoch,
+          'date': manifest.date,
+          'portraitPath': paths['portrait']!,
+          'squarePath': paths['square']!,
+          'largeSquarePath': paths['largeSquare']!,
+          'originalPhotoPath': originalPath,
+          'captionZh': manifest.captionZh,
+          'captionEn': manifest.captionEn,
+          'capturedDateText': manifest.capturedDateText,
+          'locationText': manifest.locationText,
+        });
+        if (item.itemId == plan.currentItemId) {
+          currentManifest = manifest;
+          currentPhotoBytes = photoBytes;
+          final photoFile = File('${dir.path}/original.photo');
+          final photoTemp = File('${photoFile.path}.tmp');
+          await photoTemp.writeAsBytes(photoBytes, flush: true);
+          await photoTemp.rename(photoFile.path);
+          await File('${dir.path}/daily.json').writeAsString(
+            jsonEncode({
+              'mode': 'carousel',
+              'photo_etag': itemEtag,
+              'date': manifest.date,
+              'recommendation_id': manifest.recommendationId,
+              'carousel_item_id': plan.currentItemId,
+              'carousel_plan_id': plan.planId,
+              'next_check_at': plan.nextCheckAt.toIso8601String(),
+              'caption_zh': manifest.captionZh,
+              'caption_en': manifest.captionEn,
+              'captured_date_text': manifest.capturedDateText,
+              'location_text': manifest.locationText,
+              'photo_orientation': manifest.photoOrientation,
+            }),
+            flush: true,
+          );
+          // Publish the current item immediately. If a later prefetch item is
+          // slow, the widget still advances instead of discarding the batch.
+          await WidgetBridge().update(
+            portraitPath: paths['portrait']!,
+            squarePath: paths['square']!,
+            largeSquarePath: paths['largeSquare']!,
+            date: manifest.date,
+            recommendationId: manifest.recommendationId,
+            originalPhotoPath: originalPath,
+            captionZh: manifest.captionZh,
+            captionEn: manifest.captionEn,
+            capturedDateText: manifest.capturedDateText,
+            locationText: manifest.locationText,
+            mode: 'carousel',
+          );
+        }
+
+        // Persist a usable partial timeline after every completed item. A
+        // later timeout can resume from cache without losing earlier work.
+        await WidgetBridge().scheduleCarousel(
+          planId: plan.planId,
+          entries: scheduledEntries,
         );
-        final temp = File('${output.path}.tmp');
-        await temp.writeAsBytes(rendered, flush: true);
-        await temp.rename(output.path);
-        paths[family] = output.path;
-      }
-      scheduledEntries.add({
-        'itemId': item.itemId,
-        'displayAtMillis': item.displayAt.toLocal().millisecondsSinceEpoch,
-        'date': manifest.date,
-        'portraitPath': paths['portrait']!,
-        'squarePath': paths['square']!,
-        'largeSquarePath': paths['largeSquare']!,
-        'originalPhotoPath': originalPath,
-        'captionZh': manifest.captionZh,
-        'captionEn': manifest.captionEn,
-        'capturedDateText': manifest.capturedDateText,
-        'locationText': manifest.locationText,
-      });
-      if (item.itemId == plan.currentItemId) {
-        currentManifest = manifest;
-        currentEtag = response.headers['etag'];
-        currentPhotoBytes = photoBytes;
+        try {
+          await lock.setLastModified(DateTime.now());
+        } catch (_) {}
+        debugPrint('[BloomSync] prepared photo item=${item.itemId}');
+      } catch (error) {
+        if (item.itemId == plan.currentItemId) rethrow;
+        // A broken future asset must not invalidate the current photo and all
+        // previously prepared slots. The final partial schedule will request
+        // another batch at its last usable entry.
+        debugPrint(
+          '[BloomSync] skipping future photo item=${item.itemId}: $error',
+        );
       }
     }
 
@@ -267,27 +363,6 @@ class DailyContentRepository {
     if (manifest == null || currentPhotoBytes == null) {
       throw StateError('当前轮播照片不在计划批次中');
     }
-    final photoFile = File('${dir.path}/original.photo');
-    final photoTemp = File('${photoFile.path}.tmp');
-    await photoTemp.writeAsBytes(currentPhotoBytes, flush: true);
-    await photoTemp.rename(photoFile.path);
-    await File('${dir.path}/daily.json').writeAsString(
-      jsonEncode({
-        'mode': 'carousel',
-        'photo_etag': currentEtag,
-        'date': manifest.date,
-        'recommendation_id': manifest.recommendationId,
-        'carousel_item_id': plan.currentItemId,
-        'carousel_plan_id': plan.planId,
-        'next_check_at': plan.nextCheckAt.toIso8601String(),
-        'caption_zh': manifest.captionZh,
-        'caption_en': manifest.captionEn,
-        'captured_date_text': manifest.capturedDateText,
-        'location_text': manifest.locationText,
-        'photo_orientation': manifest.photoOrientation,
-      }),
-      flush: true,
-    );
     await WidgetBridge().scheduleCarousel(
       planId: plan.planId,
       entries: scheduledEntries,

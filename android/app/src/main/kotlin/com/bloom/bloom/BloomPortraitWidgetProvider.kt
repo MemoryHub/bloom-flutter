@@ -13,11 +13,11 @@ class BloomPortraitWidgetProvider : AppWidgetProvider() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.getBooleanExtra(BLOOM_CAROUSEL_REFILL_EXTRA, false)) {
             BloomCarouselSchedule.applyLatestDueEntry(context, intent)
-            val pending = goAsync()
             super.onReceive(context, intent)
-            BloomFlutterSync.start(context, intent.getIntExtra("planId", -1)) {
-                pending.finish()
-            }
+            // Keep the AppWidget broadcast short. Network and Flutter work
+            // belongs to WorkManager; holding goAsync while a headless Flutter
+            // engine performs I/O can trigger MIUI's 60-second broadcast ANR.
+            try { BloomWidgetRefresh.enqueueRecovery(context) } catch (_: Exception) { }
             return
         }
         if (intent.getBooleanExtra(BLOOM_CAROUSEL_ALARM_EXTRA, false)) {

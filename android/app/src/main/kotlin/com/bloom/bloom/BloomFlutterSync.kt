@@ -29,36 +29,56 @@ object BloomFlutterSync : MethodChannel.MethodCallHandler {
     private val lock = Any()
     private var engine: FlutterEngine? = null
     private var channel: MethodChannel? = null
-    private var finish: (() -> Unit)? = null
+    private var finish: ((Boolean) -> Unit)? = null
+    private var starting = false
+    private var watchdog: Runnable? = null
+    private val flutterLoader = FlutterLoader()
 
-    fun start(context: Context, expectedPlanId: Int, onFinished: () -> Unit) {
+    fun start(context: Context, expectedPlanId: Int, onFinished: (Boolean) -> Unit) {
         synchronized(lock) {
             val prefs = context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
             if (expectedPlanId > 0 && prefs.getInt("scheduledCarouselPlanId", -1) != expectedPlanId) {
-                onFinished()
+                onFinished(false)
                 return
             }
             if (engine != null) {
                 // A duplicate provider broadcast may arrive while the first
                 // refill is still running. Do not leave its goAsync token
                 // open; the first sync already owns the shared engine.
-                onFinished()
+                onFinished(true)
+                return
+            }
+            if (starting) {
+                // The Flutter engine is being initialized for another alarm.
+                // Keep this attempt retryable instead of claiming success.
+                onFinished(false)
                 return
             }
             val callbackHandle = SharedPreferenceHelper.getCallbackHandle(context)
             if (callbackHandle < 1L) {
                 Log.w(TAG, "Dart background callback is not registered yet")
-                onFinished()
-                return
-            }
-            val callbackInfo = FlutterCallbackInformation.lookupCallbackInformation(callbackHandle)
-            if (callbackInfo == null) {
-                Log.w(TAG, "Unable to resolve Dart callback handle")
-                onFinished()
+                onFinished(false)
                 return
             }
             finish = onFinished
-            val flutterLoader = FlutterLoader()
+            starting = true
+
+            // Construct the engine before resolving FlutterCallbackInformation.
+            // lookupCallbackInformation() calls FlutterJNI native code, which
+            // is unavailable until Flutter's native library has been loaded.
+            // The previous order caused an UnsatisfiedLinkError when MIUI
+            // delivered a widget alarm while the app process was cold.
+            val newEngine = FlutterEngine(context.applicationContext)
+            engine = newEngine
+            val timeout = Runnable {
+                synchronized(lock) {
+                    if (engine !== newEngine) return@synchronized
+                    Log.w(TAG, "Direct Dart carousel refill timed out; scheduling recovery")
+                }
+                stop(false)
+            }
+            watchdog = timeout
+            Handler(Looper.getMainLooper()).postDelayed(timeout, 30_000L)
             if (!flutterLoader.initialized()) {
                 flutterLoader.startInitialization(context)
             }
@@ -68,9 +88,19 @@ object BloomFlutterSync : MethodChannel.MethodCallHandler {
                 Handler(Looper.getMainLooper()),
             ) {
                 synchronized(lock) {
-                    if (engine != null) return@ensureInitializationCompleteAsync
-                    val newEngine = FlutterEngine(context.applicationContext)
-                    engine = newEngine
+                    if (engine !== newEngine) return@ensureInitializationCompleteAsync
+                    val callbackInfo = try {
+                        FlutterCallbackInformation.lookupCallbackInformation(callbackHandle)
+                    } catch (error: Throwable) {
+                        Log.e(TAG, "Unable to resolve Dart callback handle", error)
+                        null
+                    }
+                    if (callbackInfo == null) {
+                        starting = false
+                        stop(false)
+                        return@ensureInitializationCompleteAsync
+                    }
+                    starting = false
                     val newChannel = MethodChannel(newEngine.dartExecutor, CHANNEL)
                     channel = newChannel
                     newChannel.setMethodCallHandler(this)
@@ -114,6 +144,8 @@ object BloomFlutterSync : MethodChannel.MethodCallHandler {
 
     private fun stop(success: Boolean) {
         synchronized(lock) {
+            watchdog?.let { Handler(Looper.getMainLooper()).removeCallbacks(it) }
+            watchdog = null
             channel?.setMethodCallHandler(null)
             channel = null
             val oldEngine = engine
@@ -122,7 +154,7 @@ object BloomFlutterSync : MethodChannel.MethodCallHandler {
             finish = null
             Handler(Looper.getMainLooper()).post {
                 oldEngine?.destroy()
-                callback?.invoke()
+                callback?.invoke(success)
             }
         }
         Log.i(TAG, "Direct Dart carousel refill finished success=$success")
