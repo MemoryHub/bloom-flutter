@@ -391,6 +391,23 @@ class DailyContentRepository {
               'carousel_item_id': plan.currentItemId,
               'carousel_plan_id': plan.planId,
               'next_check_at': plan.nextCheckAt.toIso8601String(),
+              // **Step one of "turn the page at the right moment".**
+              //
+              // This is the earliest slot in the batch that has not passed yet —
+              // the same number the native alarm chain arms itself with. Writing
+              // it next to the photo is what lets the foreground schedule a
+              // single wake-up for that instant instead of polling: one timer per
+              // slot, and the app turns the page at the same second the widget
+              // does.
+              'next_slot_at_ms': (() {
+                final nowMillis = DateTime.now().millisecondsSinceEpoch;
+                final upcoming = [
+                  for (final slot in plan.items)
+                    slot.displayAt.toLocal().millisecondsSinceEpoch,
+                ].where((at) => at > nowMillis).toList()
+                  ..sort();
+                return upcoming.isEmpty ? null : upcoming.first;
+              })(),
               'caption_zh': manifest.captionZh,
               'caption_en': manifest.captionEn,
               'captured_date_text': manifest.capturedDateText,

@@ -114,6 +114,8 @@ class _BloomHomePageState extends State<BloomHomePage>
 
   Timer? _pairingPoll;
   Timer? _messageTimer;
+  /// Turns the page when its slot arrives while the app is open.
+  Timer? _slotWatch;
   DeviceCredentials? _credentials;
   PairingInfo? _pairing;
   CachedWidgetImage? _portrait;
@@ -141,11 +143,35 @@ class _BloomHomePageState extends State<BloomHomePage>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _load();
+    _startSlotWatch();
+  }
+
+  /// **The page turns itself, like the widget does.**
+  ///
+  /// This is the feature that was rolled back by mistake: it *did* advance the
+  /// home page on its own, and it was removed together with the flash it caused
+  /// instead of the flash being fixed. Both flash causes are now closed — the
+  /// switcher stays mounted (so its state, and the outgoing photo, survive) and
+  /// it is keyed by the item id rather than the path (which flapped between
+  /// `carousel-original-<id>.photo` and `original.photo` for the same picture).
+  /// With those in place a re-read no longer repaints anything unless the photo
+  /// really changed.
+  ///
+  /// The precise version of this — wake once, exactly at `next_slot_at_ms`, now
+  /// written next to the photo — is a refinement; this interval already turns the
+  /// page within half a minute of its slot.
+  void _startSlotWatch() {
+    _slotWatch?.cancel();
+    _slotWatch = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (!mounted || _loading || !_widgetEnabled) return;
+      _load(showSpinner: false);
+    });
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _slotWatch?.cancel();
     _pairingPoll?.cancel();
     _messageTimer?.cancel();
     super.dispose();
