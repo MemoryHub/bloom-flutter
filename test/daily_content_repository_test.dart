@@ -157,6 +157,41 @@ void main() {
     ];
   }
 
+  /// Writes a `carousel-pool.json` as the previous run would have left it.
+  Future<void> writePool({
+    required int planId,
+    required int currentItemId,
+    required int lastItemId,
+    required List<int> itemIds,
+    DateTime? day,
+  }) async {
+    final at = day ?? DateTime.now();
+    await File('${cacheDir.path}/carousel-pool.json').writeAsString(
+      jsonEncode({
+        'day': dayOf(at),
+        'plan_id': planId,
+        'current_item_id': currentItemId,
+        'last_item_id': lastItemId,
+        'entries': [
+          for (final id in itemIds)
+            {
+              'itemId': id,
+              'displayAtMillis': at
+                  .subtract(const Duration(minutes: 1))
+                  .millisecondsSinceEpoch,
+              'date': dayOf(at),
+              'portraitPath': '${cacheDir.path}/mobile-local-portrait-$id.png',
+              'squarePath': '${cacheDir.path}/mobile-local-square-$id.png',
+              'largeSquarePath':
+                  '${cacheDir.path}/mobile-local-largeSquare-$id.png',
+              'originalPhotoPath':
+                  '${cacheDir.path}/carousel-original-$id.photo',
+            },
+        ],
+      }),
+    );
+  }
+
   test('连续两次补货：游标接在池尾，两批 id 不重叠且都进了排程', () async {
     final base = DateTime.now().subtract(const Duration(minutes: 1));
     final api = apiReturning([
@@ -267,6 +302,105 @@ void main() {
       reason: '新的一天必须从流的开头开始，昨天的池子不能当游标',
     );
     expect(result.recommendationId, 201);
+  });
+
+  test('游标失效：服务端回空批次时自动从头发起一次，不会永久卡死', () async {
+    final base = DateTime.now().subtract(const Duration(minutes: 1));
+    // The pool came from plan 900; the server has rebuilt the day as plan 940
+    // (a settings change, a mode switch, …), so id 104 is not in it and the
+    // paged answer is an EMPTY batch.
+    await writePool(
+      planId: 900,
+      currentItemId: 101,
+      lastItemId: 104,
+      itemIds: [104],
+    );
+    final api = apiReturning([
+      {
+        'plan_id': 940,
+        'current_item_id': 501,
+        'next_check_at': base.add(const Duration(hours: 4)).toIso8601String(),
+        'items': <Map<String, dynamic>>[],
+      },
+      planWith(
+        planId: 940,
+        currentItemId: 501,
+        ids: [501, 502, 503, 504],
+        first: base,
+      ),
+    ]);
+
+    final result = await DailyContentRepository(
+      api: api,
+    ).syncCarousel(credentials, settings);
+
+    expect(planRequests, hasLength(2));
+    expect(planRequests.first['after_item_id'], 104);
+    expect(
+      planRequests.last.containsKey('after_item_id'),
+      isFalse,
+      reason: '游标失效后必须从流的开头重取，而不是一直重发这个死游标',
+    );
+    expect(result.recommendationId, 501);
+  });
+
+  test('当天收工：池尾就是服务端当前项时空批次不重取，也不抛错', () async {
+    final now = DateTime.now();
+    await writePool(
+      planId: 950,
+      currentItemId: 104,
+      lastItemId: 104,
+      itemIds: [104],
+    );
+    // A real device still has the file; the pool's current entry must be usable.
+    await File(
+      '${cacheDir.path}/carousel-original-104.photo',
+    ).writeAsBytes(pngBytes);
+    final api = apiReturning([
+      {
+        'plan_id': 950,
+        'current_item_id': 104,
+        'next_check_at': now.add(const Duration(hours: 10)).toIso8601String(),
+        'items': <Map<String, dynamic>>[],
+      },
+    ]);
+
+    final result = await DailyContentRepository(
+      api: api,
+    ).syncCarousel(credentials, settings);
+
+    expect(planRequests, hasLength(1), reason: '收工时的空批次不该再发一次请求');
+    expect(result.recommendationId, 104);
+  });
+
+  test('无法确定当前项：排程仍然提交（闹钟链不断），失败只上报给上层', () async {
+    final now = DateTime.now();
+    await writePool(
+      planId: 960,
+      currentItemId: 105,
+      lastItemId: 105,
+      itemIds: [105],
+    );
+    // No original on disk and no daily.json: nothing can name a current slot.
+    final api = apiReturning([
+      {
+        'plan_id': 960,
+        'current_item_id': 105,
+        'next_check_at': now.add(const Duration(hours: 10)).toIso8601String(),
+        'items': <Map<String, dynamic>>[],
+      },
+    ]);
+
+    await expectLater(
+      DailyContentRepository(api: api).syncCarousel(credentials, settings),
+      throwsA(isA<StateError>()),
+    );
+    expect(
+      scheduledCalls,
+      isNotEmpty,
+      reason: 'scheduleCarousel 是原生重排补货闹钟的唯一入口，失败路径也必须提交，'
+          '否则小组件既不动、又没有任何闹钟能再叫醒它',
+    );
   });
 
   test('池子上限：连续补货不无限增长，被裁掉的一页不被游标跳过', () async {

@@ -265,22 +265,54 @@ class DailyContentRepository {
     // i.e. the last page boundary this phone prepared. A page that failed to
     // render never entered the pool, so it is asked for again instead of being
     // silently stepped over. It is per local day: a new day starts from the top.
-    final anchor =
+    var cursor =
         storedPool != null &&
             storedPool.day == today &&
             storedPool.lastItemId > 0
         ? storedPool.lastItemId
         : _maxItemId(pool);
-    final plan = await api.carouselPlan(
+    var plan = await api.carouselPlan(
       credentials,
       settings,
-      afterItemId: anchor > 0 ? anchor : null,
+      afterItemId: cursor > 0 ? cursor : null,
     );
     debugPrint(
       '[BloomSync] carousel plan=${plan.planId} items=${plan.items.length} '
-      'current=${plan.currentItemId} after=${anchor > 0 ? anchor : 'none'} '
+      'current=${plan.currentItemId} after=${cursor > 0 ? cursor : 'none'} '
       'pool=${pool.length}',
     );
+    // ---- **a cursor the server no longer knows is answered with NOTHING** --
+    //
+    // `_carousel_plan_response` sets `start_index = len(items)` when the id is
+    // not found in the plan, so a stale cursor comes back as an *empty batch* —
+    // not as an error. Left alone that is a permanent stall: the anchor never
+    // moves, every later refill re-sends the same dead id, and the pool can
+    // never grow again. It happens whenever the day's plan is rebuilt underneath
+    // the pool: a settings change (interval / window), a mode switch, or a sync
+    // during the server's 15-minute post-window grace, when it still serves
+    // yesterday's plan.
+    //
+    // The recovery is to drop the stale pool and ask from the top, which is what
+    // a fresh install does. The test is "the server's current item is not
+    // something we already hold": at a genuine end-of-day the current item *is*
+    // the pool's last entry, so the normal exhausted path is left untouched and
+    // does not spin.
+    if (cursor > 0 &&
+        plan.items.isEmpty &&
+        !pool.any((entry) => _poolItemId(entry) == plan.currentItemId)) {
+      debugPrint(
+        '[BloomSync] cursor $cursor is not in plan ${plan.planId} '
+        '(pool plan=${storedPool?.planId}, empty batch, '
+        'current=${plan.currentItemId}); restarting the walk',
+      );
+      pool.clear();
+      cursor = 0;
+      plan = await api.carouselPlan(credentials, settings);
+      debugPrint(
+        '[BloomSync] restarted plan=${plan.planId} items=${plan.items.length} '
+        'current=${plan.currentItemId} pool=${pool.length}',
+      );
+    }
     if (plan.items.isEmpty && pool.isEmpty) throw StateError('轮播计划为空');
 
     // ---- **the plan's own "now", then the rest** ------------------------
@@ -551,9 +583,15 @@ class DailyContentRepository {
       final native = await WidgetBridge().readCurrentState();
       publishCurrent = native == null || native.recommendationId < 1;
     }
-    final resolvedManifest = currentManifest;
+    var resolvedManifest = currentManifest;
     if (resolvedManifest == null || currentItemId < 1) {
-      throw StateError('当前轮播照片既不在计划批次中，也没有可用的本地副本');
+      // Last look before giving up: the mirror on disk already names a current
+      // photo, and keeping it is strictly better than failing the whole refill.
+      final cached = await cachedContent();
+      if (cached != null && cached.recommendationId > 0) {
+        resolvedManifest = cached;
+        currentItemId = cached.recommendationId;
+      }
     }
 
     // **The one place alarms come from.** Everything above can throw, and when
@@ -582,38 +620,46 @@ class DailyContentRepository {
       'next_slot=$nextSlotLabel',
     );
 
-    // `daily.json` is the Dart-side mirror of "what is on screen now". A pure
-    // refill must not move it: the resolved current above is deliberately the due
-    // slot, not the newest fetched one.
-    await _writeDailyManifest(
-      dir,
-      manifest: resolvedManifest,
-      itemId: currentItemId,
-      planId: plan.planId,
-      nextCheckAt: plan.nextCheckAt,
-      nextSlotAtMillis: nextSlotMillis,
-      etag: photoEtag[currentItemId],
-    );
+    final currentReady = resolvedManifest;
+    if (currentReady != null && currentItemId > 0) {
+      // `daily.json` is the Dart-side mirror of "what is on screen now". A pure
+      // refill must not move it: the resolved current above is deliberately the
+      // due slot, not the newest fetched one.
+      await _writeDailyManifest(
+        dir,
+        manifest: currentReady,
+        itemId: currentItemId,
+        planId: plan.planId,
+        nextCheckAt: plan.nextCheckAt,
+        nextSlotAtMillis: nextSlotMillis,
+        etag: photoEtag[currentItemId],
+      );
 
-    if (publishCurrent) {
-      final portraitPath = publishEntry?['portraitPath'] as String?;
-      if (portraitPath != null && await File(portraitPath).exists()) {
-        await WidgetBridge().update(
-          portraitPath: portraitPath,
-          squarePath:
-              (publishEntry?['squarePath'] as String?) ?? portraitPath,
-          largeSquarePath:
-              (publishEntry?['largeSquarePath'] as String?) ?? portraitPath,
-          originalPhotoPath: publishEntry?['originalPhotoPath'] as String?,
-          date: resolvedManifest.date,
-          recommendationId: currentItemId,
-          captionZh: resolvedManifest.captionZh,
-          captionEn: resolvedManifest.captionEn,
-          capturedDateText: resolvedManifest.capturedDateText,
-          locationText: resolvedManifest.locationText,
-          mode: 'carousel',
-        );
+      if (publishCurrent) {
+        final portraitPath = publishEntry?['portraitPath'] as String?;
+        if (portraitPath != null && await File(portraitPath).exists()) {
+          await WidgetBridge().update(
+            portraitPath: portraitPath,
+            squarePath:
+                (publishEntry?['squarePath'] as String?) ?? portraitPath,
+            largeSquarePath:
+                (publishEntry?['largeSquarePath'] as String?) ?? portraitPath,
+            originalPhotoPath: publishEntry?['originalPhotoPath'] as String?,
+            date: currentReady.date,
+            recommendationId: currentItemId,
+            captionZh: currentReady.captionZh,
+            captionEn: currentReady.captionEn,
+            capturedDateText: currentReady.capturedDateText,
+            locationText: currentReady.locationText,
+            mode: 'carousel',
+          );
+        }
       }
+    } else {
+      debugPrint(
+        '[BloomSync] no current slot could be named; the union is still '
+        'submitted so the native refill alarm survives',
+      );
     }
 
     // ---- the pool, on disk, where the next refill can find it -------------
@@ -642,6 +688,12 @@ class DailyContentRepository {
     } catch (error) {
       debugPrint('[BloomSync] pool save failed: $error');
     }
+    // **Submitted even when no current slot could be named.** This call is also
+    // what re-arms the native refill alarm, so skipping it would freeze the
+    // widget *and* remove the only thing that could have woken it up again — a
+    // failure that outlives itself. The Dart-side failure is still reported
+    // below (and the foreground arms its 2-minute retry), but the alarm chain
+    // survives either way.
     await WidgetBridge().scheduleCarousel(
       planId: plan.planId,
       entries: scheduled,
@@ -655,7 +707,10 @@ class DailyContentRepository {
       );
     }
     await _pruneCarouselOriginals(dir);
-    return resolvedManifest;
+    if (currentReady == null || currentItemId < 1) {
+      throw StateError('当前轮播照片既不在计划批次中，也没有可用的本地副本');
+    }
+    return currentReady;
   }
 
   Future<CachedWidgetImage?> cached(String orientation) async {
@@ -876,6 +931,7 @@ class DailyContentRepository {
       if (day == null || rawEntries is! List) return null;
       return _CarouselPool(
         day: day,
+        planId: (data['plan_id'] as num?)?.toInt() ?? 0,
         lastItemId: (data['last_item_id'] as num?)?.toInt() ?? 0,
         entries: [
           for (final raw in rawEntries)
@@ -964,6 +1020,7 @@ class DailyContentRepository {
 class _CarouselPool {
   const _CarouselPool({
     required this.day,
+    required this.planId,
     required this.lastItemId,
     required this.entries,
   });
@@ -971,6 +1028,11 @@ class _CarouselPool {
   /// Local day (`yyyy-MM-dd`) the entries belong to. A different day means the
   /// cursor restarts from the top of the stream.
   final String day;
+
+  /// `plan_id` the entries were built from. The server answers a cursor that is
+  /// not in the *current* plan with an empty batch, so this is what tells a
+  /// rebuilt plan (settings change, mode switch) apart in the logs.
+  final int planId;
 
   /// Largest `itemId` the pool held when it was written — the next refill's
   /// `after_item_id` anchor.
