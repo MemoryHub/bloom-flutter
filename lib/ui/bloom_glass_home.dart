@@ -747,7 +747,13 @@ class BloomPhotoBackdrop extends StatelessWidget {
                   ],
                 ),
             child: Opacity(
-              key: ValueKey('$path:$revision'),
+              // **The path alone identifies the photo.** It already carries the
+              // item id (`mobile-local-portrait-3197.png`), so a re-read that
+              // finds the same photo now yields the same key and the switcher
+              // stays still. Including `revision` made the key flap whenever that
+              // number came from a different source between two loads, which
+              // replayed the fade every time the page refreshed — the flicker.
+              key: ValueKey(path),
               opacity: .36,
               child: ImageFiltered(
                 // Less blur than before: at 20 the photo was a colour wash.
@@ -1526,7 +1532,9 @@ class _LetterPhotoCard extends StatelessWidget {
                 flex: 3,
                 child: Image.file(
                   File(imagePath),
-                  key: ValueKey('$imagePath:$revision'),
+                  // Same reasoning as the card behind the page: the path is the
+                  // identity, the revision is not.
+                  key: ValueKey(imagePath),
                   fit: BoxFit.cover,
                   alignment: Alignment(fx * 2 - 1, fy * 2 - 1),
                   gaplessPlayback: true,

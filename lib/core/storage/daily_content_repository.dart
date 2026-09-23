@@ -454,6 +454,34 @@ class DailyContentRepository {
     if (scheduledEntries.isEmpty) {
       throw StateError('没有任何可排程的槽位');
     }
+    // ---- the pool, on disk, where the next refill can find it -------------
+    //
+    // Step 1 of walking the day instead of replaying its first four photos.
+    //
+    // Until now this list of scheduled entries existed **only** in the native
+    // layer's SharedPreferences, and every `scheduleCarousel` call *overwrites*
+    // it. So a refill could not compute a union — it had no way to know what was
+    // already scheduled — which is the mechanical reason the old cursor attempt
+    // dropped slots and had to be rolled back. Writing the same entries next to
+    // the photos first gives the next sync something to merge with.
+    final poolFile = File('${dir.path}/carousel-pool.json');
+    try {
+      await poolFile.writeAsString(
+        jsonEncode({
+          'day': DateTime.now().toIso8601String().substring(0, 10),
+          'plan_id': plan.planId,
+          'current_item_id': plan.currentItemId,
+          'entries': scheduledEntries,
+        }),
+        flush: true,
+      );
+      debugPrint(
+        '[BloomSync] pool saved: day=${DateTime.now().toIso8601String().substring(0, 10)} '
+        'entries=${scheduledEntries.length} last=${scheduledEntries.last['itemId']}',
+      );
+    } catch (error) {
+      debugPrint('[BloomSync] pool save failed: $error');
+    }
     await WidgetBridge().scheduleCarousel(
       planId: plan.planId,
       entries: scheduledEntries,

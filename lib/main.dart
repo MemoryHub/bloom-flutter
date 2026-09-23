@@ -321,6 +321,11 @@ class _BloomHomePageState extends State<BloomHomePage>
             });
           }
           try {
+            debugPrint(
+              '[BloomSave] _load is syncing now '
+              '(mode=${displaySettings.mode.name} '
+              'window=${displaySettings.activeStart}-${displaySettings.activeEnd})',
+            );
             content =
                 displaySettings.mode == BloomDisplayMode.carousel
                     ? await repository.syncCarousel(
@@ -590,9 +595,21 @@ class _BloomHomePageState extends State<BloomHomePage>
     BloomDisplaySettings settings,
   ) async {
     if (!mounted || !device.isLocal) return;
+    // **Probes for the "I pressed 保存 and nothing happened" chain.**
+    //
+    // A save is supposed to end with a fresh sync, which is what re-arms the
+    // native alarm chain for the new window. When that did not visibly happen
+    // there was no way to tell *which* link broke: the save handler, the reload,
+    // or the sync inside it. These three lines name each link.
+    debugPrint(
+      '[BloomSave] saved: mode=${settings.mode.name} '
+      'window=${settings.activeStart}-${settings.activeEnd} '
+      'interval=${settings.intervalMinutes}',
+    );
     setState(() => _displaySettings = settings);
     // Re-run the load so the photo page shows the newly selected mode's photo.
     await _load(showSpinner: false);
+    debugPrint('[BloomSave] reload finished (alarms should be re-armed)');
   }
 
   Future<void> _nextCarouselPhoto() async {
