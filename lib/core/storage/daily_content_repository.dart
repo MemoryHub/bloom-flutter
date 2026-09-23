@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
@@ -232,8 +233,89 @@ class DailyContentRepository {
     Directory dir,
     File lock,
   ) async {
+    // **The day-walking cursor is not wired up yet.**
+    //
+    // `carousel/plan` accepts `after_item_id` and the app stores a per-day
+    // `last_item_id` next to the photos — but feeding it in skipped the item the
+    // server calls "current", and the scheduling below requires the current item
+    // to be inside the batch it just fetched. The sync then threw
+    // `Bad state: 当前轮播照片不在计划批次中` on every attempt, forever, and a
+    // fresh install showed no photo at all.
+    //
+    // Repeating a few photos is a much smaller sin than a widget that never
+    // updates, so the fetch stays cursor-less until the *reconciliation* is
+    // taught that a refill batch is purely additive: keep the plan's current
+    // item and append the new ones to the pool.
     final plan = await api.carouselPlan(credentials, settings);
     if (plan.items.isEmpty) throw StateError('轮播计划为空');
+
+    // ---- **the plan's own "now", then the rest** ------------------------
+    //
+    // Two things were wrong before. The four photos were fetched one after
+    // another (four × ~6s of empty home page), and the fetch that mattered —
+    // **the item the plan says belongs in the current slot**
+    // (`plan.currentItemId`), not whichever download happens to finish first —
+    // was queued behind the other three.
+    //
+    // So: one shared table of download tasks. Every task is created once, which
+    // is what makes this safe — the render loop below and this prefetch can both
+    // ask for item 3093 and only one of them will ever write the file. The
+    // current slot's photo is awaited; the rest are already in flight behind it
+    // and are collected as they land.
+    String originalPathOf(int itemId) =>
+        '${dir.path}/carousel-original-$itemId.photo';
+    final photoEtag = <int, String?>{};
+    final pending = <int, Future<void>>{};
+    // A photo nobody is waiting for gets a short leash. The measured failure was
+    // `Connection closed while receiving data` after **25 seconds** (the shared
+    // request timeout) on one future asset, which held the whole refill — and the
+    // whole background task — for 25s while the photo that actually belonged on
+    // screen had been ready in 0ms. The current slot keeps the generous timeout
+    // (it must not be skipped, so it deserves the patience); a future asset gives
+    // up quickly, is skipped, and is simply retried on the next refill.
+    // **25 seconds, not 8.** The 8s leash was a mistake with a measurable
+    // cause-and-effect: these are big photos fetched four-at-a-time, so each one
+    // shares the phone's bandwidth and legitimately takes far longer than it did
+    // when they went out one by one. Measured on device: the current item comes
+    // back in 0-105ms (cached) but a fresh photo needed 7s — right at the old
+    // limit — and the rest died at exactly `TimeoutException after 0:00:08`.
+    // The effect was that *every* new photo was skipped, the pool never refilled,
+    // and the widget sat on one cached photo forever. The skip-and-retry
+    // machinery is still worth having for a download that is genuinely dead; it
+    // just needs a limit that a real photo can meet.
+    Future<void> fetchPhoto(
+      int itemId, {
+      Duration timeout = const Duration(seconds: 25),
+    }) => pending.putIfAbsent(itemId, () async {
+      final path = originalPathOf(itemId);
+      if (await File(path).exists()) return;
+      final response =
+          await api.carouselPhoto(credentials, itemId).timeout(timeout);
+      if (response.statusCode != 200) {
+        throw StateError('轮播计划照片下载失败');
+      }
+      photoEtag[itemId] = response.headers['etag'];
+      final temp = File('$path.tmp');
+      await temp.writeAsBytes(response.bodyBytes, flush: true);
+      await temp.rename(path);
+    });
+
+    final prefetchWatch = Stopwatch()..start();
+    if (plan.items.any((item) => item.itemId == plan.currentItemId)) {
+      await fetchPhoto(
+        plan.currentItemId,
+        timeout: const Duration(seconds: 30),
+      );
+      debugPrint(
+        '[BloomSync] current photo item=${plan.currentItemId} ready in '
+        '${prefetchWatch.elapsedMilliseconds}ms',
+      );
+    }
+    for (final item in plan.items) {
+      if (item.itemId == plan.currentItemId) continue;
+      // Deliberately not awaited: they download while the loop renders.
+      unawaited(fetchPhoto(item.itemId).catchError((Object _) {}));
+    }
     debugPrint(
       '[BloomSync] carousel plan=${plan.planId} items=${plan.items.length} '
       'current=${plan.currentItemId}',
@@ -258,16 +340,12 @@ class DailyContentRepository {
           photoBytes = await original.readAsBytes();
           debugPrint('[BloomSync] reusing cached photo item=${item.itemId}');
         } else {
-          debugPrint('[BloomSync] downloading photo item=${item.itemId}');
-          final response = await api.carouselPhoto(credentials, item.itemId);
-          if (response.statusCode != 200) {
-            throw StateError('轮播计划照片下载失败');
-          }
-          photoBytes = response.bodyBytes;
-          itemEtag = response.headers['etag'];
-          final originalTemp = File('$originalPath.tmp');
-          await originalTemp.writeAsBytes(photoBytes, flush: true);
-          await originalTemp.rename(originalPath);
+          // Never fetch here: the shared table owns that, so a photo being
+          // downloaded in the background cannot be written twice.
+          debugPrint('[BloomSync] waiting for photo item=${item.itemId}');
+          await fetchPhoto(item.itemId);
+          photoBytes = await original.readAsBytes();
+          itemEtag = photoEtag[item.itemId];
         }
         final paths = <String, String>{};
         for (final family in ['portrait', 'square', 'largeSquare']) {
@@ -360,13 +438,27 @@ class DailyContentRepository {
     }
 
     final manifest = currentManifest;
+    // **The one place alarms come from.** Everything above can throw, and when
+    // it does this call is skipped and *no* alarm is ever armed — the widget then
+    // stops updating with no evidence anywhere. Measured on device: three photos
+    // prepared, `dumpsys alarm` empty. So both the decision and its outcome are
+    // logged, including the cases that used to fail silently.
+    debugPrint(
+      '[BloomSync] scheduling plan=${plan.planId} '
+      'entries=${scheduledEntries.length} current=${plan.currentItemId} '
+      'manifest=${manifest != null} bytes=${currentPhotoBytes != null}',
+    );
     if (manifest == null || currentPhotoBytes == null) {
       throw StateError('当前轮播照片不在计划批次中');
+    }
+    if (scheduledEntries.isEmpty) {
+      throw StateError('没有任何可排程的槽位');
     }
     await WidgetBridge().scheduleCarousel(
       planId: plan.planId,
       entries: scheduledEntries,
     );
+    debugPrint('[BloomSync] scheduled ${scheduledEntries.length} slots ok');
     for (final family in ['portrait', 'square', 'largeSquare']) {
       await _pruneVersionedImages(
         dir,

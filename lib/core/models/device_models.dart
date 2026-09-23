@@ -18,14 +18,32 @@ class PairingInfo {
 }
 
 class DeviceStatus {
-  const DeviceStatus({required this.paired, required this.hasAssets});
+  const DeviceStatus({
+    required this.paired,
+    required this.hasAssets,
+    this.mode,
+  });
 
   final bool paired;
   final bool hasAssets;
 
+  /// **The mode the server wants this device in** — the raw wire value
+  /// (`DeviceCarouselSettings.modeCarousel` / `modeRecommend`).
+  ///
+  /// `/status` always carries it (the server defaults it to `carousel` when the
+  /// device has no settings row yet), and it is the authoritative answer to
+  /// "which mode is this device in". The local mirror the home-screen widget
+  /// reads is only this phone's *copy* of that answer.
+  ///
+  /// It used to be dropped on the floor here, and the home page read the mirror
+  /// instead — which is exactly how the same phone ended up showing 推荐模式 on
+  /// the home page and 轮播模式 on its own device page.
+  final String? mode;
+
   factory DeviceStatus.fromJson(Map<String, dynamic> json) => DeviceStatus(
     paired: json['paired'] as bool? ?? false,
     hasAssets: json['has_assets'] as bool? ?? false,
+    mode: json['mode'] as String?,
   );
 }
 
@@ -209,6 +227,176 @@ class DailyContent {
     );
   }
 }
+
+/// Server-side carousel settings for one target (`eink` frame or `mobile`
+/// widget). Mirrors the `settings` object of
+/// `POST /devices/{device_id}/carousel/settings/get`.
+class DeviceCarouselSettings {
+  const DeviceCarouselSettings({
+    required this.timezone,
+    required this.activeStart,
+    required this.activeEnd,
+    required this.intervalMinutes,
+    this.mode,
+    this.dailySlotCount,
+    this.settingsHash,
+    this.updatedAt,
+  });
+
+  static const defaultTimezone = 'Asia/Shanghai';
+
+  /// The two display modes the server stores in `frame_device_settings.mode`.
+  ///
+  /// These are the **wire** values. The local mirror read by the native
+  /// widgets uses `carousel` / `recommendation` instead (see
+  /// `DisplayPreferences.cacheLocal`); the two spellings must not be mixed up.
+  static const modeCarousel = 'carousel';
+  static const modeRecommend = 'recommend';
+
+  final String timezone;
+  final String activeStart;
+  final String activeEnd;
+  final int intervalMinutes;
+
+  /// Display mode stored with the schedule (`carousel` or `recommend`).
+  ///
+  /// `null` when the server did not send one, or sent something outside the two
+  /// allowed values: callers must fall back to a known value instead of
+  /// guessing (the server rejects anything else with 422).
+  final String? mode;
+
+  /// Photos the server scheduled for one day (`daily_slot_count`).
+  ///
+  /// Kept `null` when the server does not report it (or reports a
+  /// non-positive value) so callers fall back to their own estimate instead of
+  /// showing a bogus `0`.
+  final int? dailySlotCount;
+  final String? settingsHash;
+  final DateTime? updatedAt;
+
+  /// Parses the server payload.
+  ///
+  /// The scheduling fields are required: a missing `interval_minutes`,
+  /// `active_start` or `active_end` throws a [FormatException] rather than
+  /// silently becoming `0`/`1440`. `timezone` falls back to
+  /// [defaultTimezone] (the value the app already hardcodes for its other
+  /// carousel calls) and the optional fields stay `null`.
+  ///
+  /// `mode` is optional: it is `null` when absent and also when the server
+  /// sends a value outside `carousel` / `recommend`, so a future server value
+  /// can never be mistaken for one of the two the app knows how to render.
+  factory DeviceCarouselSettings.fromJson(Map<String, dynamic> json) {
+    final interval = (json['interval_minutes'] as num?)?.toInt();
+    if (interval == null || interval <= 0) {
+      throw FormatException(
+        'carousel settings: interval_minutes is missing or not a positive '
+        'integer (got ${json['interval_minutes']})',
+      );
+    }
+    final rawSlots = (json['daily_slot_count'] as num?)?.toInt();
+    final rawTimezone = (json['timezone'] as String?)?.trim();
+    final rawMode = json['mode'];
+    return DeviceCarouselSettings(
+      timezone:
+          rawTimezone == null || rawTimezone.isEmpty
+              ? defaultTimezone
+              : rawTimezone,
+      activeStart: _requireClock(json, 'active_start'),
+      activeEnd: _requireClock(json, 'active_end'),
+      intervalMinutes: interval,
+      mode:
+          rawMode == modeCarousel || rawMode == modeRecommend
+              ? rawMode as String
+              : null,
+      dailySlotCount: rawSlots != null && rawSlots > 0 ? rawSlots : null,
+      settingsHash: json['settings_hash'] as String?,
+      updatedAt: _parseDateTime(json['updated_at']),
+    );
+  }
+}
+
+/// Envelope of `POST /devices/{device_id}/carousel/settings/get`.
+class DeviceCarouselSettingsEnvelope {
+  const DeviceCarouselSettingsEnvelope({
+    required this.settings,
+    this.apiVersion,
+    this.allowedIntervalMinutes = const <int>[],
+    this.nextCheckAt,
+  });
+
+  final DeviceCarouselSettings settings;
+  final int? apiVersion;
+
+  /// The server's authoritative tier list (`allowed_interval_minutes`).
+  ///
+  /// Empty when the server did not send one; callers must not quietly
+  /// substitute their own list in that case.
+  final List<int> allowedIntervalMinutes;
+  final DateTime? nextCheckAt;
+
+  factory DeviceCarouselSettingsEnvelope.fromJson(Map<String, dynamic> json) {
+    final settings = json['settings'];
+    if (settings is! Map<String, dynamic>) {
+      throw const FormatException(
+        'carousel settings: response has no "settings" object',
+      );
+    }
+    return DeviceCarouselSettingsEnvelope(
+      settings: DeviceCarouselSettings.fromJson(settings),
+      apiVersion: (json['api_version'] as num?)?.toInt(),
+      allowedIntervalMinutes: <int>[
+        for (final value
+            in (json['allowed_interval_minutes'] as List<dynamic>?) ??
+                const <dynamic>[])
+          if (value is num) value.toInt(),
+      ],
+      nextCheckAt: _parseDateTime(json['next_check_at']),
+    );
+  }
+}
+
+/// Result of `POST /devices/{device_id}/carousel/settings/set`.
+class DeviceSettingsUpdateResult {
+  const DeviceSettingsUpdateResult({
+    required this.status,
+    required this.settings,
+    this.purgedPlans,
+    this.nextCheckAt,
+  });
+
+  final String status;
+  final DeviceCarouselSettings settings;
+
+  /// Carousel plans the server invalidated because the schedule changed.
+  final int? purgedPlans;
+  final DateTime? nextCheckAt;
+
+  factory DeviceSettingsUpdateResult.fromJson(Map<String, dynamic> json) {
+    final settings = json['settings'];
+    if (settings is! Map<String, dynamic>) {
+      throw const FormatException(
+        'carousel settings: update response has no "settings" object',
+      );
+    }
+    return DeviceSettingsUpdateResult(
+      status: (json['status'] as String?) ?? 'unknown',
+      settings: DeviceCarouselSettings.fromJson(settings),
+      purgedPlans: (json['purged_plans'] as num?)?.toInt(),
+      nextCheckAt: _parseDateTime(json['next_check_at']),
+    );
+  }
+}
+
+String _requireClock(Map<String, dynamic> json, String key) {
+  final value = json[key];
+  if (value is! String || value.trim().isEmpty) {
+    throw FormatException('carousel settings: $key is missing (got $value)');
+  }
+  return value.trim();
+}
+
+DateTime? _parseDateTime(Object? value) =>
+    value is String ? DateTime.tryParse(value) : null;
 
 class CachedWidgetImage {
   const CachedWidgetImage({

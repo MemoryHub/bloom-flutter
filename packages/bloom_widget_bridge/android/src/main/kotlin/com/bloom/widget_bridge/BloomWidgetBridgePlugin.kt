@@ -181,6 +181,17 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         val futureEntries = (0 until entries.length())
             .mapNotNull { entries.optJSONObject(it) }
             .filter { it.optLong("displayAtMillis", 0L) > now + 5_000L }
+        // **Why this line matters.** Every slot whose time has already passed is
+        // dropped just below, and the previous refill alarm was cancelled a few
+        // lines up. So a batch that arrives "late" (which is what a phone that
+        // was asleep or offline produces) arms *nothing* — Dart reports success
+        // while `dumpsys alarm` shows zero alarms. This line makes that state
+        // visible instead of silent.
+        Log.i(
+            "BloomCarousel",
+            "schedule plan=$planId entries=${entries.length()} " +
+                "future=${futureEntries.size} now=$now",
+        )
         for (entryIndex in 0 until entries.length()) {
             val entry = entries.optJSONObject(entryIndex) ?: continue
             val itemId = entry.optInt("itemId", 0)
@@ -201,7 +212,13 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 legacyPending.cancel()
             }
 
-            if (displayAt <= now + 5_000L) continue
+            if (displayAt <= now + 5_000L) {
+                Log.i(
+                    "BloomCarousel",
+                    "skip past slot item=$itemId at=$displayAt now=$now",
+                )
+                continue
+            }
             widgetProviders.forEach { (familyIndex, component, widgetIds) ->
                 // Xiaomi may refuse to start a custom receiver after the user
                 // swipes the app away. A standard, explicit APPWIDGET_UPDATE

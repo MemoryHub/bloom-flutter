@@ -109,4 +109,143 @@ void main() {
     expect(result.item.itemId, 501);
     expect(result.item.photo.url, contains('/carousel/photo'));
   });
+
+  test('settings get posts the target and parses the envelope', () async {
+    late http.Request request;
+    final client = BloomApiClient(
+      client: MockClient((r) async {
+        request = r;
+        return http.Response(
+          jsonEncode({
+            'api_version': 1,
+            'settings': {
+              'device_id': 'bloom-mobile-test',
+              'target': 'eink',
+              'timezone': 'Asia/Shanghai',
+              'active_start': '06:00',
+              'active_end': '22:00',
+              'interval_minutes': 15,
+              'daily_slot_count': 65,
+              'settings_hash': '6de216',
+              'updated_at': '2026-09-21T09:00:00+08:00',
+            },
+            'allowed_interval_minutes': [15, 30, 60],
+            'next_check_at': '2026-09-21T10:30:00+08:00',
+          }),
+          200,
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      }),
+    );
+
+    final envelope = await client.getDeviceSettings(
+      credentials,
+      target: 'eink',
+    );
+
+    expect(request.method, 'POST');
+    expect(
+      request.url.path,
+      '/api/frame/devices/${credentials.deviceId}/carousel/settings/get',
+    );
+    expect(request.headers['x-frame-token'], credentials.deviceToken);
+    expect(jsonDecode(request.body), {'target': 'eink'});
+    expect(envelope.settings.intervalMinutes, 15);
+    expect(envelope.settings.dailySlotCount, 65);
+    expect(envelope.allowedIntervalMinutes, [15, 30, 60]);
+    expect(envelope.apiVersion, 1);
+    expect(envelope.nextCheckAt, isNotNull);
+  });
+
+  test('settings set sends caller_device_id and surfaces 422 detail', () async {
+    late http.Request request;
+    final client = BloomApiClient(
+      client: MockClient((r) async {
+        request = r;
+        return http.Response(
+          jsonEncode({'detail': 'interval_minutes 不在允许的档位中'}),
+          422,
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      }),
+    );
+
+    await expectLater(
+      client.setDeviceSettings(
+        credentials,
+        target: 'eink',
+        timezone: 'Asia/Shanghai',
+        activeStart: '06:00',
+        activeEnd: '22:00',
+        intervalMinutes: 45,
+        callerDeviceId: credentials.deviceId,
+      ),
+      throwsA(
+        isA<BloomApiException>()
+            .having((error) => error.statusCode, 'statusCode', 422)
+            .having((error) => error.message, 'message', contains('档位')),
+      ),
+    );
+
+    final body = jsonDecode(request.body) as Map<String, dynamic>;
+    expect(
+      request.url.path,
+      '/api/frame/devices/${credentials.deviceId}/carousel/settings/set',
+    );
+    expect(body['caller_device_id'], credentials.deviceId);
+    expect(body['interval_minutes'], 45);
+    expect(body['target'], 'eink');
+  });
+
+  test('settings set surfaces 403 and list-shaped 422 details', () async {
+    Future<void> expectFailure(Object body, int status, String needle) async {
+      final client = BloomApiClient(
+        client: MockClient(
+          (_) async => http.Response(
+            jsonEncode(body),
+            status,
+            headers: {'content-type': 'application/json; charset=utf-8'},
+          ),
+        ),
+      );
+      await expectLater(
+        client.setDeviceSettings(
+          credentials,
+          target: 'eink',
+          timezone: 'Asia/Shanghai',
+          activeStart: '06:00',
+          activeEnd: '22:00',
+          intervalMinutes: 60,
+          callerDeviceId: 'bloom-frame-1',
+        ),
+        throwsA(
+          isA<BloomApiException>()
+              .having((error) => error.statusCode, 'statusCode', status)
+              .having((error) => error.message, 'message', contains(needle)),
+        ),
+      );
+    }
+
+    await expectFailure(
+      const {'detail': '两个设备不属于同一账号'},
+      403,
+      '同一账号',
+    );
+    await expectFailure(
+      const {
+        'detail': [
+          {'loc': ['body', 'interval_minutes'], 'msg': 'not an allowed tier'},
+        ],
+      },
+      422,
+      'not an allowed tier',
+    );
+  });
+
+  test('listMyDevices is not implemented without a user session', () async {
+    final client = BloomApiClient(
+      client: MockClient((_) async => http.Response('{}', 200)),
+    );
+    await expectLater(client.listMyDevices(), throwsA(isA<UnsupportedError>()));
+  });
 }

@@ -9,6 +9,38 @@ import 'platform/widget_bridge.dart';
 
 const bloomDailySyncTask = 'com.bloom.bloom.dailySync';
 
+/// **Never let the chain die.**
+///
+/// In carousel mode the 15-minute worker is deliberately cancelled (see
+/// [configureBackgroundSync]) and the only thing that keeps the widget moving is
+/// the native exact-alarm chain. Nothing in that chain retries: when a refill
+/// fails — commuting out of Wi-Fi range, a photo that times out, a sleeping
+/// phone — the chain is simply not extended, its last alarm fires, and the
+/// widget then sits on the same photo **forever**, with no alarm left anywhere
+/// and no periodic task to notice. That is not a rare state: it is what a normal
+/// commute produces.
+///
+/// So every failed sync arms a one-off retry a couple of minutes out, with a
+/// network constraint so it waits for connectivity to come back. WorkManager
+/// de-duplicates by unique name, so a queue of failures cannot pile up.
+const bloomRetrySyncTask = 'com.bloom.bloom.retrySync';
+
+Future<void> _armRetry() async {
+  if (!Platform.isAndroid) return;
+  try {
+    await Workmanager().registerOneOffTask(
+      bloomRetrySyncTask,
+      bloomDailySyncTask,
+      initialDelay: const Duration(minutes: 2),
+      constraints: Constraints(networkType: NetworkType.connected),
+      existingWorkPolicy: ExistingWorkPolicy.replace,
+    );
+    debugPrint('[BloomSync] retry armed for +2min');
+  } catch (error) {
+    debugPrint('[BloomSync] could not arm retry: $error');
+  }
+}
+
 Future<void> initializeBackgroundSync() async {
   await Workmanager().initialize(_backgroundCallback);
   if (Platform.isIOS) return;
@@ -34,6 +66,21 @@ Future<void> configureBackgroundSync(BloomDisplaySettings settings) async {
     backoffPolicy: BackoffPolicy.exponential,
     backoffPolicyDelay: const Duration(minutes: 5),
   );
+}
+
+/// Stops the generic periodic worker.
+///
+/// The other half of switching the widget off — [DisplayPreferences
+/// .clearRemoteSchedule] stops the carousel's exact-alarm chain, this stops the
+/// 15-minute worker. Both have to go: leaving either armed means the device keeps
+/// waking and (in the worker's case) keeps calling the server for a widget the
+/// user has switched off.
+Future<void> disableBackgroundSync() async {
+  if (!Platform.isAndroid) return;
+  await Workmanager().cancelByUniqueName(bloomDailySyncTask);
+  // The retry is part of the same promise: a widget the user switched off must
+  // not keep waking the phone to refill itself.
+  await Workmanager().cancelByUniqueName(bloomRetrySyncTask);
 }
 
 @pragma('vm:entry-point')
@@ -96,7 +143,9 @@ void _backgroundCallback() {
     } catch (error, stackTrace) {
       debugPrint('[BloomSync] failed at stage=$stage: $error');
       debugPrintStack(stackTrace: stackTrace);
-      // Keep the previous successful cache and let WorkManager retry later.
+      // Keep the previous successful cache, and make sure something comes back
+      // to try again — in carousel mode nothing else will.
+      await _armRetry();
       return false;
     }
   });

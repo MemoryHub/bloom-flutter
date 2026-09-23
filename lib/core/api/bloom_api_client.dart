@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:math';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import '../models/device_models.dart';
 import '../storage/display_preferences.dart';
@@ -18,6 +19,11 @@ class BloomApiClient {
   // Photo responses can be several megabytes and may be proxied from Immich.
   // They must not share the short timeout used by JSON status/plan calls.
   static const _photoRequestTimeout = Duration(seconds: 60);
+
+  /// Carousel settings targets. The e-ink frame stores `eink`, the mobile
+  /// widget stores `mobile`.
+  static const settingsTargetEink = 'eink';
+  static const settingsTargetMobile = 'mobile';
 
   BloomApiClient({http.Client? client, this.baseUrl = 'https://bloom.jihu.top'})
     : _client = client ?? http.Client();
@@ -164,10 +170,19 @@ class BloomApiClient {
     return CarouselItemEnvelope.fromJson(_json(response));
   }
 
+  /// One page of the day's carousel stream.
+  ///
+  /// [afterItemId] is the server's **paging cursor** — `after_item_id`, which
+  /// has been in the API all along (`ge=1`) and which this app never sent. That
+  /// omission is the whole "翻来覆去就那么两三张" bug: every request started at
+  /// index 0 and got the same first four photos back. The batch size itself
+  /// cannot be raised (`le=4` server-side), so the day is walked four at a time
+  /// by handing back the last id each round.
   Future<CarouselPlanEnvelope> carouselPlan(
     DeviceCredentials credentials,
     BloomDisplaySettings settings, {
     int batchLimit = 4,
+    int? afterItemId,
   }) async {
     final response = await _client
         .post(
@@ -185,6 +200,7 @@ class BloomApiClient {
             'active_end': settings.activeEnd,
             'interval_minutes': settings.intervalMinutes,
             'batch_limit': batchLimit.clamp(1, 4),
+            if (afterItemId != null) 'after_item_id': afterItemId,
           }),
         )
         .timeout(_requestTimeout);
@@ -216,9 +232,104 @@ class BloomApiClient {
     return response;
   }
 
+  /// Reads the carousel settings the server stores for [target].
+  Future<DeviceCarouselSettingsEnvelope> getDeviceSettings(
+    DeviceCredentials credentials, {
+    required String target,
+  }) async {
+    final response = await _client
+        .post(
+          _uri(
+            '/api/frame/devices/${Uri.encodeComponent(credentials.deviceId)}/carousel/settings/get',
+          ),
+          headers: {
+            ..._headers(credentials.deviceToken),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'target': target}),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return DeviceCarouselSettingsEnvelope.fromJson(_json(response));
+  }
+
+  /// Writes the carousel settings the server stores for [target].
+  ///
+  /// [callerDeviceId] must be the device id that owns [credentials]: the app
+  /// has no user login yet, so the server authorises the write by checking
+  /// that the caller and the target device belong to the same account.
+  ///
+  /// [mode] is the display mode (`carousel` / `recommend`). It is **omitted
+  /// from the request when `null`**, and the server then keeps the value it
+  /// already stores — it does not reset it to the column default. That is the
+  /// path for anything that must not touch a device's mode.
+  ///
+  /// Rejected writes are surfaced, never swallowed: 422 (interval not in the
+  /// server's tier list, inverted active window, or a `mode` outside
+  /// `carousel|recommend`) and 403 (the two devices are not on the same
+  /// account) both throw a [BloomApiException] carrying the server's `detail`.
+  Future<DeviceSettingsUpdateResult> setDeviceSettings(
+    DeviceCredentials credentials, {
+    required String target,
+    required String timezone,
+    required String activeStart,
+    required String activeEnd,
+    required int intervalMinutes,
+    required String callerDeviceId,
+    String? mode,
+  }) async {
+    final response = await _client
+        .post(
+          _uri(
+            '/api/frame/devices/${Uri.encodeComponent(credentials.deviceId)}/carousel/settings/set',
+          ),
+          headers: {
+            ..._headers(credentials.deviceToken),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'target': target,
+            'timezone': timezone,
+            'active_start': activeStart,
+            'active_end': activeEnd,
+            'interval_minutes': intervalMinutes,
+            'caller_device_id': callerDeviceId,
+            if (mode != null) 'mode': mode,
+          }),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return DeviceSettingsUpdateResult.fromJson(_json(response));
+  }
+
+  /// `POST /users/me/devices`, the devices bound to the signed-in user.
+  ///
+  /// This is a **user session** endpoint. The app only has a device token today
+  /// (login is F1), which cannot authenticate it, so the call is intentionally
+  /// not implemented: it always fails with [UnsupportedError] instead of
+  /// pretending to work. The signature is declared so calling code and tests
+  /// can be written against the intended shape; the exact response schema is
+  /// unverified and must be confirmed against the backend when F1 lands.
+  Future<List<Map<String, dynamic>>> listMyDevices() async {
+    throw UnsupportedError(
+      'listMyDevices 需要用户登录态（F1），当前设备令牌无法调用 users/me/devices。',
+    );
+  }
+
   Map<String, dynamic> _json(http.Response response) =>
       jsonDecode(response.body) as Map<String, dynamic>;
   void _ensure(http.Response response, int expected, [int? second]) {
+    // **Every call, with its status, on one line.**
+    //
+    // Without this there was no way to answer "接口到底成没成功" on a real phone:
+    // a release build keeps its token in private storage, so the server's record
+    // cannot be read back from outside the app. `adb logcat` now shows the path
+    // and the status of every request the app makes, which is the evidence a
+    // settings change (or a carousel refill) actually landed.
+    debugPrint(
+      '[BloomApi] ${response.request?.method ?? '?'} '
+      '${response.request?.url.path ?? '?'} -> ${response.statusCode}',
+    );
     if (response.statusCode != expected && response.statusCode != second) {
       _throw(response);
     }
@@ -229,9 +340,33 @@ class BloomApiClient {
     var message = '请求失败';
     try {
       final data = _json(response);
-      code = (data['code'] ?? data['detail'])?.toString();
-      message = (data['message'] ?? data['detail'] ?? message).toString();
+      final detail = data['detail'];
+      code = (data['code'] ?? detail)?.toString();
+      final resolved = data['message'] ?? _detailMessage(detail);
+      if (resolved != null) message = resolved.toString();
     } catch (_) {}
     throw BloomApiException(response.statusCode, code, message);
+  }
+
+  /// Renders the server's `detail` field, keeping the reason readable when
+  /// FastAPI answers 422 with a list of validation objects instead of a
+  /// string.
+  static Object? _detailMessage(Object? detail) {
+    if (detail is List) {
+      final parts =
+          detail
+              .map(
+                (entry) =>
+                    entry is Map
+                        ? (entry['msg'] ?? entry['detail'] ?? entry)
+                        : entry,
+              )
+              .where((entry) => entry != null)
+              .map((entry) => entry.toString())
+              .where((entry) => entry.isNotEmpty)
+              .toList(growable: false);
+      return parts.isEmpty ? null : parts.join('; ');
+    }
+    return detail;
   }
 }

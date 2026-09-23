@@ -12,6 +12,7 @@ import 'core/storage/daily_content_repository.dart';
 import 'core/storage/device_identity_repository.dart';
 import 'core/storage/display_preferences.dart';
 import 'platform/widget_bridge.dart';
+import 'ui/bloom_device_pages.dart';
 import 'ui/bloom_glass_home.dart';
 
 Future<void> main() async {
@@ -51,32 +52,65 @@ class BloomApp extends StatelessWidget {
   Widget build(BuildContext context) => MaterialApp(
     title: 'Bloom',
     debugShowCheckedModeBanner: false,
-    themeMode: ThemeMode.light,
-    theme: ThemeData(
-      brightness: Brightness.light,
-      colorScheme: const ColorScheme.light(
-        primary: Color(0xff506B67),
-        secondary: Color(0xff718A85),
-        surface: Color(0xffF7F4EE),
-      ),
-      scaffoldBackgroundColor: const Color(0xffF5F2EB),
-      useMaterial3: true,
-    ),
+    // Dark, top to bottom — including every stock Material surface the app still
+    // opens: the time picker, a snack bar, the device sheet, text-selection
+    // handles, the dropdown's own menu. Without this the rebuilt pages would pop
+    // bright white dialogs, which is the one seam that would give the redesign
+    // away. Both slots carry the same theme so the system's light/dark setting
+    // cannot flip half the app back.
+    themeMode: ThemeMode.dark,
+    theme: _bloomDarkTheme,
+    darkTheme: _bloomDarkTheme,
     home: const BloomHomePage(),
   );
 }
 
+/// The Material shell under the app's own ink-and-paper system.
+///
+/// Only the pieces the app does not draw itself are configured here; everything
+/// visible in a Bloom screen comes from [BloomInk] / [BloomType].
+final _bloomDarkTheme = ThemeData(
+  brightness: Brightness.dark,
+  colorScheme: const ColorScheme.dark(
+    primary: BloomInk.text,
+    onPrimary: BloomInk.inverseInk,
+    secondary: BloomInk.accent,
+    surface: BloomInk.panel,
+    onSurface: BloomInk.text,
+  ),
+  scaffoldBackgroundColor: BloomInk.page,
+  canvasColor: BloomInk.panel,
+  splashFactory: InkRipple.splashFactory,
+  useMaterial3: true,
+);
+
 class BloomHomePage extends StatefulWidget {
-  const BloomHomePage({super.key});
+  const BloomHomePage({
+    super.key,
+    this.identity,
+    this.api,
+    this.displayPreferences,
+  });
+
+  /// Test seams. Production passes nothing and the state builds the real
+  /// collaborators; the widget tests inject a stub identity and a stubbed
+  /// `http.Client` so `_load()` can be observed (in particular the requests it
+  /// must *not* make).
+  final DeviceIdentityRepository? identity;
+  final BloomApiClient? api;
+  final DisplayPreferences? displayPreferences;
 
   @override
   State<BloomHomePage> createState() => _BloomHomePageState();
 }
 
-class _BloomHomePageState extends State<BloomHomePage> {
-  final _identity = DeviceIdentityRepository();
-  final _api = BloomApiClient();
-  final _displayPreferences = DisplayPreferences();
+class _BloomHomePageState extends State<BloomHomePage>
+    with WidgetsBindingObserver {
+  late final DeviceIdentityRepository _identity =
+      widget.identity ?? DeviceIdentityRepository();
+  late final BloomApiClient _api = widget.api ?? BloomApiClient();
+  late final DisplayPreferences _displayPreferences =
+      widget.displayPreferences ?? DisplayPreferences();
 
   Timer? _pairingPoll;
   Timer? _messageTimer;
@@ -87,22 +121,31 @@ class _BloomHomePageState extends State<BloomHomePage> {
   String? _originalPhotoPath;
   String? _date;
   String? _message;
+
+  /// The master switch, mirrored from the device page: off means the widget is
+  /// not running and this page must not fetch anything.
+  bool _widgetEnabled = true;
   bool _paired = false;
   bool _loading = true;
   bool _pairingRefreshing = false;
   bool _nextLoading = false;
-  bool _modeSwitching = false;
   int _selectedTab = 0;
+
+  /// Device whose photos the photo page shows. `null` = this phone (the only
+  /// device whose photos the app can load).
+  String? _photoDeviceId;
   BloomDisplaySettings _displaySettings = const BloomDisplaySettings();
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _load();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pairingPoll?.cancel();
     _messageTimer?.cancel();
     super.dispose();
@@ -118,6 +161,40 @@ class _BloomHomePageState extends State<BloomHomePage> {
       if (mounted) {
         setState(() => _credentials = credentials);
       }
+      // Local-only, and deliberately *not* `read()`: the mirror
+      // (`bloom.display_mode` + the three `bloom.carousel_*` keys) is the phone
+      // widget's own record, and a server read here would (a) write the frame's
+      // `eink` schedule into it, changing the phone widget's cadence, and
+      // (b) put a network round trip in front of the first frame even though
+      // the photo page shows no settings at all. `readLocal()` touches neither
+      // the network nor the mirror and still gives the photo page the phone's
+      // own mode, which picks the carousel/recommendation sync path.
+      final displaySettingsFuture = _displayPreferences.readLocal();
+      // **The master switch, ahead of every request.** With the widget switched
+      // off the app must not read a single byte from the server — the user's
+      // words were "也不会去走接口，它就不读取线上的数据了". So the gate is here,
+      // before the registration and status calls, and the page falls back to
+      // whatever is already on disk (nothing is downloaded, nothing is written).
+      final widgetEnabled = await _displayPreferences.readWidgetEnabled();
+      if (!widgetEnabled) {
+        final repository = DailyContentRepository(api: _api);
+        final cached = await repository.cachedContent();
+        final cachedPortrait = await repository.cached('portrait');
+        final local = await displaySettingsFuture;
+        if (!mounted) return;
+        setState(() {
+          _widgetEnabled = false;
+          _displaySettings = local;
+          _content = cached;
+          _portrait = cachedPortrait;
+          _date = cached?.date;
+          _paired = true;
+          _loading = false;
+          _message = null;
+        });
+        return;
+      }
+      if (mounted && !_widgetEnabled) setState(() => _widgetEnabled = true);
       DeviceStatus? status;
       PairingInfo? pairing;
       if (storedCredentials == null) {
@@ -143,7 +220,31 @@ class _BloomHomePageState extends State<BloomHomePage> {
       String? message;
       WidgetCurrentState? nativeState;
       var nativeStateApplied = false;
-      final displaySettings = await _displayPreferences.read();
+      var displaySettings = await displaySettingsFuture;
+      // **The server's own answer wins, and the mirror is made to agree.**
+      //
+      // `/status` carries the mode the server wants this device in on every
+      // launch. The app used to ignore it and read the *local mirror* instead,
+      // and the user's report was exactly the symptom: 推荐模式 on the home page
+      // and 轮播模式 on the very same phone's device page. The mirror is only
+      // ever written by this app, so anything set anywhere else (the web UI)
+      // never reached it — the mirror is the stale one, not the server.
+      //
+      // Reconciling here also re-points the home-screen widget, which reads that
+      // same mirror, so the server, the app and the widget end up telling one
+      // story. For the device whose token we hold this is always our own
+      // `mobile` record, so there is no way to pull a frame's schedule in here.
+      final serverMode = bloomModeFromWire(status?.mode);
+      if (serverMode != null && serverMode != displaySettings.mode) {
+        displaySettings = displaySettings.copyWith(mode: serverMode);
+        try {
+          await _displayPreferences.write(displaySettings);
+          await configureBackgroundSync(displaySettings);
+        } catch (_) {
+          // A failing mirror write must not stop the app from launching; the
+          // next launch will try again.
+        }
+      }
       if (status?.paired == true) {
         _pairingPoll?.cancel();
         // Pairing is a server-authentication state, not an image-refresh
@@ -168,7 +269,13 @@ class _BloomHomePageState extends State<BloomHomePage> {
               _paired = true;
               _portrait = cachedPortraitBeforeSync;
               _content = cachedBeforeSync;
-              _originalPhotoPath = cachedOriginal;
+              // A cache read that comes back empty must not *erase* a photo
+              // that is already on screen: the file is being renamed into place
+              // at exactly the wrong moment during every background refill, and
+              // the null it returns then used to blank the card — permanently,
+              // once anything re-read the cache periodically. Lines 433/623
+              // already merge this way; these two were the odd ones out.
+              _originalPhotoPath = cachedOriginal ?? _originalPhotoPath;
               _date = cachedBeforeSync.date;
               _displaySettings = displaySettings;
               _loading = false;
@@ -206,7 +313,8 @@ class _BloomHomePageState extends State<BloomHomePage> {
                 capturedDateText: nativeBefore.capturedDateText,
                 locationText: nativeBefore.locationText,
               );
-              _originalPhotoPath = nativeBefore.originalPhotoPath;
+              _originalPhotoPath =
+                  nativeBefore.originalPhotoPath ?? _originalPhotoPath;
               _date = nativeBefore.date;
               _displaySettings = displaySettings;
               _loading = false;
@@ -220,7 +328,14 @@ class _BloomHomePageState extends State<BloomHomePage> {
                       displaySettings,
                     )
                     : await repository.sync(credentials);
-          } catch (_) {
+          } catch (error, stack) {
+            // **Never swallow this silently again.** The user-visible notice
+            // ("正在显示上一张") is the *only* thing this catch produced, so a
+            // failing sync left no evidence anywhere — no log, no reason, just a
+            // stale photo. Whatever throws here is the answer to "why is the
+            // photo old", so it goes to logcat in full.
+            debugPrint('[BloomSync] foreground sync failed: $error');
+            debugPrint('[BloomSync] $stack');
             content = await repository.cachedContent();
             message = '新照片暂时刷新失败，正在显示上一张。';
           }
@@ -387,32 +502,102 @@ class _BloomHomePageState extends State<BloomHomePage> {
     }
   }
 
-  Future<void> _setDisplayMode(BloomDisplayMode mode) async {
-    if (_displaySettings.mode == mode ||
-        _loading ||
-        _modeSwitching ||
-        _nextLoading) {
-      return;
+  /// Devices the photo page switcher and the "设备" tab list.
+  ///
+  /// Hardcoded on purpose: `listMyDevices()` is a user-session endpoint and
+  /// throws [UnsupportedError] without a login (F1), so nothing here calls it.
+  List<BloomDevice> get _devices => bloomDevices(
+    credentials: _credentials,
+    localOnline: _credentials == null ? null : _paired,
+  );
+
+  /// The device whose photos the photo page shows; falls back to this phone.
+  BloomDevice? get _photoDevice {
+    final devices = _devices;
+    final selected = _photoDeviceId;
+    if (selected != null) {
+      for (final device in devices) {
+        if (device.deviceId == selected) return device;
+      }
     }
-    setState(() => _modeSwitching = true);
-    await HapticFeedback.selectionClick();
-    try {
-      final settings = _displaySettings.copyWith(mode: mode);
-      await _displayPreferences.write(settings);
-      if (Platform.isAndroid) await configureBackgroundSync(settings);
-      if (!mounted) return;
-      setState(() => _displaySettings = settings);
-      await _load();
-    } catch (_) {
-      _notify('模式切换失败，请稍后重试。');
-    } finally {
-      if (mounted) setState(() => _modeSwitching = false);
+    for (final device in devices) {
+      if (device.isLocal) return device;
     }
+    return null;
+  }
+
+  void _changePhotoDevice(String deviceId) {
+    if (_photoDeviceId == deviceId) return;
+    HapticFeedback.selectionClick();
+    setState(() => _photoDeviceId = deviceId);
+  }
+
+  void _showAddDeviceNotice() {
+    HapticFeedback.lightImpact();
+    _notify('扫码配对即将支持');
+  }
+
+  Future<void> _openDeviceDetail(BloomDevice device) async {
+    final credentials = _credentials;
+    await BloomDeviceDetailPage.open(
+      context,
+      device: device,
+      preferences: _displayPreferences,
+      settings: _displaySettings,
+      credentials: credentials,
+      // The app writes with the token it holds, so the caller is the app's own
+      // device (not the frame it is configuring).
+      callerDeviceId: credentials?.deviceId,
+      // The page paints the same photo the home page does, so its glass has
+      // something to refract.
+      photoPath: _originalPhotoPath,
+      pairing: _pairing,
+      onModeChanged: (settings) => _applyModeChange(device, settings),
+      onSaved: (settings) => _applySavedSettings(device, settings),
+      // **The link that was missing.** The detail page has always called this
+      // callback when the switch moves; nobody was listening, because this route
+      // was opened without it.
+      onWidgetEnabledChanged:
+          (enabled) => setState(() => _widgetEnabled = enabled),
+      onRefreshPairingCode: _newPairingCode,
+      onCopyPairingCode: _copyPairingCode,
+    );
+  }
+
+  /// [_displaySettings] models **this phone's** own record: the photo page uses
+  /// its mode to pick the carousel/recommendation sync path and its cadence to
+  /// drive the carousel, and it is the same record the local mirror holds.
+  ///
+  /// A save to the frame's `eink` record therefore must not be copied in here:
+  /// it belongs to another device, and adopting it would put the frame's mode
+  /// and cadence in front of the phone's photo page.
+  void _applySavedSettings(BloomDevice device, BloomDisplaySettings settings) {
+    if (!mounted || !device.isLocal) return;
+    setState(() => _displaySettings = settings);
+  }
+
+  /// A mode change made **on a device's own detail page**.
+  ///
+  /// This is the bug the user kept reporting: it used to take no device and
+  /// carry no guard, so changing the mode on the **frame's** page adopted the
+  /// frame's `eink` record into this phone's shared slot — the phone's home page
+  /// then said 推荐 while the phone's own page said 轮播, and switching the
+  /// device picker back to 手机小组件 showed the frame's mode. Its sibling
+  /// [_applySavedSettings] has had exactly this guard (and the comment above it)
+  /// all along; this one was simply missed.
+  Future<void> _applyModeChange(
+    BloomDevice device,
+    BloomDisplaySettings settings,
+  ) async {
+    if (!mounted || !device.isLocal) return;
+    setState(() => _displaySettings = settings);
+    // Re-run the load so the photo page shows the newly selected mode's photo.
+    await _load(showSpinner: false);
   }
 
   Future<void> _nextCarouselPhoto() async {
     final credentials = _credentials;
-    if (credentials == null || _loading || _modeSwitching || _nextLoading) {
+    if (credentials == null || _loading || _nextLoading) {
       return;
     }
     await HapticFeedback.lightImpact();
@@ -508,169 +693,9 @@ class _BloomHomePageState extends State<BloomHomePage> {
     });
   }
 
-  Future<void> _showCarouselSettings() async {
-    var draft = _displaySettings;
-    final result = await showModalBottomSheet<BloomDisplaySettings>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: const Color(0xffF7F4EE),
-      barrierColor: const Color(0x520D1716),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(30)),
-      ),
-      builder:
-          (context) => StatefulBuilder(
-            builder:
-                (context, setSheetState) => SafeArea(
-                  child: Padding(
-                    padding: EdgeInsets.fromLTRB(
-                      22,
-                      18,
-                      22,
-                      22 + MediaQuery.viewInsetsOf(context).bottom,
-                    ),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        Center(
-                          child: Container(
-                            width: 38,
-                            height: 4,
-                            decoration: BoxDecoration(
-                              color: const Color(0x382F3E3B),
-                              borderRadius: BorderRadius.circular(2),
-                            ),
-                          ),
-                        ),
-                        const SizedBox(height: 18),
-                        const Text(
-                          '轮播设置',
-                          style: TextStyle(
-                            fontSize: 24,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                        const SizedBox(height: 20),
-                        DropdownButtonFormField<int>(
-                          value: draft.intervalMinutes,
-                          decoration: const InputDecoration(
-                            labelText: '更换频率',
-                            border: OutlineInputBorder(),
-                          ),
-                          items:
-                              BloomDisplaySettings.allowedIntervals
-                                  .map(
-                                    (value) => DropdownMenuItem(
-                                      value: value,
-                                      child: Text(
-                                        BloomDisplaySettings(
-                                          intervalMinutes: value,
-                                        ).intervalLabel,
-                                      ),
-                                    ),
-                                  )
-                                  .toList(),
-                          onChanged: (value) {
-                            if (value != null) {
-                              setSheetState(
-                                () =>
-                                    draft = draft.copyWith(
-                                      intervalMinutes: value,
-                                    ),
-                              );
-                            }
-                          },
-                        ),
-                        const SizedBox(height: 10),
-                        _TimeSettingTile(
-                          title: '开始时间',
-                          value: draft.activeStart,
-                          onTap: () async {
-                            final selected = await showTimePicker(
-                              context: context,
-                              initialTime: _parseTime(draft.activeStart),
-                            );
-                            if (selected != null) {
-                              setSheetState(
-                                () =>
-                                    draft = draft.copyWith(
-                                      activeStart: _formatTime(selected),
-                                    ),
-                              );
-                            }
-                          },
-                        ),
-                        if (draft.intervalMinutes < 1440)
-                          _TimeSettingTile(
-                            title: '结束时间',
-                            value: draft.activeEnd,
-                            onTap: () async {
-                              final selected = await showTimePicker(
-                                context: context,
-                                initialTime: _parseTime(draft.activeEnd),
-                              );
-                              if (selected != null) {
-                                setSheetState(
-                                  () =>
-                                      draft = draft.copyWith(
-                                        activeEnd: _formatTime(selected),
-                                      ),
-                                );
-                              }
-                            },
-                          ),
-                        const SizedBox(height: 6),
-                        Text(
-                          draft.intervalMinutes == 1440
-                              ? '每天 ${draft.activeStart} 更新一次'
-                              : '预计每天更新 ${draft.expectedDailyItems} 张',
-                          style: const TextStyle(color: Color(0xff68736F)),
-                        ),
-                        const SizedBox(height: 22),
-                        FilledButton(
-                          onPressed: () => Navigator.pop(context, draft),
-                          style: FilledButton.styleFrom(
-                            minimumSize: const Size.fromHeight(52),
-                            backgroundColor: const Color(0xff526E69),
-                            foregroundColor: Colors.white,
-                          ),
-                          child: const Text('保存'),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-          ),
-    );
-    if (result == null) return;
-    if (result.intervalMinutes < 1440 && result.expectedDailyItems < 1) {
-      _notify('结束时间必须晚于开始时间。');
-      return;
-    }
-    await _displayPreferences.write(result);
-    if (Platform.isAndroid) await configureBackgroundSync(result);
-    if (!mounted) return;
-    setState(() => _displaySettings = result);
-    await HapticFeedback.mediumImpact();
-    _notify('轮播设置已保存。');
-    await _load(showSpinner: false);
-  }
-
-  static TimeOfDay _parseTime(String value) {
-    final parts = value.split(':');
-    return TimeOfDay(
-      hour: int.tryParse(parts.first) ?? 6,
-      minute: parts.length > 1 ? int.tryParse(parts[1]) ?? 0 : 0,
-    );
-  }
-
-  static String _formatTime(TimeOfDay value) =>
-      '${value.hour.toString().padLeft(2, '0')}:${value.minute.toString().padLeft(2, '0')}';
-
   @override
   Widget build(BuildContext context) => BloomGlassHome(
-    loading: _loading || _modeSwitching,
+    loading: _loading,
     paired: _paired,
     pairingRefreshing: _pairingRefreshing,
     nextLoading: _nextLoading,
@@ -683,40 +708,18 @@ class _BloomHomePageState extends State<BloomHomePage> {
     date: _date,
     message: _message,
     settings: _displaySettings,
+    devices: _devices,
+    widgetEnabled: _widgetEnabled,
+    onWidgetEnabledChanged: (enabled) => setState(() => _widgetEnabled = enabled),
+    selectedDeviceId: _photoDevice?.deviceId,
     onTabChanged: _changeTab,
     onRefresh: _load,
-    onModeChanged: _setDisplayMode,
     onNext: _nextCarouselPhoto,
-    onOpenCarouselSettings: _showCarouselSettings,
+    onDeviceChanged: _changePhotoDevice,
+    onOpenDevice: _openDeviceDetail,
+    onAddDevice: _showAddDeviceNotice,
     onRefreshPairingCode: _newPairingCode,
     onCopyDeviceId: _copyDeviceId,
     onCopyPairingCode: _copyPairingCode,
-  );
-}
-
-class _TimeSettingTile extends StatelessWidget {
-  const _TimeSettingTile({
-    required this.title,
-    required this.value,
-    required this.onTap,
-  });
-
-  final String title;
-  final String value;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) => ListTile(
-    contentPadding: EdgeInsets.zero,
-    title: Text(title),
-    trailing: Text(
-      value,
-      style: const TextStyle(
-        color: Color(0xff526E69),
-        fontSize: 16,
-        fontWeight: FontWeight.w600,
-      ),
-    ),
-    onTap: onTap,
   );
 }

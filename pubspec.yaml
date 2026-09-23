@@ -43,6 +43,11 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  # Real-device, real-server scenarios. These run *inside* the app process, so
+  # they can drive the UI without adb input injection — which this phone (MIUI,
+  # no SIM) forbids.
+  integration_test:
+    sdk: flutter
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
@@ -61,7 +66,12 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
   fonts:
+    # 霞鹜文楷 (LXGW WenKai, OFL): the app's one typeface, Latin included.
+    - family: BloomSerif
+      fonts:
+        - asset: assets/fonts/LXGWWenKai-Regular.ttf
     - family: BloomHandwriting
       fonts:
         - asset: assets/fonts/mmxj.ttf
