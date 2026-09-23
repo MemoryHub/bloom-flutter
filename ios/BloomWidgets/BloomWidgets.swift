@@ -360,7 +360,7 @@ private enum BloomWidgetRemoteLoader {
     // widget forward on its own. Handing back the largest id the shared plan
     // already holds makes `/carousel/plan` return the *next* page, exactly like
     // `after_item_id` does for the Android/Dart side.
-    let storedPlan = storedCarouselPlan(defaults: defaults)
+    var storedPlan = storedCarouselPlan(defaults: defaults)
     let cursor = carouselCursor(in: storedPlan)
     var requestBody: [String: Any] = [
       "target": "mobile",
@@ -401,6 +401,11 @@ private enum BloomWidgetRemoteLoader {
         method: "POST",
         body: requestBody
       )
+      // Drop the dead plan as well, exactly like the Dart side clears its pool:
+      // its item ids belong to a plan the server has already replaced, and
+      // merging them back would both pollute the timeline and make the *next*
+      // refill compute the same stale cursor all over again.
+      storedPlan = []
     }
     let now = Date()
     var entries: [BloomEntry] = []

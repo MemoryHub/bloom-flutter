@@ -382,15 +382,27 @@ class DailyContentRepository {
     }
     final batchCurrent = batchCurrentCandidate;
     final prefetchWatch = Stopwatch()..start();
+    // A due slot that cannot be prepared must not take the whole refill down with
+    // it. It is flagged here and in the render loop, and reported *after* the
+    // union has been submitted — because that submission is also what re-arms the
+    // native refill alarm, and the caller's 2-minute retry is useless without it.
+    var batchCurrentFailed = false;
     if (batchCurrent != null) {
-      await fetchPhoto(
-        batchCurrent.itemId,
-        timeout: const Duration(seconds: 30),
-      );
-      debugPrint(
-        '[BloomSync] current photo item=${batchCurrent.itemId} ready in '
-        '${prefetchWatch.elapsedMilliseconds}ms',
-      );
+      try {
+        await fetchPhoto(
+          batchCurrent.itemId,
+          timeout: const Duration(seconds: 30),
+        );
+        debugPrint(
+          '[BloomSync] current photo item=${batchCurrent.itemId} ready in '
+          '${prefetchWatch.elapsedMilliseconds}ms',
+        );
+      } catch (error) {
+        batchCurrentFailed = true;
+        debugPrint(
+          '[BloomSync] current photo item=${batchCurrent.itemId} failed: $error',
+        );
+      }
     }
     for (final item in plan.items) {
       if (batchCurrent != null && item.itemId == batchCurrent.itemId) continue;
@@ -476,7 +488,22 @@ class DailyContentRepository {
         } catch (_) {}
         debugPrint('[BloomSync] prepared photo item=${item.itemId}');
       } catch (error) {
-        if (batchCurrent != null && item.itemId == batchCurrent.itemId) rethrow;
+        if (batchCurrent != null && item.itemId == batchCurrent.itemId) {
+          // The slot that should be on screen now could not be prepared. Do not
+          // `rethrow`: that skips the submission below, so the native chain loses
+          // the very refill that could have recovered it. Flag it, let the union
+          // go out, and report the failure at the end of the method.
+          //
+          // The cursor deliberately does *not* hold a place for it either. A
+          // permanently broken asset would then be asked for forever and the pool
+          // would never grow past it; one skipped slot beats a stalled day, and
+          // the caller's retry still re-requests it whenever it is the page head.
+          batchCurrentFailed = true;
+          debugPrint(
+            '[BloomSync] current photo item=${item.itemId} failed: $error',
+          );
+          continue;
+        }
         // A broken future asset must not invalidate the current photo and all
         // previously prepared slots. The final partial schedule will request
         // another batch at its last usable entry.
@@ -494,7 +521,10 @@ class DailyContentRepository {
     // slot that was already armed.
     final union = _mergePool(pool, incoming);
     final scheduled = _capPool(union, nowMillis);
-    if (scheduled.isEmpty) throw StateError('没有任何可排程的槽位');
+    // An empty union is no longer fatal *here*. `scheduleCarousel` with no entries
+    // still arms the native recovery alarm, so throwing at this point would leave
+    // the widget with no alarm at all — the one failure that cannot be recovered
+    // from without opening the app. It is reported after the submission instead.
 
     // **The cursor is the largest id the pool actually holds** (step 2), not the
     // largest id fetched: a photo that timed out or was trimmed by the cap is
@@ -707,8 +737,19 @@ class DailyContentRepository {
       );
     }
     await _pruneCarouselOriginals(dir);
+    // ---- everything below is reported *after* the alarm chain was re-armed ----
+    if (scheduled.isEmpty) {
+      // A whole page that failed to prepare and no pool to fall back on: fail so
+      // the caller retries in two minutes rather than at the next slot.
+      throw StateError('本轮没有任何可排程的槽位，等待重试');
+    }
     if (currentReady == null || currentItemId < 1) {
       throw StateError('当前轮播照片既不在计划批次中，也没有可用的本地副本');
+    }
+    if (batchCurrentFailed) {
+      // The schedule is already submitted, so the alarm chain survives this; the
+      // failure only asks the caller to try again sooner than the next slot.
+      throw StateError('当前轮播照片未能准备，已保留原照片并重排闹钟');
     }
     return currentReady;
   }

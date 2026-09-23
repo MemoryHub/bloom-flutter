@@ -119,8 +119,12 @@ void main() {
   };
 
   /// Serves [pages] in order from `/carousel/plan` and a valid PNG from
-  /// `/carousel/photo`, recording every plan request body.
-  BloomApiClient apiReturning(List<Map<String, dynamic>> pages) {
+  /// `/carousel/photo`, recording every plan request body. Ids in
+  /// [failingPhotoIds] answer the photo endpoint with a 500.
+  BloomApiClient apiReturning(
+    List<Map<String, dynamic>> pages, {
+    Set<int> failingPhotoIds = const {},
+  }) {
     var index = 0;
     return BloomApiClient(
       client: MockClient((request) async {
@@ -137,6 +141,10 @@ void main() {
           );
         }
         if (request.url.path.endsWith('/carousel/photo')) {
+          final body = jsonDecode(request.body) as Map<String, dynamic>;
+          if (failingPhotoIds.contains((body['item_id'] as num?)?.toInt())) {
+            return http.Response('{"detail":"boom"}', 500);
+          }
           return http.Response.bytes(
             pngBytes,
             200,
@@ -401,6 +409,64 @@ void main() {
       reason: 'scheduleCarousel 是原生重排补货闹钟的唯一入口，失败路径也必须提交，'
           '否则小组件既不动、又没有任何闹钟能再叫醒它',
     );
+  });
+
+  test('当前项准备失败：排程仍提交、失败上报，游标不因此被钉死', () async {
+    final base = DateTime.now().subtract(const Duration(minutes: 1));
+    // The page head is the slot due right now, and its photo endpoint is broken.
+    final api = apiReturning([
+      planWith(
+        planId: 970,
+        currentItemId: 201,
+        ids: [201, 202, 203, 204],
+        first: base,
+      ),
+    ], failingPhotoIds: {201});
+
+    await expectLater(
+      DailyContentRepository(api: api).syncCarousel(credentials, settings),
+      throwsA(isA<StateError>()),
+    );
+
+    expect(
+      scheduledCalls,
+      isNotEmpty,
+      reason: '当前项失败也必须提交排程，否则小组件既不动、又没有闹钟能再叫醒它',
+    );
+    expect(scheduledIds(scheduledCalls.length - 1), containsAll([202, 203, 204]));
+    final pool =
+        jsonDecode(await File('${cacheDir.path}/carousel-pool.json').readAsString())
+            as Map<String, dynamic>;
+    expect(
+      pool['last_item_id'],
+      204,
+      reason: '一张坏图不能把游标钉死，否则后面的槽位永远拿不到',
+    );
+  });
+
+  test('整页都失败：仍提交（空）排程保住恢复闹钟，然后才上报失败', () async {
+    final base = DateTime.now().subtract(const Duration(minutes: 1));
+    final api = apiReturning([
+      planWith(
+        planId: 980,
+        currentItemId: 301,
+        ids: [301, 302, 303, 304],
+        first: base,
+      ),
+    ], failingPhotoIds: {301, 302, 303, 304});
+
+    await expectLater(
+      DailyContentRepository(api: api).syncCarousel(credentials, settings),
+      throwsA(isA<StateError>()),
+    );
+
+    expect(planRequests, hasLength(1));
+    expect(
+      scheduledCalls,
+      isNotEmpty,
+      reason: '空排程也必须提交：原生层仍会据此排下恢复闹钟',
+    );
+    expect(scheduledIds(scheduledCalls.length - 1), isEmpty);
   });
 
   test('池子上限：连续补货不无限增长，被裁掉的一页不被游标跳过', () async {
