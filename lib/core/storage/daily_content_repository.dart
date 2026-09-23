@@ -591,6 +591,26 @@ class DailyContentRepository {
   File _versionedImage(Directory dir, String family, int recommendationId) =>
       File('${dir.path}/mobile-local-$family-$recommendationId.png');
 
+  /// **The next moment the page has something new to show.**
+  ///
+  /// Written by every sync (`next_slot_at_ms` in `daily.json`) and read here so
+  /// the foreground can arm one timer for that instant instead of asking the
+  /// cache every 30 seconds whether anything changed. Null when the day's slots
+  /// are exhausted or the file is unreadable — the caller then simply leaves the
+  /// existing behaviour alone rather than guessing a time.
+  Future<int?> nextSlotAtMillis() async {
+    try {
+      final dir = await _dir();
+      final file = File('${dir.path}/daily.json');
+      if (!await file.exists()) return null;
+      final raw = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+      return (raw['next_slot_at_ms'] as num?)?.toInt();
+    } catch (error) {
+      debugPrint('[BloomSync] next slot unavailable: $error');
+      return null;
+    }
+  }
+
   Future<void> _pruneCarouselOriginals(Directory dir) async {
     final files = <File>[];
     await for (final entity in dir.list()) {

@@ -116,6 +116,8 @@ class _BloomHomePageState extends State<BloomHomePage>
   Timer? _messageTimer;
   /// Turns the page when its slot arrives while the app is open.
   Timer? _slotWatch;
+  /// Fires exactly when the next slot begins.
+  Timer? _slotWake;
   DeviceCredentials? _credentials;
   PairingInfo? _pairing;
   CachedWidgetImage? _portrait;
@@ -166,11 +168,33 @@ class _BloomHomePageState extends State<BloomHomePage>
       if (!mounted || _loading || !_widgetEnabled) return;
       _load(showSpinner: false);
     });
+    _armNextSlotWake();
+  }
+
+  /// **One wake-up per slot, at the slot's own moment.**
+  ///
+  /// `next_slot_at_ms` is written by every sync with the same number the native
+  /// alarm chain arms itself with, so waking on it means the page and the widget
+  /// turn at the same instant. The interval above stays only as a fallback for
+  /// when the file is missing, the slot is in the past, or the write raced the
+  /// read — it is no longer the mechanism.
+  Future<void> _armNextSlotWake() async {
+    final at = await DailyContentRepository(api: _api).nextSlotAtMillis();
+    if (!mounted || at == null) return;
+    final delay = at - DateTime.now().millisecondsSinceEpoch;
+    if (delay <= 0) return;
+    _slotWake?.cancel();
+    _slotWake = Timer(Duration(milliseconds: delay + 1500), () async {
+      if (!mounted || !_widgetEnabled) return;
+      await _load(showSpinner: false);
+      await _armNextSlotWake();
+    });
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _slotWake?.cancel();
     _slotWatch?.cancel();
     _pairingPoll?.cancel();
     _messageTimer?.cancel();
