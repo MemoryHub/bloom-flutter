@@ -233,21 +233,55 @@ class DailyContentRepository {
     Directory dir,
     File lock,
   ) async {
-    // **The day-walking cursor is not wired up yet.**
+    // ---- **walk the day with a cursor; let the pool own "current"** ------
     //
-    // `carousel/plan` accepts `after_item_id` and the app stores a per-day
-    // `last_item_id` next to the photos — but feeding it in skipped the item the
-    // server calls "current", and the scheduling below requires the current item
-    // to be inside the batch it just fetched. The sync then threw
-    // `Bad state: 当前轮播照片不在计划批次中` on every attempt, forever, and a
-    // fresh install showed no photo at all.
+    // The two jobs used to be tangled in this one method, and that is exactly
+    // why the first cursor attempt had to be rolled back: `carousel/plan`
+    // deliberately returns the page that *starts after* the server's
+    // `current_item_id`, while the old code insisted the current item be inside
+    // the fetched batch. Every refill then threw
+    // `Bad state: 当前轮播照片不在计划批次中`, and because the cursor advanced on
+    // each failure, no later attempt could recover — a fresh install showed no
+    // photo at all.
     //
-    // Repeating a few photos is a much smaller sin than a widget that never
-    // updates, so the fetch stays cursor-less until the *reconciliation* is
-    // taught that a refill batch is purely additive: keep the plan's current
-    // item and append the new ones to the pool.
-    final plan = await api.carouselPlan(credentials, settings);
-    if (plan.items.isEmpty) throw StateError('轮播计划为空');
+    // They are separated here:
+    //
+    //   * the **cursor** (`after_item_id`) decides which *new* photos to fetch
+    //     and only ever appends them to the pool;
+    //   * the **pool** decides which photo is on screen *now*, and a refill page
+    //     may not change it.
+    //
+    // The native layer always receives the **whole union**, because
+    // `scheduleCarousel` overwrites what it stores — submitting only the new page
+    // would drop every slot that is already armed.
+    final now = DateTime.now();
+    final nowMillis = now.millisecondsSinceEpoch;
+    final today = _dayKey(now);
+    final storedPool = await _readPool(dir);
+    final pool = <Map<String, Object?>>[
+      if (storedPool != null && storedPool.day == today) ...storedPool.entries,
+    ];
+    // **Step 2 — the refill anchor.** The largest id the pool actually holds,
+    // i.e. the last page boundary this phone prepared. A page that failed to
+    // render never entered the pool, so it is asked for again instead of being
+    // silently stepped over. It is per local day: a new day starts from the top.
+    final anchor =
+        storedPool != null &&
+            storedPool.day == today &&
+            storedPool.lastItemId > 0
+        ? storedPool.lastItemId
+        : _maxItemId(pool);
+    final plan = await api.carouselPlan(
+      credentials,
+      settings,
+      afterItemId: anchor > 0 ? anchor : null,
+    );
+    debugPrint(
+      '[BloomSync] carousel plan=${plan.planId} items=${plan.items.length} '
+      'current=${plan.currentItemId} after=${anchor > 0 ? anchor : 'none'} '
+      'pool=${pool.length}',
+    );
+    if (plan.items.isEmpty && pool.isEmpty) throw StateError('轮播计划为空');
 
     // ---- **the plan's own "now", then the rest** ------------------------
     //
@@ -300,29 +334,39 @@ class DailyContentRepository {
       await temp.rename(path);
     });
 
+    // **"Current" is the slot that is due now — not merely the id the server
+    // labelled.** Outside the active window the server names *tomorrow's* first
+    // item as `current_item_id` (the iOS timeline has guarded against this for a
+    // while). Treating that as current would push tomorrow's photo onto the
+    // widget tonight.
+    CarouselItemContent? batchCurrentCandidate;
+    for (final item in plan.items) {
+      if (item.itemId != plan.currentItemId) continue;
+      if (item.displayAt.toLocal().isAfter(now.add(const Duration(seconds: 60)))) {
+        continue;
+      }
+      batchCurrentCandidate = item;
+      break;
+    }
+    final batchCurrent = batchCurrentCandidate;
     final prefetchWatch = Stopwatch()..start();
-    if (plan.items.any((item) => item.itemId == plan.currentItemId)) {
+    if (batchCurrent != null) {
       await fetchPhoto(
-        plan.currentItemId,
+        batchCurrent.itemId,
         timeout: const Duration(seconds: 30),
       );
       debugPrint(
-        '[BloomSync] current photo item=${plan.currentItemId} ready in '
+        '[BloomSync] current photo item=${batchCurrent.itemId} ready in '
         '${prefetchWatch.elapsedMilliseconds}ms',
       );
     }
     for (final item in plan.items) {
-      if (item.itemId == plan.currentItemId) continue;
+      if (batchCurrent != null && item.itemId == batchCurrent.itemId) continue;
       // Deliberately not awaited: they download while the loop renders.
       unawaited(fetchPhoto(item.itemId).catchError((Object _) {}));
     }
-    debugPrint(
-      '[BloomSync] carousel plan=${plan.planId} items=${plan.items.length} '
-      'current=${plan.currentItemId}',
-    );
-    final scheduledEntries = <Map<String, Object?>>[];
+    final incoming = <Map<String, Object?>>[];
     DailyContent? currentManifest;
-    Uint8List? currentPhotoBytes;
 
     for (final item in plan.items) {
       try {
@@ -335,7 +379,6 @@ class DailyContentRepository {
             family: _versionedImage(dir, family, item.itemId),
         };
         Uint8List photoBytes;
-        String? itemEtag;
         if (await original.exists()) {
           photoBytes = await original.readAsBytes();
           debugPrint('[BloomSync] reusing cached photo item=${item.itemId}');
@@ -345,7 +388,6 @@ class DailyContentRepository {
           debugPrint('[BloomSync] waiting for photo item=${item.itemId}');
           await fetchPhoto(item.itemId);
           photoBytes = await original.readAsBytes();
-          itemEtag = photoEtag[item.itemId];
         }
         final paths = <String, String>{};
         for (final family in ['portrait', 'square', 'largeSquare']) {
@@ -362,62 +404,18 @@ class DailyContentRepository {
           }
           paths[family] = output.path;
         }
-        scheduledEntries.add({
-          'itemId': item.itemId,
-          'displayAtMillis': item.displayAt.toLocal().millisecondsSinceEpoch,
-          'date': manifest.date,
-          'portraitPath': paths['portrait']!,
-          'squarePath': paths['square']!,
-          'largeSquarePath': paths['largeSquare']!,
-          'originalPhotoPath': originalPath,
-          'captionZh': manifest.captionZh,
-          'captionEn': manifest.captionEn,
-          'capturedDateText': manifest.capturedDateText,
-          'locationText': manifest.locationText,
-        });
-        if (item.itemId == plan.currentItemId) {
+        incoming.add(_poolEntry(item, manifest, paths, originalPath));
+        if (batchCurrent != null && item.itemId == batchCurrent.itemId) {
           currentManifest = manifest;
-          currentPhotoBytes = photoBytes;
+          // Keep `original.photo` pointing at the slot the app shows now.
           final photoFile = File('${dir.path}/original.photo');
           final photoTemp = File('${photoFile.path}.tmp');
           await photoTemp.writeAsBytes(photoBytes, flush: true);
           await photoTemp.rename(photoFile.path);
-          await File('${dir.path}/daily.json').writeAsString(
-            jsonEncode({
-              'mode': 'carousel',
-              'photo_etag': itemEtag,
-              'date': manifest.date,
-              'recommendation_id': manifest.recommendationId,
-              'carousel_item_id': plan.currentItemId,
-              'carousel_plan_id': plan.planId,
-              'next_check_at': plan.nextCheckAt.toIso8601String(),
-              // **Step one of "turn the page at the right moment".**
-              //
-              // This is the earliest slot in the batch that has not passed yet —
-              // the same number the native alarm chain arms itself with. Writing
-              // it next to the photo is what lets the foreground schedule a
-              // single wake-up for that instant instead of polling: one timer per
-              // slot, and the app turns the page at the same second the widget
-              // does.
-              'next_slot_at_ms': (() {
-                final nowMillis = DateTime.now().millisecondsSinceEpoch;
-                final upcoming = [
-                  for (final slot in plan.items)
-                    slot.displayAt.toLocal().millisecondsSinceEpoch,
-                ].where((at) => at > nowMillis).toList()
-                  ..sort();
-                return upcoming.isEmpty ? null : upcoming.first;
-              })(),
-              'caption_zh': manifest.captionZh,
-              'caption_en': manifest.captionEn,
-              'captured_date_text': manifest.capturedDateText,
-              'location_text': manifest.locationText,
-              'photo_orientation': manifest.photoOrientation,
-            }),
-            flush: true,
-          );
           // Publish the current item immediately. If a later prefetch item is
           // slow, the widget still advances instead of discarding the batch.
+          // `daily.json` is written once at the end, when the union — and with
+          // it the true `next_slot_at_ms` — is known.
           await WidgetBridge().update(
             portraitPath: paths['portrait']!,
             squarePath: paths['square']!,
@@ -434,17 +432,19 @@ class DailyContentRepository {
         }
 
         // Persist a usable partial timeline after every completed item. A
-        // later timeout can resume from cache without losing earlier work.
+        // later timeout can resume from cache without losing earlier work. The
+        // batch is merged with the stored pool so this partial write never drops
+        // a slot that is already armed.
         await WidgetBridge().scheduleCarousel(
           planId: plan.planId,
-          entries: scheduledEntries,
+          entries: _mergePool(pool, incoming),
         );
         try {
           await lock.setLastModified(DateTime.now());
         } catch (_) {}
         debugPrint('[BloomSync] prepared photo item=${item.itemId}');
       } catch (error) {
-        if (item.itemId == plan.currentItemId) rethrow;
+        if (batchCurrent != null && item.itemId == batchCurrent.itemId) rethrow;
         // A broken future asset must not invalidate the current photo and all
         // previously prepared slots. The final partial schedule will request
         // another batch at its last usable entry.
@@ -454,78 +454,208 @@ class DailyContentRepository {
       }
     }
 
-    final manifest = currentManifest;
+    // ---- steps 4, 6, 7: append, submit the union, keep it bounded --------
+    //
+    // The page is *added* to the pool, never substituted for it, and the native
+    // layer receives the whole union: `scheduleCarousel` overwrites what it
+    // stores, so a submission of "just the new page" would silently drop every
+    // slot that was already armed.
+    final union = _mergePool(pool, incoming);
+    final scheduled = _capPool(union, nowMillis);
+    if (scheduled.isEmpty) throw StateError('没有任何可排程的槽位');
+
+    // **The cursor is the largest id the pool actually holds** (step 2), not the
+    // largest id fetched: a photo that timed out or was trimmed by the cap is
+    // therefore asked for again on the next refill instead of being stepped over
+    // for good. The one exception is a page that produced *nothing at all* — then
+    // the cursor advances anyway, so one poisoned item cannot stall the day.
+    var lastItemId = _maxItemId(scheduled);
+    final fetchedMax = plan.items.fold<int>(
+      0,
+      (max, item) => item.itemId > max ? item.itemId : max,
+    );
+    if (incoming.isEmpty && fetchedMax > lastItemId) {
+      lastItemId = fetchedMax;
+      debugPrint(
+        '[BloomSync] cursor advanced past a page that rendered nothing to=$lastItemId',
+      );
+    }
+
+    var currentItemId = batchCurrent?.itemId ?? 0;
+    Map<String, Object?>? publishEntry;
+    var publishCurrent = false;
+    if (currentManifest == null) {
+      // **Step 5 — the current slot is not decided by the batch.**
+      //
+      // A pure refill page starts *after* the server's current item, so it
+      // simply does not contain it. That is not an error: the due slot is read
+      // back from the persisted pool, or from whatever the native layer already
+      // shows. This is the exact case the previous attempt crashed on.
+      Map<String, Object?>? dueEntry;
+      for (final entry in scheduled) {
+        if (_poolAt(entry) <= nowMillis) dueEntry = entry;
+      }
+      if (dueEntry != null) {
+        final path = dueEntry['originalPhotoPath'] as String?;
+        if (path == null || !await File(path).exists()) dueEntry = null;
+      }
+      final native = await WidgetBridge().readCurrentState();
+      final nativeCarousel =
+          native != null && (native.mode == null || native.mode == 'carousel')
+          ? native
+          : null;
+      final duePoolId = dueEntry == null ? 0 : _poolItemId(dueEntry);
+      final nativeId = nativeCarousel?.recommendationId ?? 0;
+      if (nativeCarousel != null && nativeId > duePoolId) {
+        // The native timeline moved on (an alarm fired while Flutter was not
+        // running): it is newer than the pool, so it stays the current item.
+        currentItemId = nativeId;
+        currentManifest = _nativeManifest(nativeCarousel);
+      } else if (dueEntry != null) {
+        currentItemId = duePoolId;
+        currentManifest = _manifestFromPoolEntry(dueEntry);
+        publishEntry = dueEntry;
+        // Catch the native share up when the alarm never ran (device off, widget
+        // not installed) — but never roll it back to an older slot.
+        publishCurrent = nativeId < duePoolId;
+      } else if (nativeCarousel != null) {
+        currentItemId = nativeId;
+        currentManifest = _nativeManifest(nativeCarousel);
+      } else {
+        final cached = await cachedContent();
+        if (cached != null) {
+          currentManifest = cached;
+          currentItemId = cached.recommendationId;
+        }
+      }
+    }
+    // The batch's own current slot was already published inside the loop, so the
+    // only path that can still need a native write is the pool/native one above
+    // (and the fresh-install fallback below).
+
+    if (currentManifest == null && plan.items.isNotEmpty) {
+      // Nothing due anywhere — a fresh install opened outside the active window,
+      // where the server names tomorrow's first item as `current_item_id`. Show
+      // that item rather than nothing, but do not push it over a photo that is
+      // already on screen.
+      final fallbackItem = plan.items.firstWhere(
+        (item) => item.itemId == plan.currentItemId,
+        orElse: () => plan.items.first,
+      );
+      currentItemId = fallbackItem.itemId;
+      currentManifest = fallbackItem.asDailyContent();
+      publishEntry = scheduled.firstWhere(
+        (entry) => _poolItemId(entry) == currentItemId,
+        orElse: () => const <String, Object?>{},
+      );
+      final native = await WidgetBridge().readCurrentState();
+      publishCurrent = native == null || native.recommendationId < 1;
+    }
+    final resolvedManifest = currentManifest;
+    if (resolvedManifest == null || currentItemId < 1) {
+      throw StateError('当前轮播照片既不在计划批次中，也没有可用的本地副本');
+    }
+
     // **The one place alarms come from.** Everything above can throw, and when
-    // it does this call is skipped and *no* alarm is ever armed — the widget then
-    // stops updating with no evidence anywhere. Measured on device: three photos
-    // prepared, `dumpsys alarm` empty. So both the decision and its outcome are
-    // logged, including the cases that used to fail silently.
-    // The slot the page should wake up for. `displayAtMillis` is already on
-    // every entry, and the native layer derives its alarms from exactly this
-    // number — so the same value is what a foreground "wake exactly at the next
-    // slot" timer needs, instead of the poll that had to be rolled back.
-    final nowMillis = DateTime.now().millisecondsSinceEpoch;
-    final upcoming = scheduledEntries
-        .map((entry) => (entry['displayAtMillis'] as num?)?.toInt() ?? 0)
+    // it does the `scheduleCarousel` below is skipped and *no* alarm is ever
+    // armed — the widget then stops updating with no evidence anywhere. Measured
+    // on device: three photos prepared, `dumpsys alarm` empty. So both the
+    // decision and its outcome are logged, including the cases that used to fail
+    // silently.
+    //
+    // `next_slot_at_ms` is the union's earliest future slot — the same number the
+    // native alarm chain arms itself with, so an open page turns with the widget
+    // instead of polling for it.
+    final upcoming = scheduled
+        .map(_poolAt)
         .where((at) => at > nowMillis)
         .toList()
       ..sort();
     final nextSlotMillis = upcoming.isEmpty ? null : upcoming.first;
+    final nextSlotLabel = nextSlotMillis == null
+        ? 'none'
+        : '$nextSlotMillis '
+              '(${DateTime.fromMillisecondsSinceEpoch(nextSlotMillis).toIso8601String()})';
     debugPrint(
-      '[BloomSync] scheduling plan=${plan.planId} '
-      'entries=${scheduledEntries.length} current=${plan.currentItemId} '
-      'manifest=${manifest != null} bytes=${currentPhotoBytes != null} '
-      'next_slot=${nextSlotMillis ?? 'none'} '
-      '(${nextSlotMillis == null ? '-' : DateTime.fromMillisecondsSinceEpoch(nextSlotMillis).toIso8601String()})',
+      '[BloomSync] scheduling plan=${plan.planId} entries=${scheduled.length} '
+      'current=$currentItemId batch_current=${batchCurrent?.itemId ?? 'none'} '
+      'next_slot=$nextSlotLabel',
     );
-    if (manifest == null || currentPhotoBytes == null) {
-      throw StateError('当前轮播照片不在计划批次中');
+
+    // `daily.json` is the Dart-side mirror of "what is on screen now". A pure
+    // refill must not move it: the resolved current above is deliberately the due
+    // slot, not the newest fetched one.
+    await _writeDailyManifest(
+      dir,
+      manifest: resolvedManifest,
+      itemId: currentItemId,
+      planId: plan.planId,
+      nextCheckAt: plan.nextCheckAt,
+      nextSlotAtMillis: nextSlotMillis,
+      etag: photoEtag[currentItemId],
+    );
+
+    if (publishCurrent) {
+      final portraitPath = publishEntry?['portraitPath'] as String?;
+      if (portraitPath != null && await File(portraitPath).exists()) {
+        await WidgetBridge().update(
+          portraitPath: portraitPath,
+          squarePath:
+              (publishEntry?['squarePath'] as String?) ?? portraitPath,
+          largeSquarePath:
+              (publishEntry?['largeSquarePath'] as String?) ?? portraitPath,
+          originalPhotoPath: publishEntry?['originalPhotoPath'] as String?,
+          date: resolvedManifest.date,
+          recommendationId: currentItemId,
+          captionZh: resolvedManifest.captionZh,
+          captionEn: resolvedManifest.captionEn,
+          capturedDateText: resolvedManifest.capturedDateText,
+          locationText: resolvedManifest.locationText,
+          mode: 'carousel',
+        );
+      }
     }
-    if (scheduledEntries.isEmpty) {
-      throw StateError('没有任何可排程的槽位');
-    }
+
     // ---- the pool, on disk, where the next refill can find it -------------
     //
-    // Step 1 of walking the day instead of replaying its first four photos.
-    //
-    // Until now this list of scheduled entries existed **only** in the native
-    // layer's SharedPreferences, and every `scheduleCarousel` call *overwrites*
-    // it. So a refill could not compute a union — it had no way to know what was
-    // already scheduled — which is the mechanical reason the old cursor attempt
-    // dropped slots and had to be rolled back. Writing the same entries next to
-    // the photos first gives the next sync something to merge with.
+    // Step 1 of walking the day instead of replaying its first four photos: this
+    // is what makes the union above possible at all. Before it, the scheduled
+    // entries existed **only** in the native layer's SharedPreferences, and every
+    // `scheduleCarousel` call overwrites that — so a refill had nothing to merge
+    // with, which is the mechanical reason the old cursor attempt dropped slots.
     final poolFile = File('${dir.path}/carousel-pool.json');
     try {
       await poolFile.writeAsString(
         jsonEncode({
-          'day': DateTime.now().toIso8601String().substring(0, 10),
+          'day': today,
           'plan_id': plan.planId,
-          'current_item_id': plan.currentItemId,
-          'entries': scheduledEntries,
+          'current_item_id': currentItemId,
+          'last_item_id': lastItemId,
+          'entries': scheduled,
         }),
         flush: true,
       );
       debugPrint(
-        '[BloomSync] pool saved: day=${DateTime.now().toIso8601String().substring(0, 10)} '
-        'entries=${scheduledEntries.length} last=${scheduledEntries.last['itemId']}',
+        '[BloomSync] pool saved: day=$today entries=${scheduled.length} '
+        'current=$currentItemId last=$lastItemId fetched=${plan.items.length}',
       );
     } catch (error) {
       debugPrint('[BloomSync] pool save failed: $error');
     }
     await WidgetBridge().scheduleCarousel(
       planId: plan.planId,
-      entries: scheduledEntries,
+      entries: scheduled,
     );
-    debugPrint('[BloomSync] scheduled ${scheduledEntries.length} slots ok');
-    for (final family in ['portrait', 'square', 'largeSquare']) {
+    debugPrint('[BloomSync] scheduled ${scheduled.length} slots ok');
+    for (final family in _families) {
       await _pruneVersionedImages(
         dir,
         family,
-        keeping: _versionedImage(dir, family, plan.currentItemId).path,
+        keeping: _versionedImage(dir, family, currentItemId).path,
       );
     }
     await _pruneCarouselOriginals(dir);
-    return manifest;
+    return resolvedManifest;
   }
 
   Future<CachedWidgetImage?> cached(String orientation) async {
@@ -591,6 +721,173 @@ class DailyContentRepository {
   File _versionedImage(Directory dir, String family, int recommendationId) =>
       File('${dir.path}/mobile-local-$family-$recommendationId.png');
 
+  // ---- the carousel pool ------------------------------------------------
+  //
+  // A slot is one `itemId` plus the four files and the caption that belong to
+  // it. The pool is the list of slots this phone has prepared for one local day,
+  // persisted next to the photos so a refill can merge with it (see
+  // `_downloadAndScheduleCarouselPlan`).
+
+  /// Pool size. Every entry needs one original and three rendered images on
+  /// disk, and the pruners below keep **eight** of each — the cap and the
+  /// pruners are deliberately the same number, so a slot is never deleted
+  /// underneath the alarm that still points at it.
+  static const _poolLimit = 8;
+  static const _families = ['portrait', 'square', 'largeSquare'];
+
+  String _dayKey(DateTime at) => at.toIso8601String().substring(0, 10);
+
+  int _poolItemId(Map<String, Object?> entry) =>
+      (entry['itemId'] as num?)?.toInt() ?? 0;
+
+  int _poolAt(Map<String, Object?> entry) =>
+      (entry['displayAtMillis'] as num?)?.toInt() ?? 0;
+
+  int _maxItemId(Iterable<Map<String, Object?>> entries) {
+    var max = 0;
+    for (final entry in entries) {
+      final id = _poolItemId(entry);
+      if (id > max) max = id;
+    }
+    return max;
+  }
+
+  Map<String, Object?> _poolEntry(
+    CarouselItemContent item,
+    DailyContent manifest,
+    Map<String, String> paths,
+    String originalPath,
+  ) => {
+    'itemId': item.itemId,
+    'displayAtMillis': item.displayAt.toLocal().millisecondsSinceEpoch,
+    'date': manifest.date,
+    'portraitPath': paths['portrait'],
+    'squarePath': paths['square'],
+    'largeSquarePath': paths['largeSquare'],
+    'originalPhotoPath': originalPath,
+    'captionZh': manifest.captionZh,
+    'captionEn': manifest.captionEn,
+    'capturedDateText': manifest.capturedDateText,
+    'locationText': manifest.locationText,
+  };
+
+  /// Appends [incoming] to [existing]. The incoming copy of an id wins (it was
+  /// just re-rendered), and the result is ordered by slot time so the native
+  /// layer always receives a chronological timeline.
+  List<Map<String, Object?>> _mergePool(
+    List<Map<String, Object?>> existing,
+    List<Map<String, Object?>> incoming,
+  ) {
+    final byId = <int, Map<String, Object?>>{};
+    for (final entry in [...existing, ...incoming]) {
+      final id = _poolItemId(entry);
+      if (id > 0) byId[id] = entry;
+    }
+    return byId.values.toList()
+      ..sort((a, b) => _poolAt(a).compareTo(_poolAt(b)));
+  }
+
+  /// **Step 7 — keep the pool bounded.**
+  ///
+  /// The current slot, the one before it, and the run of future slots that fits
+  /// inside [limit] are all the widget can still use. Anything older can never
+  /// be shown again, and anything further ahead is fetched again by a later
+  /// refill — so dropping it keeps the list, the alarms and the image files the
+  /// same size.
+  List<Map<String, Object?>> _capPool(
+    List<Map<String, Object?>> entries,
+    int nowMillis, {
+    int limit = _poolLimit,
+  }) {
+    if (entries.length <= limit) return entries;
+    var currentIndex = entries.lastIndexWhere((entry) => _poolAt(entry) <= nowMillis);
+    if (currentIndex < 0) currentIndex = 0;
+    final start = (currentIndex - 1).clamp(0, entries.length - limit).toInt();
+    return entries.sublist(start, start + limit);
+  }
+
+  DailyContent _manifestFromPoolEntry(Map<String, Object?> entry) =>
+      DailyContent(
+        date: entry['date'] as String? ?? '',
+        recommendationId: _poolItemId(entry),
+        captionZh: entry['captionZh'] as String?,
+        captionEn: entry['captionEn'] as String?,
+        capturedDateText: entry['capturedDateText'] as String?,
+        locationText: entry['locationText'] as String?,
+      );
+
+  DailyContent _nativeManifest(WidgetCurrentState state) => DailyContent(
+    date: state.date ?? '',
+    recommendationId: state.recommendationId,
+    captionZh: state.captionZh,
+    captionEn: state.captionEn,
+    capturedDateText: state.capturedDateText,
+    locationText: state.locationText,
+  );
+
+  /// Writes the one `daily.json` a run produces.
+  ///
+  /// It is written **once**, after the current slot has been resolved, so
+  /// `next_slot_at_ms` describes the union that was actually scheduled rather
+  /// than the single page that happened to be fetched.
+  Future<void> _writeDailyManifest(
+    Directory dir, {
+    required DailyContent manifest,
+    required int itemId,
+    required int planId,
+    required DateTime nextCheckAt,
+    required int? nextSlotAtMillis,
+    String? etag,
+  }) async {
+    await File('${dir.path}/daily.json').writeAsString(
+      jsonEncode({
+        'mode': 'carousel',
+        'photo_etag': etag,
+        'date': manifest.date,
+        'recommendation_id': manifest.recommendationId,
+        'carousel_item_id': itemId,
+        'carousel_plan_id': planId,
+        'next_check_at': nextCheckAt.toIso8601String(),
+        // **Turn the page at the right moment.** The earliest slot in the union
+        // that has not passed yet is the same number the native alarm chain arms
+        // itself with, so the foreground can wake once for that instant instead
+        // of polling.
+        'next_slot_at_ms': nextSlotAtMillis,
+        'caption_zh': manifest.captionZh,
+        'caption_en': manifest.captionEn,
+        'captured_date_text': manifest.capturedDateText,
+        'location_text': manifest.locationText,
+        'photo_orientation': manifest.photoOrientation,
+      }),
+      flush: true,
+    );
+  }
+
+  /// Reads the persisted pool. A missing, unreadable or malformed file is simply
+  /// an empty pool — never an exception on the sync path.
+  Future<_CarouselPool?> _readPool(Directory dir) async {
+    final file = File('${dir.path}/carousel-pool.json');
+    if (!await file.exists()) return null;
+    try {
+      final data =
+          jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+      final day = data['day'] as String?;
+      final rawEntries = data['entries'];
+      if (day == null || rawEntries is! List) return null;
+      return _CarouselPool(
+        day: day,
+        lastItemId: (data['last_item_id'] as num?)?.toInt() ?? 0,
+        entries: [
+          for (final raw in rawEntries)
+            if (raw is Map) Map<String, Object?>.from(raw),
+        ],
+      );
+    } catch (error) {
+      debugPrint('[BloomSync] pool read failed: $error');
+      return null;
+    }
+  }
+
   /// **The next moment the page has something new to show.**
   ///
   /// Written by every sync (`next_slot_at_ms` in `daily.json`) and read here so
@@ -655,4 +952,29 @@ class DailyContentRepository {
       } catch (_) {}
     }
   }
+}
+
+/// The persisted carousel pool: every slot this phone has prepared for one local
+/// day.
+///
+/// It lives next to the photos (step 1 of walking the day instead of replaying
+/// its first four photos) so a refill can compute a union with what is already
+/// scheduled. Writing it is what makes the cursor safe: the batch is merged into
+/// this list, never substituted for it.
+class _CarouselPool {
+  const _CarouselPool({
+    required this.day,
+    required this.lastItemId,
+    required this.entries,
+  });
+
+  /// Local day (`yyyy-MM-dd`) the entries belong to. A different day means the
+  /// cursor restarts from the top of the stream.
+  final String day;
+
+  /// Largest `itemId` the pool held when it was written — the next refill's
+  /// `after_item_id` anchor.
+  final int lastItemId;
+
+  final List<Map<String, Object?>> entries;
 }
