@@ -493,23 +493,8 @@ class _BloomHomePageState extends State<BloomHomePage>
       final pairedNow = status?.paired ?? false;
       final pairingJustCompleted =
           !_paired && pairedNow && _credentials != null;
-              // ---- **decode it before showing it** -------------------------------
-        //
-        // The cross-fade is between two widgets, but the incoming one cannot
-        // paint until its file is decoded, so without this the fade passes
-        // through a blank frame — the flash the rebuild probes finally pinned
-        // down (the path flaps between `carousel-original-<id>.photo` and
-        // `original.photo` for the same picture, and the switcher swaps then).
-        // Decoding first means the swap has a real frame to fade into.
-        final incomingPhoto = originalPhotoPath;
-        if (incomingPhoto != null && incomingPhoto != _originalPhotoPath) {
-          try {
-            await precacheImage(FileImage(File(incomingPhoto)), context);
-          } catch (error) {
-            debugPrint('[BloomUI] precache failed: $error');
-          }
-        }
-setState(() {
+      await _precacheIncoming(originalPhotoPath);
+      setState(() {
         _credentials = credentials;
         _pairing = pairing ?? _pairing;
         _paired = pairedNow;
@@ -713,6 +698,7 @@ setState(() {
           mode: 'carousel',
         );
       }
+      await _precacheIncoming(originalPhotoPath);
       if (!mounted) return;
       setState(() {
         _portrait = portrait ?? _portrait;
@@ -738,6 +724,28 @@ setState(() {
 
   Future<void> _evictOriginalPhoto(String? path) async {
     if (path != null) await FileImage(File(path)).evict();
+  }
+
+  /// **Decode the incoming photo before the swap that shows it.**
+  ///
+  /// The cross-fade is between two widgets, but the incoming one cannot paint
+  /// until its file is decoded, so without this the fade passes through a blank
+  /// frame — the flash the rebuild probes finally pinned down (the same picture
+  /// arrives under two paths, `carousel-original-<id>.photo` and
+  /// `original.photo`, and the switcher swaps when the path changes). Decoding
+  /// first means the swap has a real frame to fade into.
+  ///
+  /// Both places that can replace the photo call this: the page load and the
+  /// manual "下一张" action. Evicting the file first (the callers do that) keeps
+  /// this from being a no-op on a path that was already decoded.
+  Future<void> _precacheIncoming(String? incoming) async {
+    if (!mounted || incoming == null || incoming == _originalPhotoPath) return;
+    try {
+      await precacheImage(FileImage(File(incoming)), context);
+    } catch (_) {
+      // Decoding ahead is an optimisation: a failure only means the older
+      // blank-frame fade, never a failed load.
+    }
   }
 
   void _changeTab(int index) {

@@ -721,11 +721,6 @@ class BloomPhotoBackdrop extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // **Flash probe.** A visible blink of the *same* photo can only come from a
-    // rebuild, a path change, or something outside this widget — and there was no
-    // way to tell which. Every rebuild now says so, with the path it is painting,
-    // so the moment the user sees the blink lines up with one of these.
-    debugPrint('[BloomUI] backdrop build path=$imagePath rev=$revision');
     final path = imagePath;
     return Stack(
       fit: StackFit.expand,
@@ -785,7 +780,7 @@ class BloomPhotoBackdrop extends StatelessWidget {
                 child: Transform.scale(
                   scale: 1.12,
                   child: Image.file(
-                    File(path!),
+                    File(path),
                     fit: BoxFit.cover,
                     alignment: const Alignment(0, -.12),
                     gaplessPlayback: true,
@@ -1526,7 +1521,6 @@ class _LetterPhotoCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    debugPrint('[BloomUI] card build path=$imagePath');
     final fx = (content?.photo?.focusX ?? .5).clamp(0.0, 1.0);
     final fy = (content?.photo?.focusY ?? .45).clamp(0.0, 1.0);
     return AspectRatio(
