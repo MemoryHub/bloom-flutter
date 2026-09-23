@@ -443,10 +443,23 @@ class DailyContentRepository {
     // stops updating with no evidence anywhere. Measured on device: three photos
     // prepared, `dumpsys alarm` empty. So both the decision and its outcome are
     // logged, including the cases that used to fail silently.
+    // The slot the page should wake up for. `displayAtMillis` is already on
+    // every entry, and the native layer derives its alarms from exactly this
+    // number — so the same value is what a foreground "wake exactly at the next
+    // slot" timer needs, instead of the poll that had to be rolled back.
+    final nowMillis = DateTime.now().millisecondsSinceEpoch;
+    final upcoming = scheduledEntries
+        .map((entry) => (entry['displayAtMillis'] as num?)?.toInt() ?? 0)
+        .where((at) => at > nowMillis)
+        .toList()
+      ..sort();
+    final nextSlotMillis = upcoming.isEmpty ? null : upcoming.first;
     debugPrint(
       '[BloomSync] scheduling plan=${plan.planId} '
       'entries=${scheduledEntries.length} current=${plan.currentItemId} '
-      'manifest=${manifest != null} bytes=${currentPhotoBytes != null}',
+      'manifest=${manifest != null} bytes=${currentPhotoBytes != null} '
+      'next_slot=${nextSlotMillis ?? 'none'} '
+      '(${nextSlotMillis == null ? '-' : DateTime.fromMillisecondsSinceEpoch(nextSlotMillis).toIso8601String()})',
     );
     if (manifest == null || currentPhotoBytes == null) {
       throw StateError('当前轮播照片不在计划批次中');

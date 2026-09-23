@@ -721,14 +721,28 @@ class BloomPhotoBackdrop extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // **Flash probe.** A visible blink of the *same* photo can only come from a
+    // rebuild, a path change, or something outside this widget — and there was no
+    // way to tell which. Every rebuild now says so, with the path it is painting,
+    // so the moment the user sees the blink lines up with one of these.
+    debugPrint('[BloomUI] backdrop build path=$imagePath rev=$revision');
     final path = imagePath;
     return Stack(
       fit: StackFit.expand,
       children: [
         // The grain is deliberately not here: it goes on last, below.
         const BloomAtmosphere(grain: false),
-        if (path != null)
-          AnimatedSwitcher(
+        // **Always mounted, on purpose.**
+        //
+        // This switcher is stateful: it keeps the outgoing child so it can
+        // cross-fade. Mounting it conditionally (`if (path != null) ...`) threw
+        // that state away — a rebuild where the path was momentarily null
+        // unmounted the whole switcher, and when it came back it saw a "first"
+        // child and faded in from nothing, which is exactly the once-per-refresh
+        // flash of the *same* photo. Keying by path was not enough on its own:
+        // the keys matched, but the widget holding them had been destroyed.
+        // A placeholder child keeps it mounted through the gap.
+        AnimatedSwitcher(
             duration: const Duration(milliseconds: 420),
             switchInCurve: Curves.easeOutCubic,
             // **This is what made the photo a band instead of a backdrop.**
@@ -746,14 +760,24 @@ class BloomPhotoBackdrop extends StatelessWidget {
                     if (currentChild != null) currentChild,
                   ],
                 ),
-            child: Opacity(
+            child: path == null
+                ? const SizedBox.shrink(key: ValueKey('bloom-no-photo'))
+                : Opacity(
               // **The path alone identifies the photo.** It already carries the
               // item id (`mobile-local-portrait-3197.png`), so a re-read that
               // finds the same photo now yields the same key and the switcher
               // stays still. Including `revision` made the key flap whenever that
               // number came from a different source between two loads, which
               // replayed the fade every time the page refreshed — the flicker.
-              key: ValueKey(path),
+              // **Keyed by the item, not the path.** Probes on the device show
+              // the same photo arriving under two different spellings —
+              // `carousel-original-3263.photo` from the per-item cache and
+              // `original.photo` from the current-photo mirror — while the
+              // revision stays 3263 for both. Keying by path therefore animated
+              // the same picture, which is exactly the "it blinks but the photo
+              // did not change" report. The item id is the identity; the path is
+              // an implementation detail that flaps.
+              key: ValueKey(revision),
               opacity: .36,
               child: ImageFiltered(
                 // Less blur than before: at 20 the photo was a colour wash.
@@ -761,7 +785,7 @@ class BloomPhotoBackdrop extends StatelessWidget {
                 child: Transform.scale(
                   scale: 1.12,
                   child: Image.file(
-                    File(path),
+                    File(path!),
                     fit: BoxFit.cover,
                     alignment: const Alignment(0, -.12),
                     gaplessPlayback: true,
@@ -1502,6 +1526,7 @@ class _LetterPhotoCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    debugPrint('[BloomUI] card build path=$imagePath');
     final fx = (content?.photo?.focusX ?? .5).clamp(0.0, 1.0);
     final fy = (content?.photo?.focusY ?? .45).clamp(0.0, 1.0);
     return AspectRatio(
@@ -1534,7 +1559,7 @@ class _LetterPhotoCard extends StatelessWidget {
                   File(imagePath),
                   // Same reasoning as the card behind the page: the path is the
                   // identity, the revision is not.
-                  key: ValueKey(imagePath),
+                  key: ValueKey(revision),
                   fit: BoxFit.cover,
                   alignment: Alignment(fx * 2 - 1, fy * 2 - 1),
                   gaplessPlayback: true,
