@@ -373,12 +373,35 @@ private enum BloomWidgetRemoteLoader {
     if cursor > 0 {
       requestBody["after_item_id"] = cursor
     }
-    let payload: BloomCarouselPlanPayload = try await requestJSON(
+    var payload: BloomCarouselPlanPayload = try await requestJSON(
       path: path,
       token: token,
       method: "POST",
       body: requestBody
     )
+    // **A cursor the server no longer knows is answered with NOTHING.**
+    //
+    // `/carousel/plan` sets `start_index = len(items)` when `after_item_id` is
+    // not in the day's plan, so a stale cursor comes back as an empty page — not
+    // as an error. Left alone that is a permanent stall: the cursor never moves,
+    // every later refresh re-sends the same dead id, and the timeline can never
+    // grow again. It happens whenever the plan is rebuilt underneath the shared
+    // plan (a settings change, a mode switch, or a refresh during the server's
+    // post-window grace). The Dart side recovers by restarting the walk; this is
+    // the same recovery for the one refill path iOS has on its own.
+    if cursor > 0,
+       payload.items.isEmpty,
+       !storedPlan.contains(where: {
+         ($0["itemId"] as? NSNumber)?.intValue == payload.currentItemID
+       }) {
+      requestBody.removeValue(forKey: "after_item_id")
+      payload = try await requestJSON(
+        path: path,
+        token: token,
+        method: "POST",
+        body: requestBody
+      )
+    }
     let now = Date()
     var entries: [BloomEntry] = []
     var sharedPlan: [[String: Any]] = []
