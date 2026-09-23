@@ -493,7 +493,23 @@ class _BloomHomePageState extends State<BloomHomePage>
       final pairedNow = status?.paired ?? false;
       final pairingJustCompleted =
           !_paired && pairedNow && _credentials != null;
-      setState(() {
+              // ---- **decode it before showing it** -------------------------------
+        //
+        // The cross-fade is between two widgets, but the incoming one cannot
+        // paint until its file is decoded, so without this the fade passes
+        // through a blank frame — the flash the rebuild probes finally pinned
+        // down (the path flaps between `carousel-original-<id>.photo` and
+        // `original.photo` for the same picture, and the switcher swaps then).
+        // Decoding first means the swap has a real frame to fade into.
+        final incomingPhoto = originalPhotoPath;
+        if (incomingPhoto != null && incomingPhoto != _originalPhotoPath) {
+          try {
+            await precacheImage(FileImage(File(incomingPhoto)), context);
+          } catch (error) {
+            debugPrint('[BloomUI] precache failed: $error');
+          }
+        }
+setState(() {
         _credentials = credentials;
         _pairing = pairing ?? _pairing;
         _paired = pairedNow;
