@@ -272,11 +272,8 @@ private enum BloomWidgetRemoteLoader {
     family: String,
     defaults: UserDefaults
   ) -> ([BloomEntry], Date)? {
-    guard let rawPlan = defaults.string(forKey: "iosCarouselPlan"),
-          let data = rawPlan.data(using: .utf8),
-          let plan = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-      return nil
-    }
+    let plan = storedCarouselPlan(defaults: defaults)
+    guard !plan.isEmpty else { return nil }
     let now = Date()
     let resolved = plan.compactMap { item -> (Date, BloomEntry)? in
       guard let millis = (item["displayAtMillis"] as? NSNumber)?.doubleValue else {
@@ -354,18 +351,33 @@ private enum BloomWidgetRemoteLoader {
     let activeStart = defaults.string(forKey: "bloom.carousel_active_start") ?? "06:00"
     let activeEnd = defaults.string(forKey: "bloom.carousel_active_end") ?? "22:00"
     let path = "/api/frame/devices/\(deviceID)/carousel/plan"
+    // **The same paging cursor the host app uses.**
+    //
+    // Without it this request always asked for the day's *first* page. By
+    // mid-morning that page is entirely in the past, every item is filtered out
+    // by the `isCurrent || displayAt > now` guard below, `entries` comes back
+    // empty and the refresh throws — the extension had no way to move the
+    // widget forward on its own. Handing back the largest id the shared plan
+    // already holds makes `/carousel/plan` return the *next* page, exactly like
+    // `after_item_id` does for the Android/Dart side.
+    let storedPlan = storedCarouselPlan(defaults: defaults)
+    let cursor = carouselCursor(in: storedPlan)
+    var requestBody: [String: Any] = [
+      "target": "mobile",
+      "timezone": "Asia/Shanghai",
+      "active_start": activeStart,
+      "active_end": activeEnd,
+      "interval_minutes": interval,
+      "batch_limit": 4,
+    ]
+    if cursor > 0 {
+      requestBody["after_item_id"] = cursor
+    }
     let payload: BloomCarouselPlanPayload = try await requestJSON(
       path: path,
       token: token,
       method: "POST",
-      body: [
-        "target": "mobile",
-        "timezone": "Asia/Shanghai",
-        "active_start": activeStart,
-        "active_end": activeEnd,
-        "interval_minutes": interval,
-        "batch_limit": 4,
-      ]
+      body: requestBody
     )
     let now = Date()
     var entries: [BloomEntry] = []
@@ -428,13 +440,25 @@ private enum BloomWidgetRemoteLoader {
         // short execution budget and can be terminated between downloads;
         // keeping partial progress prevents a successful first/second image
         // from being discarded with the rest of the unfinished batch.
-        persistCarouselPlan(sharedPlan, defaults: defaults)
+        //
+        // **Merged, not replaced.** `iosCarouselPlan` is shared with the host
+        // app, whose sync writes the whole union (current + the future runway).
+        // Overwriting it with this page alone dropped every slot the app had
+        // just scheduled — the same "submit only the new page" mistake the Dart
+        // pool had to be taught not to make.
+        persistCarouselPlan(
+          mergeCarouselPlan(existing: storedPlan, incoming: sharedPlan),
+          defaults: defaults
+        )
       } catch {
         continue
       }
     }
     guard !entries.isEmpty else { throw BloomWidgetNetworkError.invalidResponse }
-    persistCarouselPlan(sharedPlan, defaults: defaults)
+    persistCarouselPlan(
+      mergeCarouselPlan(existing: storedPlan, incoming: sharedPlan),
+      defaults: defaults
+    )
     entries.sort { $0.date < $1.date }
     // Refill while one prefetched entry is still available. WidgetKit may
     // delay networking, but the already-created timeline keeps switching.
@@ -448,6 +472,77 @@ private enum BloomWidgetRemoteLoader {
     return (entries, nextCarouselCheck(proposed: refill, defaults: defaults))
   }
 
+  /// The local day (`yyyy-MM-dd`) a shared carousel plan belongs to.
+  ///
+  /// The Dart/Android pool records `{day, last_item_id}` and resets its cursor
+  /// when the day changes; the extension keeps the same bookkeeping so a plan
+  /// from yesterday can never be used as a paging cursor.
+  private static func localDay(_ date: Date = Date()) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
+    formatter.dateFormat = "yyyy-MM-dd"
+    return formatter.string(from: date)
+  }
+
+  /// The shared plan, or an empty one when it belongs to a previous day.
+  ///
+  /// A **missing** day key — a plan written before this bookkeeping existed — is
+  /// treated as usable rather than discarded, so an update cannot blank a widget
+  /// that is working.
+  private static func storedCarouselPlan(defaults: UserDefaults) -> [[String: Any]] {
+    if let day = defaults.string(forKey: "iosCarouselPlanDay"), day != localDay() {
+      return []
+    }
+    guard let rawPlan = defaults.string(forKey: "iosCarouselPlan"),
+          let data = rawPlan.data(using: .utf8),
+          let plan = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+      return []
+    }
+    return plan
+  }
+
+  /// `after_item_id` for the extension's own refill: the largest id the shared
+  /// plan already holds, or 0 when there is nothing to continue from.
+  private static func carouselCursor(in plan: [[String: Any]]) -> Int {
+    var cursor = 0
+    for item in plan {
+      if let id = (item["itemId"] as? NSNumber)?.intValue, id > cursor {
+        cursor = id
+      }
+    }
+    return cursor
+  }
+
+  /// Appends a fetched page to the stored plan instead of replacing it.
+  ///
+  /// `persistCarouselPlan` overwrites `iosCarouselPlan`, which the host app also
+  /// writes. The union keeps every future entry the app has scheduled while this
+  /// page is added to it. The trimmed result is the entry the widget is on now,
+  /// the one before it and the future runway — the same window (and the same
+  /// eight images) the Dart pool keeps.
+  private static func mergeCarouselPlan(
+    existing: [[String: Any]],
+    incoming: [[String: Any]]
+  ) -> [[String: Any]] {
+    var byID: [Int: [String: Any]] = [:]
+    for item in existing + incoming {
+      guard let id = (item["itemId"] as? NSNumber)?.intValue, id > 0 else { continue }
+      byID[id] = item
+    }
+    let merged = byID.values.sorted {
+      (($0["displayAtMillis"] as? NSNumber)?.doubleValue ?? 0) <
+        (($1["displayAtMillis"] as? NSNumber)?.doubleValue ?? 0)
+    }
+    guard merged.count > 8 else { return merged }
+    let now = Date().timeIntervalSince1970 * 1000
+    let currentIndex = merged.lastIndex {
+      (($0["displayAtMillis"] as? NSNumber)?.doubleValue ?? 0) <= now
+    } ?? 0
+    let start = min(max(0, currentIndex - 1), merged.count - 8)
+    return Array(merged[start..<(start + 8)])
+  }
+
   private static func persistCarouselPlan(
     _ plan: [[String: Any]],
     defaults: UserDefaults
@@ -455,6 +550,7 @@ private enum BloomWidgetRemoteLoader {
     guard let data = try? JSONSerialization.data(withJSONObject: plan),
           let encoded = String(data: data, encoding: .utf8) else { return }
     defaults.set(encoded, forKey: "iosCarouselPlan")
+    defaults.set(localDay(), forKey: "iosCarouselPlanDay")
     defaults.synchronize()
   }
 

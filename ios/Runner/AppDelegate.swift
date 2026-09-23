@@ -127,6 +127,11 @@ import WidgetKit
         }
         defaults.set(planId.intValue, forKey: "iosHostCarouselPlanId")
         defaults.set(encoded, forKey: "iosCarouselPlan")
+        // The widget extension uses this to reset its paging cursor when the day
+        // changes, mirroring the Dart pool's `{day, last_item_id}` bookkeeping.
+        // It has to be written here too, or the extension would treat the host
+        // app's freshly scheduled plan as stale.
+        defaults.set(Self.localDay(), forKey: "iosCarouselPlanDay")
         defaults.synchronize()
         WidgetCenter.shared.reloadAllTimelines()
         result(nil)
@@ -134,6 +139,7 @@ import WidgetKit
         if let defaults = UserDefaults(suiteName: Self.bloomAppGroup) {
           defaults.removeObject(forKey: "iosHostCarouselPlanId")
           defaults.removeObject(forKey: "iosCarouselPlan")
+          defaults.removeObject(forKey: "iosCarouselPlanDay")
           defaults.synchronize()
         }
         WidgetCenter.shared.reloadAllTimelines()
@@ -176,6 +182,16 @@ import WidgetKit
     bloomWidgetChannel = channel
   }
 
+  /// The local day (`yyyy-MM-dd`) a shared carousel plan belongs to — the iOS
+  /// half of the cursor bookkeeping the Dart repository keeps in its pool file.
+  private static func localDay(_ date: Date = Date()) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
+    formatter.dateFormat = "yyyy-MM-dd"
+    return formatter.string(from: date)
+  }
+
   private static let keychainService = "com.zhangbo.bloom.device-identity"
 
   private static func currentWidgetState() -> [String: Any]? {
@@ -200,8 +216,11 @@ import WidgetKit
     put("locationText", defaults.string(forKey: "locationText"))
 
     // WidgetKit advances future entries without launching Flutter. Resolve
-    // the same shared plan here when the app is opened later.
+    // the same shared plan here when the app is opened later. A plan from a
+    // previous day is ignored: its entries are all in the past, and resolving
+    // them would report yesterday's last photo as the current one.
     if mode == "carousel",
+       defaults.string(forKey: "iosCarouselPlanDay") == Self.localDay(),
        let rawPlan = defaults.string(forKey: "iosCarouselPlan"),
        let data = rawPlan.data(using: .utf8),
        let plan = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
