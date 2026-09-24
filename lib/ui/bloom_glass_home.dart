@@ -256,6 +256,69 @@ class BloomGlassHome extends StatelessWidget {
 
   final BloomDisplaySettings settings;
 
+  /// "下次更新 今天 14:15" — the phone's own next carousel slot, in the reader's
+  /// own words.
+  ///
+  /// **The persisted stamp is only as fresh as the last sync that landed.** When
+  /// that sync was blocked (the background task held the lock, the phone was
+  /// offline, the switch was off) the stamp sits in the past while the clock
+  /// moves on: the user saw "今天 12:15" at 14:11. The window and the interval are
+  /// enough to answer locally — slots are `start + k * interval`, so the next one
+  /// is the first grid point after now, and once the window is done it is
+  /// tomorrow's start.
+  static String? nextSlotText(BloomDisplaySettings settings, int? stampMillis) {
+    final now = DateTime.now();
+    final stamp =
+        (stampMillis == null || stampMillis < 1)
+            ? null
+            : DateTime.fromMillisecondsSinceEpoch(stampMillis);
+    final at =
+        (stamp != null && stamp.isAfter(now))
+            ? stamp
+            : _gridNextSlot(settings, now);
+    final days =
+        DateTime(
+          at.year,
+          at.month,
+          at.day,
+        ).difference(DateTime(now.year, now.month, now.day)).inDays;
+    final day = switch (days) {
+      0 => '今天',
+      1 => '明天',
+      _ => '${at.month}月${at.day}日',
+    };
+    final hh = at.hour.toString().padLeft(2, '0');
+    final mm = at.minute.toString().padLeft(2, '0');
+    return '下次更新 $day $hh:$mm';
+  }
+
+  static DateTime _gridNextSlot(BloomDisplaySettings settings, DateTime now) {
+    final start = _clockOffset(settings.activeStart);
+    final end = _clockOffset(settings.activeEnd);
+    final step = Duration(
+      minutes: settings.intervalMinutes > 0 ? settings.intervalMinutes : 15,
+    );
+    final midnight = DateTime(now.year, now.month, now.day);
+    final first = midnight.add(start);
+    if (now.isBefore(first)) return first;
+    final passed = now.difference(first);
+    final next = first.add(
+      step * (passed.inMicroseconds ~/ step.inMicroseconds + 1),
+    );
+    // The end of the window is itself a slot when it lands on the grid.
+    if (!next.isAfter(midnight.add(end))) return next;
+    return midnight.add(const Duration(days: 1)).add(start);
+  }
+
+  static Duration _clockOffset(String text) {
+    final parts = text.split(':');
+    if (parts.length < 2) return Duration.zero;
+    return Duration(
+      hours: int.tryParse(parts[0].trim()) ?? 0,
+      minutes: int.tryParse(parts[1].trim()) ?? 0,
+    );
+  }
+
   /// Devices the switcher and the "设备" tab list. Hardcoded for now (F3):
   /// this phone plus the frame. See `bloom_device_pages.dart`.
   final List<BloomDevice> devices;
@@ -549,7 +612,13 @@ class BloomGlassHome extends StatelessWidget {
     // 照片 (the future photo library, an empty placeholder today) → 设备.
     final pages = [
       _PhotoPage(
-        nextSlotAt: nextSlotAt,
+        // The switch being off freezes this phone's card, so a "下次更新" under it
+        // would be a promise the app is not keeping; and the label describes this
+        // phone's own plan, so it goes away with it.
+        nextSlotText:
+            widgetEnabled && settings.mode == BloomDisplayMode.carousel
+                ? nextSlotText(settings, nextSlotAt)
+                : null,
         originalPhotoPath: originalPhotoPath,
         content: content,
         date: date,
@@ -746,58 +815,59 @@ class BloomPhotoBackdrop extends StatelessWidget {
         // the keys matched, but the widget holding them had been destroyed.
         // A placeholder child keeps it mounted through the gap.
         AnimatedSwitcher(
-            duration: const Duration(milliseconds: 420),
-            switchInCurve: Curves.easeOutCubic,
-            // **This is what made the photo a band instead of a backdrop.**
-            // AnimatedSwitcher lays its children out in a Stack, and a Stack
-            // hands non-positioned children *loose* constraints — so the
-            // `BoxFit.cover` below never had a box to cover and the image fell
-            // back to its own aspect: a portrait photo became a tall strip with
-            // black above and below, a landscape one a strip across the middle.
-            // Expanding the layout gives the photo the whole screen to cover.
-            layoutBuilder:
-                (currentChild, previousChildren) => Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    ...previousChildren,
-                    if (currentChild != null) currentChild,
-                  ],
-                ),
-            child: path == null
-                ? const SizedBox.shrink(key: ValueKey('bloom-no-photo'))
-                : Opacity(
-              // **The path alone identifies the photo.** It already carries the
-              // item id (`mobile-local-portrait-3197.png`), so a re-read that
-              // finds the same photo now yields the same key and the switcher
-              // stays still. Including `revision` made the key flap whenever that
-              // number came from a different source between two loads, which
-              // replayed the fade every time the page refreshed — the flicker.
-              // **Keyed by the item, not the path.** Probes on the device show
-              // the same photo arriving under two different spellings —
-              // `carousel-original-3263.photo` from the per-item cache and
-              // `original.photo` from the current-photo mirror — while the
-              // revision stays 3263 for both. Keying by path therefore animated
-              // the same picture, which is exactly the "it blinks but the photo
-              // did not change" report. The item id is the identity; the path is
-              // an implementation detail that flaps.
-              key: ValueKey(revision),
-              opacity: .36,
-              child: ImageFiltered(
-                // Less blur than before: at 20 the photo was a colour wash.
-                imageFilter: ui.ImageFilter.blur(sigmaX: 19, sigmaY: 19),
-                child: Transform.scale(
-                  scale: 1.12,
-                  child: Image.file(
-                    File(path),
-                    fit: BoxFit.cover,
-                    alignment: const Alignment(0, -.12),
-                    gaplessPlayback: true,
-                    errorBuilder: (_, __, ___) => const SizedBox.shrink(),
-                  ),
-                ),
+          duration: const Duration(milliseconds: 420),
+          switchInCurve: Curves.easeOutCubic,
+          // **This is what made the photo a band instead of a backdrop.**
+          // AnimatedSwitcher lays its children out in a Stack, and a Stack
+          // hands non-positioned children *loose* constraints — so the
+          // `BoxFit.cover` below never had a box to cover and the image fell
+          // back to its own aspect: a portrait photo became a tall strip with
+          // black above and below, a landscape one a strip across the middle.
+          // Expanding the layout gives the photo the whole screen to cover.
+          layoutBuilder:
+              (currentChild, previousChildren) => Stack(
+                fit: StackFit.expand,
+                children: [
+                  ...previousChildren,
+                  if (currentChild != null) currentChild,
+                ],
               ),
-            ),
-          ),
+          child:
+              path == null
+                  ? const SizedBox.shrink(key: ValueKey('bloom-no-photo'))
+                  : Opacity(
+                    // **The path alone identifies the photo.** It already carries the
+                    // item id (`mobile-local-portrait-3197.png`), so a re-read that
+                    // finds the same photo now yields the same key and the switcher
+                    // stays still. Including `revision` made the key flap whenever that
+                    // number came from a different source between two loads, which
+                    // replayed the fade every time the page refreshed — the flicker.
+                    // **Keyed by the item, not the path.** Probes on the device show
+                    // the same photo arriving under two different spellings —
+                    // `carousel-original-3263.photo` from the per-item cache and
+                    // `original.photo` from the current-photo mirror — while the
+                    // revision stays 3263 for both. Keying by path therefore animated
+                    // the same picture, which is exactly the "it blinks but the photo
+                    // did not change" report. The item id is the identity; the path is
+                    // an implementation detail that flaps.
+                    key: ValueKey(revision),
+                    opacity: .36,
+                    child: ImageFiltered(
+                      // Less blur than before: at 20 the photo was a colour wash.
+                      imageFilter: ui.ImageFilter.blur(sigmaX: 19, sigmaY: 19),
+                      child: Transform.scale(
+                        scale: 1.12,
+                        child: Image.file(
+                          File(path),
+                          fit: BoxFit.cover,
+                          alignment: const Alignment(0, -.12),
+                          gaplessPlayback: true,
+                          errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                        ),
+                      ),
+                    ),
+                  ),
+        ),
         const DecoratedBox(
           decoration: BoxDecoration(
             gradient: LinearGradient(
@@ -1063,7 +1133,7 @@ class _PaperGrainPainter extends CustomPainter {
 
 class _PhotoPage extends StatelessWidget {
   const _PhotoPage({
-    required this.nextSlotAt,
+    required this.nextSlotText,
     required this.originalPhotoPath,
     required this.content,
     required this.date,
@@ -1073,7 +1143,7 @@ class _PhotoPage extends StatelessWidget {
     required this.onDeviceChanged,
   });
 
-  final int? nextSlotAt;
+  final String? nextSlotText;
   final String? originalPhotoPath;
   final DailyContent? content;
   final String? date;
@@ -1081,25 +1151,6 @@ class _PhotoPage extends StatelessWidget {
   final List<BloomDevice> devices;
   final String? selectedDeviceId;
   final ValueChanged<String> onDeviceChanged;
-
-  /// "下次更新 今天 10:15" — the phone's own next carousel slot, in the reader's
-  /// own words rather than as a timestamp. `null` renders nothing.
-  static String? nextSlotLabel(int? millis) {
-    if (millis == null || millis < 1) return null;
-    final at = DateTime.fromMillisecondsSinceEpoch(millis);
-    final now = DateTime.now();
-    final days = DateTime(at.year, at.month, at.day)
-        .difference(DateTime(now.year, now.month, now.day))
-        .inDays;
-    final day = switch (days) {
-      0 => '今天',
-      1 => '明天',
-      _ => '${at.month}月${at.day}日',
-    };
-    final hh = at.hour.toString().padLeft(2, '0');
-    final mm = at.minute.toString().padLeft(2, '0');
-    return '下次更新 $day $hh:$mm';
-  }
 
   /// The device whose photos this page shows. Falls back to this phone when
   /// nothing (or something unknown) is selected.
@@ -1234,7 +1285,7 @@ class _PhotoPage extends StatelessWidget {
                   // The "next update" line sits under the card, inside the same
                   // width, so its height comes out of the card's budget — reserve
                   // it here or the column overflows on a short screen.
-                  final nextSlot = nextSlotLabel(nextSlotAt);
+                  final nextSlot = remoteSelected ? null : nextSlotText;
                   const nextSlotGap = 8.0;
                   const nextSlotHeight = 15.0;
                   final cardBox = math.max(
@@ -1300,6 +1351,7 @@ class _PhotoPage extends StatelessWidget {
                               BloomDeviceSwitch(
                                 key: const ValueKey('bloom-device-switcher'),
                                 deviceName: selected?.name ?? '手机小组件',
+                                label: remoteSelected ? 'E-Ink' : '小组件',
                                 onTap:
                                     devices.length > 1
                                         ? () => _pickDevice(context)
@@ -1616,29 +1668,49 @@ class _LetterPhotoCard extends StatelessWidget {
         ),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(27),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Expanded(
-                flex: 3,
-                child: Image.file(
-                  File(imagePath),
-                  // Same reasoning as the card behind the page: the path is the
-                  // identity, the revision is not.
-                  key: ValueKey(revision),
-                  fit: BoxFit.cover,
-                  alignment: Alignment(fx * 2 - 1, fy * 2 - 1),
-                  gaplessPlayback: true,
-                  errorBuilder: (_, __, ___) => const _LetterPhotoFallback(),
+          child: AnimatedSwitcher(
+            // **A cross-fade, not a blink.** The old photo used to be swapped for
+            // the new one in a single frame — and because the new file still had
+            // to be decoded, what the eye caught was a flash of nothing. Letting
+            // the two overlap removes both the blink and the empty frame.
+            duration: const Duration(milliseconds: 480),
+            switchInCurve: Curves.easeOutCubic,
+            switchOutCurve: Curves.easeInCubic,
+            layoutBuilder:
+                (currentChild, previousChildren) => Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    ...previousChildren,
+                    if (currentChild != null) currentChild,
+                  ],
                 ),
-              ),
-              Expanded(
-                child: _LetterPaper(
-                  content: content,
-                  fallbackDate: fallbackDate,
+            // **Keyed by the item, so the fade runs only when the picture really
+            // changes** — a rebuild that re-renders the same item (a sync
+            // landing, the label ticking, the backdrop updating) must not
+            // animate it again. And the *whole* card fades, photo and words
+            // together: the two can never be seen from different items.
+            child: Column(
+              key: ValueKey(content?.recommendationId ?? imagePath),
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  flex: 3,
+                  child: Image.file(
+                    File(imagePath),
+                    fit: BoxFit.cover,
+                    alignment: Alignment(fx * 2 - 1, fy * 2 - 1),
+                    gaplessPlayback: true,
+                    errorBuilder: (_, __, ___) => const _LetterPhotoFallback(),
+                  ),
                 ),
-              ),
-            ],
+                Expanded(
+                  child: _LetterPaper(
+                    content: content,
+                    fallbackDate: fallbackDate,
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -2695,12 +2767,23 @@ class _Slip extends StatelessWidget {
 /// accessibility label, which is also where the selected device's name lives
 /// now that no text is drawn.
 class BloomDeviceSwitch extends StatelessWidget {
-  const BloomDeviceSwitch({super.key, required this.deviceName, this.onTap});
+  const BloomDeviceSwitch({
+    super.key,
+    required this.deviceName,
+    required this.label,
+    this.onTap,
+  });
 
   /// The device this control currently points at. Not drawn: the name is the
   /// tooltip and the accessibility label, and it is spelled out in full on every
   /// row of the sheet that opens.
   final String deviceName;
+
+  /// **The word on the control itself**: `小组件` while it points at this phone,
+  /// `E-Ink` while it points at the frame. An icon alone left the reader guessing
+  /// what the two arrows were switching between.
+  final String label;
+
   final VoidCallback? onTap;
 
   /// Both arrows, opposite directions: "move between the things in this set".
@@ -2722,11 +2805,19 @@ class BloomDeviceSwitch extends StatelessWidget {
       label: '切换设备，当前 $deviceName',
       child: _Slip(
         height: BloomInk.controlSize,
-        width: BloomInk.controlSize,
         edge: false,
         onTap: onTap,
-        padding: EdgeInsets.zero,
-        child: const Icon(glyph, size: 20, color: BloomInk.text),
+        // The whole slip is the target, word and glyph together — the row sizes
+        // itself around them instead of the old fixed 34px square.
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(label, maxLines: 1, style: BloomType.labelStrong),
+            const SizedBox(width: 6),
+            const Icon(glyph, size: 20, color: BloomInk.text),
+          ],
+        ),
       ),
     ),
   );

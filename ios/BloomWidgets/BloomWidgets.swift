@@ -317,11 +317,11 @@ private enum BloomWidgetRemoteLoader {
 
     let current = resolved.last { $0.0 <= now }
     let future = resolved.filter { $0.0 > now }
-    // Refill before the local timeline is exhausted. WidgetKit may delay a
-    // policy boundary while the phone is locked or under power management;
-    // asking for the next batch while one future item remains leaves a local
-    // fallback entry even if the network request takes a little longer.
-    guard future.count >= 2 else { return nil }
+    // **No local floor on how many future entries there are.** Android builds
+    // whatever union it has and lets the recovery alarm refill it, and the two
+    // platforms have to behave identically: refusing to build a timeline because
+    // only one — or no — future item is left is exactly what blanks the widget
+    // on a slow night.
     var entries: [BloomEntry] = []
     if let current {
       entries.append(BloomEntry(
@@ -336,7 +336,17 @@ private enum BloomWidgetRemoteLoader {
     }
     entries.append(contentsOf: future.map { $0.1 })
     guard !entries.isEmpty else { return nil }
-    let refillAt = future[future.count - 2].0
+    // Ask for the next batch at the second-to-last stamp when there is one, at
+    // the last known stamp when there is only one, and right away when the local
+    // plan is spent.
+    let refillAt: Date
+    if future.count >= 2 {
+      refillAt = future[future.count - 2].0
+    } else if let last = future.last {
+      refillAt = last.0
+    } else {
+      refillAt = now
+    }
     return (entries, nextCarouselCheck(proposed: refillAt, defaults: defaults))
   }
 
@@ -490,12 +500,15 @@ private enum BloomWidgetRemoteLoader {
     entries.sort { $0.date < $1.date }
     // Refill while one prefetched entry is still available. WidgetKit may
     // delay networking, but the already-created timeline keeps switching.
-    let refill: Date? = if entries.count >= 3 {
-      entries[entries.count - 2].date
+    // Statement form rather than an `if` expression: identical meaning, and it
+    // parses on every toolchain the project is opened with.
+    let refill: Date?
+    if entries.count >= 3 {
+      refill = entries[entries.count - 2].date
     } else if entries.count == 2 {
-      entries.last?.date
+      refill = entries.last?.date
     } else {
-      parseDate(payload.nextCheckAt)
+      refill = parseDate(payload.nextCheckAt)
     }
     return (entries, nextCarouselCheck(proposed: refill, defaults: defaults))
   }
