@@ -208,6 +208,7 @@ class BloomGlassHome extends StatelessWidget {
   const BloomGlassHome({
     super.key,
     required this.loading,
+    this.syncing = false,
     required this.paired,
     required this.pairingRefreshing,
     required this.nextLoading,
@@ -237,6 +238,10 @@ class BloomGlassHome extends StatelessWidget {
   });
 
   final bool loading;
+
+  /// True while a carousel sync is in flight. The "下次更新" line cannot be known
+  /// until it finishes, so that is when its skeleton shows.
+  final bool syncing;
   final bool paired;
   final bool pairingRefreshing;
   final bool nextLoading;
@@ -597,7 +602,7 @@ class BloomGlassHome extends StatelessWidget {
             widgetEnabled && settings.mode == BloomDisplayMode.carousel
                 ? nextSlotText(settings, nextSlotAt)
                 : null,
-        nextSlotLoading: loading,
+        nextSlotLoading: syncing,
         originalPhotoPath: originalPhotoPath,
         content: content,
         date: date,
