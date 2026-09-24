@@ -1117,26 +1117,52 @@ class _PaperGrainPainter extends CustomPainter {
 
 /// Placeholder for the "下次更新" line while its value is still unknown. Sized to
 /// the label (meta type, one line) so nothing moves when the real text arrives.
-class _NextSlotSkeleton extends StatelessWidget {
+/// Placeholder for the "下次更新" line while its value is still unknown.
+///
+/// Three short bars that breathe, i.e. a *text*-shaped placeholder rather than a
+/// dead grey rectangle: the wait then reads as "this line is being written" and
+/// the swap to the real text is a change of content, not of layout.
+class _NextSlotSkeleton extends StatefulWidget {
   const _NextSlotSkeleton();
 
   @override
+  State<_NextSlotSkeleton> createState() => _NextSlotSkeletonState();
+}
+
+class _NextSlotSkeletonState extends State<_NextSlotSkeleton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 950),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  static const _bar = BoxDecoration(
+    color: Color(0xFF8A8375),
+    borderRadius: BorderRadius.all(Radius.circular(6)),
+  );
+
+  @override
   Widget build(BuildContext context) {
-    return TweenAnimationBuilder<double>(
-      // A pale grey on the cream panel was invisible — the placeholder has to be
-      // *darker* than the paper, not lighter, or it reads as empty space.
-      tween: Tween(begin: 0.35, end: 0.85),
-      duration: const Duration(milliseconds: 650),
-      curve: Curves.easeInOut,
-      builder: (context, value, child) => Opacity(opacity: value, child: child),
-      child: Container(
-        key: const ValueKey('bloom-next-slot-skeleton'),
-        width: 132,
-        height: 12,
-        decoration: BoxDecoration(
-          color: const Color(0xFF8A8375),
-          borderRadius: BorderRadius.circular(6),
-        ),
+    return FadeTransition(
+      key: const ValueKey('bloom-next-slot-skeleton'),
+      opacity: Tween<double>(begin: 0.3, end: 0.85).animate(
+        CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
+      ),
+      child: const Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(width: 30, height: 12, child: DecoratedBox(decoration: _bar)),
+          SizedBox(width: 5),
+          SizedBox(width: 44, height: 12, child: DecoratedBox(decoration: _bar)),
+          SizedBox(width: 5),
+          SizedBox(width: 16, height: 12, child: DecoratedBox(decoration: _bar)),
+        ],
       ),
     );
   }
@@ -1310,9 +1336,7 @@ class _PhotoPage extends StatelessWidget {
                     constraints.maxHeight -
                         rowHeight -
                         BloomGlassHome.cardGap -
-                        (nextSlot == null && !nextSlotLoading
-                            ? 0.0
-                            : nextSlotGap + nextSlotHeight),
+                        nextSlotGap + nextSlotHeight,
                   );
                   // Same formula as `AspectRatio` itself: fill the width unless
                   // the height says otherwise (the card is portrait, 720x1200).
@@ -1426,7 +1450,7 @@ class _PhotoPage extends StatelessWidget {
                           ),
                         ),
                       ),
-                      if (nextSlot != null || nextSlotLoading) ...[
+                      ...[
                         const SizedBox(height: nextSlotGap),
                         SizedBox(
                           height: nextSlotHeight,
