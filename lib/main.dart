@@ -411,10 +411,18 @@ class _BloomHomePageState extends State<BloomHomePage>
           // older daily.json snapshot.
           final native = await WidgetBridge().readCurrentState();
           nativeState = native;
+          // **The item's own immutable copy wins over the path the native state
+          // carries.** `original.photo` is rewritten in place by every sync,
+          // while the native id and captions can advance on their own (an alarm
+          // applies the stored plan), so that file can still hold the previous
+          // item's bytes at the very moment its own id is current — the card
+          // then shows one item's picture under another item's words.
           final nativePhoto =
               native == null
                   ? null
-                  : (native.originalPhotoPath ?? native.portraitPath);
+                  : (await repository.photoPathFor(native.recommendationId) ??
+                      native.originalPhotoPath ??
+                      native.portraitPath);
           final nativePhotoExists =
               nativePhoto != null && await File(nativePhoto).exists();
           final expectedMode =
@@ -495,7 +503,13 @@ class _BloomHomePageState extends State<BloomHomePage>
               date: content?.date ?? portrait.date ?? '',
               recommendationId:
                   content?.recommendationId ?? portrait.recommendationId ?? 0,
-              originalPhotoPath: originalPhotoPath,
+              // Never hand the native state the one mutable file: the widget
+              // and the app both read this back, and the next sync overwrites it
+              // in place. The item's versioned copy is stable for as long as the
+              // item is.
+              originalPhotoPath:
+                  await repository.photoPathFor(content?.recommendationId) ??
+                  originalPhotoPath,
               captionZh: content?.captionZh,
               captionEn: content?.captionEn,
               capturedDateText: content?.capturedDateText,
