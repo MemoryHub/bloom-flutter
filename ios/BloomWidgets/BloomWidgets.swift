@@ -141,8 +141,13 @@ private enum BloomWidgetRemoteLoader {
         // budget and should not have to serially download several multi-MB
         // originals merely to advance an already-known local timeline.
         if let local = localCarouselTimeline(family: family, defaults: defaults) {
+          logTimelineChoice(
+            "family=\(family) source=local entries=\(local.0.count) "
+              + "first=\(Int(local.0.first?.date.timeIntervalSince1970 ?? 0))"
+          )
           return local
         }
+        logTimelineChoice("family=\(family) source=online (no usable local plan)")
         return try await carouselTimeline(
           family: family,
           deviceID: deviceID,
@@ -266,6 +271,32 @@ private enum BloomWidgetRemoteLoader {
       [entry(content)],
       normalizedNext(parseDate(payload.nextCheckAt))
     )
+  }
+
+
+  /// **Why did the widget pick that photo?**
+  ///
+  /// iOS release logs cannot be read from the build machine (no `idevicesyslog`, and
+  /// `devicectl` has no console), so every past diagnosis of "iOS repeats a photo" was
+  /// guesswork. This appends one line per timeline build into the App Group, where the
+  /// host app can read it and print it. Diagnostic only: it changes no decision, and
+  /// every failure path is swallowed so a full disk can never break the widget.
+  private static func logTimelineChoice(_ line: String) {
+    guard
+      let root = FileManager.default.containerURL(
+        forSecurityApplicationGroupIdentifier: bloomAppGroup
+      )
+    else { return }
+    let file = root.appendingPathComponent("widget-timeline.log")
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    let entry = "\(stamp) \(line)\n"
+    if let handle = try? FileHandle(forWritingTo: file) {
+      handle.seekToEndOfFile()
+      handle.write(Data(entry.utf8))
+      try? handle.close()
+    } else {
+      try? entry.write(to: file, atomically: true, encoding: .utf8)
+    }
   }
 
   private static func localCarouselTimeline(
