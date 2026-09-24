@@ -1118,16 +1118,18 @@ class _NextSlotSkeleton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return TweenAnimationBuilder<double>(
-      tween: Tween(begin: 0.25, end: 0.55),
-      duration: const Duration(milliseconds: 700),
+      // A pale grey on the cream panel was invisible — the placeholder has to be
+      // *darker* than the paper, not lighter, or it reads as empty space.
+      tween: Tween(begin: 0.35, end: 0.85),
+      duration: const Duration(milliseconds: 650),
       curve: Curves.easeInOut,
       builder: (context, value, child) => Opacity(opacity: value, child: child),
       child: Container(
         key: const ValueKey('bloom-next-slot-skeleton'),
-        width: 118,
-        height: 11,
+        width: 132,
+        height: 12,
         decoration: BoxDecoration(
-          color: BloomType.meta.color,
+          color: const Color(0xFF8A8375),
           borderRadius: BorderRadius.circular(6),
         ),
       ),
