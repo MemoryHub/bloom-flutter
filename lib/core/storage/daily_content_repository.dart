@@ -338,17 +338,7 @@ class DailyContentRepository {
       settings,
       afterItemId: cursor > 0 ? cursor : null,
     );
-    // **The next slot is known the moment the plan arrives.** The "下次更新" line
-    // needs a time, not a photo, so it must not wait for the batch to be
-    // downloaded and drawn — that wait is why it appeared "after a long time".
-    // Published here, any rebuild (including the 30s slot watch) picks it up while
-    // the pictures are still downloading.
-    await _publishNextSlotEarly(
-      dir,
-      plan,
-      DateTime.now().millisecondsSinceEpoch,
-      settings.intervalMinutes,
-    );
+
     debugPrint(
       '[BloomSync] carousel plan=${plan.planId} items=${plan.items.length} '
       'current=${plan.currentItemId} after=${cursor > 0 ? cursor : 'none'} '
@@ -1242,52 +1232,7 @@ class DailyContentRepository {
   /// **The next moment the page has something new to show.**
   ///
 
-  /// Rewrites only `next_slot_at_ms` in the mirror, so "下次更新" can be shown
-  /// while the photos of the batch are still downloading.
-  Future<void> _publishNextSlotEarly(
-    Directory dir,
-    CarouselPlanEnvelope plan,
-    int nowMillis,
-    int intervalMinutes,
-  ) async {
-    try {
-      // **The next slot is the current slot plus one interval.**
-      //
-      // A batch fetched with the paging cursor contains only *later* items — that
-      // is exactly what the cursor asks for — so "the earliest future item in the
-      // batch" is not the next slot at all: measured on iOS at 21:36 it named
-      // "22:30" instead of "21:45", and clamping that value made the line go silent
-      // instead. Current-slot + interval is exact, immediate, and can never name a
-      // time hours away. A near-future item from the batch is only a fallback.
-      final interval = Duration(
-        minutes: intervalMinutes > 0 ? intervalMinutes : 15,
-      ).inMilliseconds;
-      final currentAt = plan.items
-          .where((item) => item.itemId == plan.currentItemId)
-          .map((item) => item.displayAt.toLocal().millisecondsSinceEpoch)
-          .followedBy(const [-1])
-          .first;
-      final upcoming = <int>[
-        if (currentAt > 0) currentAt + interval,
-        ...plan.items
-            .map((item) => item.displayAt.toLocal().millisecondsSinceEpoch)
-            .where((at) => at > nowMillis && at <= nowMillis + interval * 2),
-      ].where((at) => at > nowMillis).toList()
-        ..sort();
-      if (upcoming.isEmpty) return;
-      final file = File('${dir.path}/daily.json');
-      if (!await file.exists()) return;
-      final raw = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
-      if (raw['next_slot_at_ms'] == upcoming.first) return;
-      raw['next_slot_at_ms'] = upcoming.first;
-      final temp = File('${file.path}.tmp');
-      await temp.writeAsString(jsonEncode(raw), flush: true);
-      await temp.rename(file.path);
-      debugPrint('[BloomSync] next_slot published early = ${upcoming.first}');
-    } catch (error) {
-      debugPrint('[BloomSync] early next_slot write skipped: $error');
-    }
-  }
+
 
   /// Written by every sync (`next_slot_at_ms` in `daily.json`) and read here so
   /// the foreground can arm one timer for that instant instead of asking the
