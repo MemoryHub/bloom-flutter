@@ -24,20 +24,24 @@ object BloomWidgetSize {
     ): Pair<Int, Int> {
         val options = manager.getAppWidgetOptions(id)
         val density = context.resources.displayMetrics.density
-        val widthDp = options.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_WIDTH, 0)
+        // **`MIN_*` is the size the widget *is*; `MAX_*` is the largest it may
+        // become.** Reading MAX first made the bitmap bigger than the view, and
+        // `centerCrop` then scaled it back down — which scaled the rounded corners
+        // baked into it by the same factor, so a 27dp design arrived on the wall as
+        // roughly 16dp and the corners looked pointed. The bitmap is meant to land
+        // 1:1 on the view; MIN is what the launcher reports for that.
+        val widthDp = options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH, 0)
             .takeIf { it > 0 }
-            ?: options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH, 0).takeIf { it > 0 }
+            ?: options.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_WIDTH, 0).takeIf { it > 0 }
             ?: fallbackWidthDp
-        val heightDp = options.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_HEIGHT, 0)
+        val heightDp = options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT, 0)
             .takeIf { it > 0 }
-            ?: options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT, 0).takeIf { it > 0 }
+            ?: options.getInt(AppWidgetManager.OPTION_APPWIDGET_MAX_HEIGHT, 0).takeIf { it > 0 }
             ?: fallbackHeightDp
-        // The floor is a *dp* value, so it converts like the size above does;
-        // comparing pixels against a bare dp number meant a nonsense minimum.
-        var width =
-            (widthDp * density).toInt().coerceAtLeast((fallbackWidthDp * density).toInt())
-        var height =
-            (heightDp * density).toInt().coerceAtLeast((fallbackHeightDp * density).toInt())
+        // No pixel floor: forcing the bitmap up to the fallback size only makes
+        // `centerCrop` scale it again, which is what shrinks the corners.
+        var width = (widthDp * density).toInt().coerceAtLeast(1)
+        var height = (heightDp * density).toInt().coerceAtLeast(1)
         val pixels = width.toLong() * height.toLong()
         if (pixels > MAX_BITMAP_PIXELS) {
             val scale = sqrt(MAX_BITMAP_PIXELS.toDouble() / pixels.toDouble())

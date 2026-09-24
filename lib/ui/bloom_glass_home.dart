@@ -597,6 +597,7 @@ class BloomGlassHome extends StatelessWidget {
             widgetEnabled && settings.mode == BloomDisplayMode.carousel
                 ? nextSlotText(settings, nextSlotAt)
                 : null,
+        nextSlotLoading: loading,
         originalPhotoPath: originalPhotoPath,
         content: content,
         date: date,
@@ -1109,9 +1110,35 @@ class _PaperGrainPainter extends CustomPainter {
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
+/// Placeholder for the "下次更新" line while its value is still unknown. Sized to
+/// the label (meta type, one line) so nothing moves when the real text arrives.
+class _NextSlotSkeleton extends StatelessWidget {
+  const _NextSlotSkeleton();
+
+  @override
+  Widget build(BuildContext context) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0.25, end: 0.55),
+      duration: const Duration(milliseconds: 700),
+      curve: Curves.easeInOut,
+      builder: (context, value, child) => Opacity(opacity: value, child: child),
+      child: Container(
+        key: const ValueKey('bloom-next-slot-skeleton'),
+        width: 118,
+        height: 11,
+        decoration: BoxDecoration(
+          color: BloomType.meta.color,
+          borderRadius: BorderRadius.circular(6),
+        ),
+      ),
+    );
+  }
+}
+
 class _PhotoPage extends StatelessWidget {
   const _PhotoPage({
     required this.nextSlotText,
+    this.nextSlotLoading = false,
     required this.originalPhotoPath,
     required this.content,
     required this.date,
@@ -1122,6 +1149,11 @@ class _PhotoPage extends StatelessWidget {
   });
 
   final String? nextSlotText;
+
+  /// True while the first sync of a session is still running. The label cannot be
+  /// known yet, and it used to pop in out of nowhere and shove the card upwards;
+  /// the skeleton below holds its place until there is something to say.
+  final bool nextSlotLoading;
   final String? originalPhotoPath;
   final DailyContent? content;
   final String? date;
@@ -1271,7 +1303,9 @@ class _PhotoPage extends StatelessWidget {
                     constraints.maxHeight -
                         rowHeight -
                         BloomGlassHome.cardGap -
-                        (nextSlot == null ? 0.0 : nextSlotGap + nextSlotHeight),
+                        (nextSlot == null && !nextSlotLoading
+                            ? 0.0
+                            : nextSlotGap + nextSlotHeight),
                   );
                   // Same formula as `AspectRatio` itself: fill the width unless
                   // the height says otherwise (the card is portrait, 720x1200).
@@ -1385,7 +1419,7 @@ class _PhotoPage extends StatelessWidget {
                           ),
                         ),
                       ),
-                      if (nextSlot != null) ...[
+                      if (nextSlot != null || nextSlotLoading) ...[
                         const SizedBox(height: nextSlotGap),
                         SizedBox(
                           height: nextSlotHeight,
@@ -1396,13 +1430,17 @@ class _PhotoPage extends StatelessWidget {
                             padding: EdgeInsets.only(right: side),
                             child: Align(
                               alignment: Alignment.centerRight,
-                              child: Text(
-                                nextSlot,
-                                key: const ValueKey('bloom-next-slot'),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: BloomType.meta,
-                              ),
+                              child: nextSlot == null
+                                  ? (nextSlotLoading
+                                        ? const _NextSlotSkeleton()
+                                        : const SizedBox.shrink())
+                                  : Text(
+                                      nextSlot,
+                                      key: const ValueKey('bloom-next-slot'),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: BloomType.meta,
+                                    ),
                             ),
                           ),
                         ),
