@@ -521,6 +521,24 @@ private enum BloomWidgetRemoteLoader {
       defaults: defaults
     )
     entries.sort { $0.date < $1.date }
+    // **Never leave the due slot empty.** A failed download is `continue`d above, so
+    // that slot has no entry at all — and WidgetKit then keeps the previous timeline
+    // entry on the wall, i.e. a photo the user has already seen (measured on iOS at
+    // 22:30, while Android showed a fresh one). The Dart layer pulls the next ready
+    // photo forward so the pictures shift while the grid stays put; this is that same
+    // rule, applied to the online path, which did not have it. The entry is moved,
+    // not copied, so it cannot appear twice.
+    if let first = entries.first, first.date > now.addingTimeInterval(60) {
+      entries[0] = BloomEntry(
+        date: now,
+        compositeImage: first.compositeImage,
+        photoImage: first.photoImage,
+        captionZh: first.captionZh,
+        captionEn: first.captionEn,
+        capturedDateText: first.capturedDateText,
+        locationText: first.locationText
+      )
+    }
     // Refill while one prefetched entry is still available. WidgetKit may
     // delay networking, but the already-created timeline keeps switching.
     // Statement form rather than an `if` expression: identical meaning, and it
