@@ -346,23 +346,40 @@ class DailyContentRepository {
       settings,
       afterItemId: cursor > 0 ? cursor : null,
     );
-    // **The label must not wait for the photos.** "下次更新" needs a time, not a
-    // picture, and the plan already carries every slot time — so the mirror is
-    // updated here, before a single photo is downloaded. Measured before this: the
-    // write sat at the end of the run, behind a 30s+25s download timeout, so the
-    // label appeared about a minute late or, if a stage threw, not at all.
-    final earlyNextSlotMillis = <int>{
-      ...pool.map(_poolAt),
-      for (final item in plan.items)
-        item.displayAt.toLocal().millisecondsSinceEpoch,
-    }.where((at) => at > DateTime.now().millisecondsSinceEpoch).toList()
+    // **The label must not wait for anything.** "下次更新" is a property of the slot
+    // grid, not of the photos: a failed download swaps the *picture*, the *time*
+    // never moves. So the plan response is enough — the earliest slot still in the
+    // future if the page carries one, otherwise the slot the page is anchored at
+    // plus one interval. No reliance on the download loop, on the pool, or on any
+    // "future entry" being prepared.
+    final nowForLabel = DateTime.now().millisecondsSinceEpoch;
+    final futureFromPlan = plan.items
+        .map((item) => item.displayAt.toLocal().millisecondsSinceEpoch)
+        .where((at) => at > nowForLabel)
+        .toList()
       ..sort();
-    if (earlyNextSlotMillis.isNotEmpty) {
-      await _publishNextSlotAt(dir, earlyNextSlotMillis.first);
+    var labelMillis = futureFromPlan.isEmpty ? null : futureFromPlan.first;
+    if (labelMillis == null) {
+      final anchorFromPage = plan.items
+          .map((item) => item.displayAt.toLocal().millisecondsSinceEpoch)
+          .where((at) => at <= nowForLabel)
+          .toList()
+        ..sort();
+      final anchor = anchorFromPage.isEmpty
+          ? pool
+                .map(_poolAt)
+                .where((at) => at <= nowForLabel)
+                .fold<int?>(null, (best, at) => best == null || at > best ? at : best)
+          : anchorFromPage.last;
+      if (anchor != null) {
+        final step = Duration(minutes: settings.intervalMinutes > 0 ? settings.intervalMinutes : 15);
+        labelMillis = anchor + step.inMilliseconds;
+      }
+    }
+    if (labelMillis != null) {
+      await _publishNextSlotAt(dir, labelMillis);
     } else {
-      // Never silent: if this keeps appearing, the early value has no source yet and
-      // the label is once again waiting for the photos.
-      debugPrint('[BloomSync] no early next_slot (nothing future known yet)');
+      debugPrint('[BloomSync] no next_slot known from the plan response');
     }
 
 
