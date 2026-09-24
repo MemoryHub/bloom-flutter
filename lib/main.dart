@@ -875,10 +875,6 @@ class _BloomHomePageState extends State<BloomHomePage>
   @override
   Widget build(BuildContext context) => BloomGlassHome(
     loading: _loading,
-    // The label's skeleton keys off *this*, not `loading`: `_loading` drops as
-    // soon as cached content is on screen, while the sync that produces the
-    // next-slot stamp is still running, so keying off it left no window at all.
-    syncing: _loadInFlight,
     paired: _paired,
     pairingRefreshing: _pairingRefreshing,
     nextLoading: _nextLoading,

@@ -208,7 +208,6 @@ class BloomGlassHome extends StatelessWidget {
   const BloomGlassHome({
     super.key,
     required this.loading,
-    this.syncing = false,
     required this.paired,
     required this.pairingRefreshing,
     required this.nextLoading,
@@ -239,9 +238,6 @@ class BloomGlassHome extends StatelessWidget {
 
   final bool loading;
 
-  /// True while a carousel sync is in flight. The "下次更新" line cannot be known
-  /// until it finishes, so that is when its skeleton shows.
-  final bool syncing;
   final bool paired;
   final bool pairingRefreshing;
   final bool nextLoading;
@@ -602,7 +598,6 @@ class BloomGlassHome extends StatelessWidget {
             widgetEnabled && settings.mode == BloomDisplayMode.carousel
                 ? nextSlotText(settings, nextSlotAt)
                 : null,
-        nextSlotLoading: syncing,
         originalPhotoPath: originalPhotoPath,
         content: content,
         date: date,
@@ -1115,63 +1110,9 @@ class _PaperGrainPainter extends CustomPainter {
   bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
 
-/// Placeholder for the "下次更新" line while its value is still unknown. Sized to
-/// the label (meta type, one line) so nothing moves when the real text arrives.
-/// Placeholder for the "下次更新" line while its value is still unknown.
-///
-/// Three short bars that breathe, i.e. a *text*-shaped placeholder rather than a
-/// dead grey rectangle: the wait then reads as "this line is being written" and
-/// the swap to the real text is a change of content, not of layout.
-class _NextSlotSkeleton extends StatefulWidget {
-  const _NextSlotSkeleton();
-
-  @override
-  State<_NextSlotSkeleton> createState() => _NextSlotSkeletonState();
-}
-
-class _NextSlotSkeletonState extends State<_NextSlotSkeleton>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _controller = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 950),
-  )..repeat(reverse: true);
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  static const _bar = BoxDecoration(
-    color: Color(0xFF8A8375),
-    borderRadius: BorderRadius.all(Radius.circular(6)),
-  );
-
-  @override
-  Widget build(BuildContext context) {
-    return FadeTransition(
-      key: const ValueKey('bloom-next-slot-skeleton'),
-      opacity: Tween<double>(begin: 0.3, end: 0.85).animate(
-        CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
-      ),
-      child: const Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          SizedBox(width: 30, height: 12, child: DecoratedBox(decoration: _bar)),
-          SizedBox(width: 5),
-          SizedBox(width: 44, height: 12, child: DecoratedBox(decoration: _bar)),
-          SizedBox(width: 5),
-          SizedBox(width: 16, height: 12, child: DecoratedBox(decoration: _bar)),
-        ],
-      ),
-    );
-  }
-}
-
 class _PhotoPage extends StatelessWidget {
   const _PhotoPage({
     required this.nextSlotText,
-    this.nextSlotLoading = false,
     required this.originalPhotoPath,
     required this.content,
     required this.date,
@@ -1183,10 +1124,6 @@ class _PhotoPage extends StatelessWidget {
 
   final String? nextSlotText;
 
-  /// True while the first sync of a session is still running. The label cannot be
-  /// known yet, and it used to pop in out of nowhere and shove the card upwards;
-  /// the skeleton below holds its place until there is something to say.
-  final bool nextSlotLoading;
   final String? originalPhotoPath;
   final DailyContent? content;
   final String? date;
@@ -1336,7 +1273,7 @@ class _PhotoPage extends StatelessWidget {
                     constraints.maxHeight -
                         rowHeight -
                         BloomGlassHome.cardGap -
-                        nextSlotGap + nextSlotHeight,
+                        (nextSlot == null ? 0.0 : nextSlotGap + nextSlotHeight),
                   );
                   // Same formula as `AspectRatio` itself: fill the width unless
                   // the height says otherwise (the card is portrait, 720x1200).
@@ -1450,7 +1387,7 @@ class _PhotoPage extends StatelessWidget {
                           ),
                         ),
                       ),
-                      ...[
+                      if (nextSlot != null) ...[
                         const SizedBox(height: nextSlotGap),
                         SizedBox(
                           height: nextSlotHeight,
@@ -1462,9 +1399,7 @@ class _PhotoPage extends StatelessWidget {
                             child: Align(
                               alignment: Alignment.centerRight,
                               child: nextSlot == null
-                                  ? (nextSlotLoading
-                                        ? const _NextSlotSkeleton()
-                                        : const SizedBox.shrink())
+                                  ? const SizedBox.shrink()
                                   : Text(
                                       nextSlot,
                                       key: const ValueKey('bloom-next-slot'),

@@ -253,6 +253,7 @@ class DeviceCarouselSettings {
   static const modeCarousel = 'carousel';
   static const modeRecommend = 'recommend';
 
+
   final String timezone;
   final String activeStart;
   final String activeEnd;
