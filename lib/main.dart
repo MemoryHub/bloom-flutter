@@ -758,6 +758,11 @@ class _BloomHomePageState extends State<BloomHomePage>
     setState(() => _nextLoading = true);
     try {
       final repository = DailyContentRepository(api: _api);
+      // **Pick the next-slot stamp up while the photos are still downloading.**
+      // The repository publishes it the moment the plan request returns, so the
+      // page can name the next quarter hour right away instead of waiting for the
+      // whole batch to be drawn — which is why "下次更新" used to show up so late.
+      unawaited(_watchNextSlot(repository));
       final content = await repository.syncCarousel(
         credentials,
         _displaySettings,
@@ -870,6 +875,19 @@ class _BloomHomePageState extends State<BloomHomePage>
     _messageTimer = Timer(const Duration(seconds: 2), () {
       if (mounted) setState(() => _message = null);
     });
+  }
+
+
+  /// Re-reads the next-slot stamp while a sync is running, so "下次更新" can appear
+  /// as soon as the plan is known rather than at the end of the batch.
+  Future<void> _watchNextSlot(DailyContentRepository repository) async {
+    for (var i = 0; i < 15 && mounted; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      if (!mounted) return;
+      final at = await repository.nextSlotAtMillis();
+      if (!mounted || at == null || at == _nextSlotAt) continue;
+      setState(() => _nextSlotAt = at);
+    }
   }
 
   @override
