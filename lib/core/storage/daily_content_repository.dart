@@ -258,19 +258,37 @@ class DailyContentRepository {
     final nowMillis = now.millisecondsSinceEpoch;
     final today = _dayKey(now);
     final storedPool = await _readPool(dir);
-    final pool = <Map<String, Object?>>[
+    final storedEntries = <Map<String, Object?>>[
       if (storedPool != null && storedPool.day == today) ...storedPool.entries,
     ];
+    // **A pool entry whose photo is gone must not pin the cursor.**
+    //
+    // Pruning (or a crash between the render and the write) can leave entries
+    // that can never be shown again. Keeping them is unrecoverable: the cursor
+    // sits *past* them, so the missing slots are never requested again and the
+    // day freezes on the last photo that still exists. Dropping them recomputes
+    // the anchor, and a request without a cursor always returns the page that
+    // starts at the slot which is due *now* — the app then re-renders it and
+    // publishes it in the same pass. Measured before this check: at 08:30 the
+    // server said `current=3271`, the pool held 3271, its file had been pruned,
+    // and the app stayed on the 08:15 photo.
+    final pool = <Map<String, Object?>>[];
+    for (final entry in storedEntries) {
+      final path = entry['originalPhotoPath'] as String?;
+      if (path == null || await File(path).exists()) pool.add(entry);
+    }
+    if (pool.length != storedEntries.length) {
+      debugPrint(
+        '[BloomSync] dropped ${storedEntries.length - pool.length} pool '
+        'entries whose photo file is gone; the walk restarts from the current '
+        'slot',
+      );
+    }
     // **Step 2 — the refill anchor.** The largest id the pool actually holds,
     // i.e. the last page boundary this phone prepared. A page that failed to
     // render never entered the pool, so it is asked for again instead of being
     // silently stepped over. It is per local day: a new day starts from the top.
-    var cursor =
-        storedPool != null &&
-            storedPool.day == today &&
-            storedPool.lastItemId > 0
-        ? storedPool.lastItemId
-        : _maxItemId(pool);
+    var cursor = _maxItemId(pool);
     var plan = await api.carouselPlan(
       credentials,
       settings,

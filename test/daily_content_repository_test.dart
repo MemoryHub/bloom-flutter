@@ -172,6 +172,8 @@ void main() {
     required int lastItemId,
     required List<int> itemIds,
     DateTime? day,
+    Duration displayAtOffset = const Duration(minutes: -1),
+    bool withFiles = false,
   }) async {
     final at = day ?? DateTime.now();
     await File('${cacheDir.path}/carousel-pool.json').writeAsString(
@@ -185,7 +187,7 @@ void main() {
             {
               'itemId': id,
               'displayAtMillis': at
-                  .subtract(const Duration(minutes: 1))
+                  .add(displayAtOffset)
                   .millisecondsSinceEpoch,
               'date': dayOf(at),
               'portraitPath': '${cacheDir.path}/mobile-local-portrait-$id.png',
@@ -198,6 +200,13 @@ void main() {
         ],
       }),
     );
+    if (withFiles) {
+      for (final id in itemIds) {
+        await File(
+          '${cacheDir.path}/carousel-original-$id.photo',
+        ).writeAsBytes(pngBytes);
+      }
+    }
   }
 
   test('连续两次补货：游标接在池尾，两批 id 不重叠且都进了排程', () async {
@@ -322,6 +331,7 @@ void main() {
       currentItemId: 101,
       lastItemId: 104,
       itemIds: [104],
+      withFiles: true,
     );
     final api = apiReturning([
       {
@@ -388,6 +398,8 @@ void main() {
       currentItemId: 105,
       lastItemId: 105,
       itemIds: [105],
+      displayAtOffset: const Duration(minutes: 30),
+      withFiles: true,
     );
     // No original on disk and no daily.json: nothing can name a current slot.
     final api = apiReturning([
@@ -523,6 +535,44 @@ void main() {
         reason: '按引用保留：$path 仍被池子引用，任何一次剪枝都不能删它',
       );
     }
+  });
+
+  test('池子里的图被删了：游标自动重置，同一趟就把当前槽位重新取回来', () async {
+    final base = DateTime.now().subtract(const Duration(minutes: 1));
+    // A pool that points at files which no longer exist (pruned by an older
+    // build, or a crash between render and write) — `withFiles` is deliberately
+    // off here.
+    await writePool(
+      planId: 995,
+      currentItemId: 501,
+      lastItemId: 504,
+      itemIds: [501, 502, 503, 504],
+    );
+    final api = apiReturning([
+      planWith(
+        planId: 995,
+        currentItemId: 501,
+        ids: [501, 502, 503, 504],
+        first: base,
+      ),
+    ]);
+
+    final result = await DailyContentRepository(
+      api: api,
+    ).syncCarousel(credentials, settings);
+
+    expect(
+      planRequests.single.containsKey('after_item_id'),
+      isFalse,
+      reason: '池子里没有一张能用的图，就不能再拿它的最大 id 当游标 —— '
+          '否则这些槽位永远不会被重新取回，照片会一直冻在旧的那张',
+    );
+    expect(result.recommendationId, 501);
+    expect(
+      await File('${cacheDir.path}/carousel-original-501.photo').exists(),
+      isTrue,
+      reason: '同一趟里就该把它重新下回来',
+    );
   });
 
   test('池子上限：连续补货不无限增长，被裁掉的一页不被游标跳过', () async {
