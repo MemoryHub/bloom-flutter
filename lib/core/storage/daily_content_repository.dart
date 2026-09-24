@@ -602,11 +602,28 @@ class DailyContentRepository {
           );
           continue;
         }
-        // A broken future asset must not invalidate the current photo and all
-        // previously prepared slots. The final partial schedule will request
-        // another batch at its last usable entry.
+        // **A late photo must not delete its slot.** Dropping the item here is
+        // what left the union with no future entry at all: measured on device at
+        // 20:12 with `fetched=4`, the pool's newest item was the *current* one, so
+        // `next_slot` came out `none` (the "下次更新" line had nothing to say, and
+        // the skeleton had nothing to hold) and the widget had nothing to advance
+        // to — the same few photos came round again. The cadence is the grid; only
+        // the picture may be late. The slot goes into the union with the paths it
+        // will have, and the native side keeps the current photo on the wall until
+        // the file really exists.
+        incoming.add(
+          _poolEntry(
+            item,
+            item.asDailyContent(),
+            {
+              for (final family in _families)
+                family: _versionedImage(dir, family, item.itemId).path,
+            },
+            '${dir.path}/carousel-original-${item.itemId}.photo',
+          ),
+        );
         debugPrint(
-          '[BloomSync] skipping future photo item=${item.itemId}: $error',
+          '[BloomSync] future photo item=${item.itemId} not ready yet: $error',
         );
       }
     }

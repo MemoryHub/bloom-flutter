@@ -267,19 +267,51 @@ class BloomGlassHome extends StatelessWidget {
   /// enough to answer locally — slots are `start + k * interval`, so the next one
   /// is the first grid point after now, and once the window is done it is
   /// tomorrow's start.
+  /// The slot after [now] on the window/interval grid, or null when the settings
+  /// cannot describe one.
+  static DateTime? _gridNextSlot(BloomDisplaySettings settings, DateTime now) {
+    final start = _clockOffset(settings.activeStart);
+    final end = _clockOffset(settings.activeEnd);
+    if (end <= start || settings.intervalMinutes < 1) return null;
+    final step = Duration(minutes: settings.intervalMinutes);
+    final midnight = DateTime(now.year, now.month, now.day);
+    var next = midnight.add(start);
+    if (!next.isAfter(now)) {
+      final passed = now.difference(next).inMinutes;
+      next = next.add(step * (passed ~/ settings.intervalMinutes + 1));
+    }
+    if (next.isAfter(midnight.add(end))) {
+      return midnight.add(const Duration(days: 1)).add(start);
+    }
+    return next;
+  }
+
+  static Duration _clockOffset(String value) {
+    final parts = value.split(':');
+    final hh = int.tryParse(parts.isNotEmpty ? parts[0] : '') ?? 0;
+    final mm = int.tryParse(parts.length > 1 ? parts[1] : '') ?? 0;
+    return Duration(hours: hh, minutes: mm);
+  }
+
   static String? nextSlotText(BloomDisplaySettings settings, int? stampMillis) {
     final now = DateTime.now();
     final stamp =
         (stampMillis == null || stampMillis < 1)
             ? null
             : DateTime.fromMillisecondsSinceEpoch(stampMillis);
-    // **Only the plan's own stamp — never a guess from the phone's settings.**
-    // The grid fallback that used to stand here read the *local* window, which on
-    // this phone did not match the plan the server is actually running, so at
-    // 15:00 it announced "明天 06:00"; a settings state is not a schedule. If the
-    // stamp is missing or already past, the honest answer is to say nothing.
-    if (stamp == null || !stamp.isAfter(now)) return null;
-    final at = stamp;
+    // **Instant, then corrected.** The stamp is the truth, but it is only written
+    // when a whole sync finishes — photos downloaded and drawn — which is why the
+    // line used to appear "after a long time". The window and interval the user
+    // set define the same grid the plan runs on, so the next quarter hour can be
+    // named immediately and the real stamp simply overwrites it when it arrives.
+    //
+    // A degenerate window (start == end, or a zero interval) is a settings state,
+    // not a schedule: that is what produced the old "明天 06:00", so it says
+    // nothing instead.
+    final at = (stamp != null && stamp.isAfter(now))
+        ? stamp
+        : _gridNextSlot(settings, now);
+    if (at == null) return null;
     final days =
         DateTime(
           at.year,

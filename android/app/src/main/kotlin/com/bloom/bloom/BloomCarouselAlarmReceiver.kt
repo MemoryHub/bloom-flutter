@@ -75,6 +75,21 @@ object BloomCarouselSchedule {
             return false
         }
 
+        // **Never move onto a file that is not there.** A slot is kept in the plan
+        // even while its photo is still downloading (a slow server must not cost a
+        // quarter hour), so the newest due entry is not always displayable;
+        // applying it would put an empty frame on the wall. Keep the current photo
+        // but still return true, so the provider runs and its refill sync fetches
+        // the missing image moments later.
+        val candidates = listOfNotNull(
+            resolved["portraitPath"] as? String,
+            resolved["originalPhotoPath"] as? String,
+        )
+        if (candidates.none { java.io.File(it).exists() }) {
+            Log.i(TAG, "Due item ${resolved["itemId"]} has no image yet; keeping current")
+            return true
+        }
+
         prefs.edit()
             .putString("mobileLocalPortraitPath", resolved["portraitPath"] as? String)
             .putString("mobileLocalSquarePath", resolved["squarePath"] as? String)
