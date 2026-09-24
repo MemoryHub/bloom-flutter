@@ -243,6 +243,14 @@ class DailyContentRepository {
         // while the background was still downloading (measured on iOS: the widget
         // advanced, the in-app card did not until the app was relaunched).
         if (foreground) {
+          // **Do not go quiet.** Handing back what we have keeps the page
+          // responsive, but the slot still has to advance: measured on iOS, the
+          // widget moved on while the in-app card stayed on the old photo — with no
+          // error and, worse, no retry, because the failure had been silenced. One
+          // short self-retry closes that gap and touches nothing else: if the lock
+          // is still held the retry lands here again, and once the background sync
+          // finishes it goes through and the card catches up.
+          _scheduleForegroundRetry(credentials, settings);
           final cached = await cachedContent();
           if (cached != null) return cached;
           final native = await WidgetBridge().readCurrentState();
@@ -1239,6 +1247,28 @@ class DailyContentRepository {
   /// cache every 30 seconds whether anything changed. Null when the day's slots
   /// are exhausted or the file is unreadable — the caller then simply leaves the
   /// existing behaviour alone rather than guessing a time.
+
+  /// One short retry after a foreground sync could not take the lock. Bounded by
+  /// construction: the retry re-enters the same guard, so it can only be pending
+  /// while a sync is actually in flight.
+  void _scheduleForegroundRetry(
+    DeviceCredentials credentials,
+    BloomDisplaySettings settings,
+  ) {
+    if (_foregroundRetryPending) return;
+    _foregroundRetryPending = true;
+    unawaited(
+      Future<void>.delayed(const Duration(seconds: 5), () async {
+        _foregroundRetryPending = false;
+        try {
+          await syncCarousel(credentials, settings, foreground: true);
+        } catch (_) {}
+      }),
+    );
+  }
+
+  bool _foregroundRetryPending = false;
+
   Future<int?> nextSlotAtMillis() async {
     try {
       final dir = await _dir();
