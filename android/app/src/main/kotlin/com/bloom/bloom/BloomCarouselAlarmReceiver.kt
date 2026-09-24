@@ -105,9 +105,19 @@ object BloomCarouselSchedule {
             .putLong("updatedAtMillis", System.currentTimeMillis())
             .apply()
 
+        // **The diagnostic that separates the two possible faults.** `at` is the
+        // time the plan gives this item and `now` is the moment it went up:
+        //   at  > now  -> the widget advanced *early* (it showed a slot before its
+        //                 turn, which is what makes a photo look "seen before" when
+        //                 the slot's own picture arrives later);
+        //   at <= now  -> the item was due, so a repeat means the *selection* is
+        //                 wrong: another entry with a later `at` (or a larger id at
+        //                 the same `at`) should have won instead.
+        val dueAt = (resolved["displayAtMillis"] as? Number)?.toLong() ?: 0L
         Log.i(
             TAG,
-            "Applied cached carousel item=${resolved["itemId"]} action=${intent.action}",
+            "Applied cached carousel item=${resolved["itemId"]} at=$dueAt " +
+                "now=${System.currentTimeMillis()} action=${intent.action}",
         )
         return true
     }
