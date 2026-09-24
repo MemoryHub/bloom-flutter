@@ -847,7 +847,7 @@ class DailyContentRepository {
       'next_slot=$nextSlotLabel',
     );
 
-    final currentReady = resolvedManifest;
+    var currentReady = resolvedManifest;
     if (currentReady != null && currentItemId > 0) {
       // `daily.json` is the Dart-side mirror of "what is on screen now". A pure
       // refill must not move it: the resolved current above is deliberately the
@@ -977,6 +977,27 @@ class DailyContentRepository {
       // picture, which is the whole point of the shift, so there is nothing for
       // the caller to retry.
       throw StateError('当前轮播照片未能准备，已保留原照片并重排闹钟');
+    }
+    // **The native is the single authority for what is on screen.**
+    //
+    // The widget and the app used to decide independently — each with its own rule
+    // and its own inputs — which is exactly how a phone ended up showing two
+    // different photos (measured: the widget advanced at 22:00 while the in-app
+    // card stayed on the previous slot). The app's job is to *publish* the plan and
+    // the photos; what it draws is then whatever the native holds, as long as that
+    // item really has a photo on disk. From here the two cannot disagree.
+    final nativeNow = await WidgetBridge().readCurrentState();
+    final nativeNowId = nativeNow?.recommendationId ?? 0;
+    if (nativeNow != null && nativeNowId > 0 && nativeNowId != currentItemId) {
+      if (await photoPathFor(nativeNowId) != null) {
+        // `_nativeManifest` is total: it always yields a usable manifest.
+        debugPrint(
+          '[BloomSync] app follows native item=$nativeNowId '
+          '(own resolution was $currentItemId)',
+        );
+        currentItemId = nativeNowId;
+        currentReady = _nativeManifest(nativeNow);
+      }
     }
     return currentReady;
   }
