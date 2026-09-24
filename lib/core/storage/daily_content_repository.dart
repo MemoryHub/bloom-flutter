@@ -346,6 +346,21 @@ class DailyContentRepository {
       settings,
       afterItemId: cursor > 0 ? cursor : null,
     );
+    // **The label must not wait for the photos.** "下次更新" needs a time, not a
+    // picture, and the plan already carries every slot time — so the mirror is
+    // updated here, before a single photo is downloaded. Measured before this: the
+    // write sat at the end of the run, behind a 30s+25s download timeout, so the
+    // label appeared about a minute late or, if a stage threw, not at all.
+    final earlyNextSlotMillis = <int>{
+      ...pool.map(_poolAt),
+      for (final item in plan.items)
+        item.displayAt.toLocal().millisecondsSinceEpoch,
+    }.where((at) => at > DateTime.now().millisecondsSinceEpoch).toList()
+      ..sort();
+    if (earlyNextSlotMillis.isNotEmpty) {
+      await _publishNextSlotAt(dir, earlyNextSlotMillis.first);
+    }
+
 
     debugPrint(
       '[BloomSync] carousel plan=${plan.planId} items=${plan.items.length} '
@@ -1289,6 +1304,28 @@ class DailyContentRepository {
   }
 
   bool _foregroundRetryPending = false;
+
+
+  /// Writes only `next_slot_at_ms` into the Dart-side mirror, leaving every other
+  /// field alone. Used as soon as the plan's slot times are known so the label is
+  /// decoupled from the photo downloads; the end-of-run write repeats the same
+  /// value, so running this early is idempotent.
+  Future<void> _publishNextSlotAt(Directory dir, int atMillis) async {
+    final file = File('${dir.path}/daily.json');
+    try {
+      if (!await file.exists()) return;
+      final raw = jsonDecode(await file.readAsString());
+      if (raw is! Map<String, Object?>) return;
+      if (raw['next_slot_at_ms'] == atMillis) return;
+      raw['next_slot_at_ms'] = atMillis;
+      final temp = File('${file.path}.tmp');
+      await temp.writeAsString(jsonEncode(raw), flush: true);
+      await temp.rename(file.path);
+      debugPrint('[BloomSync] next_slot published with the plan = $atMillis');
+    } catch (error) {
+      debugPrint('[BloomSync] early next_slot write skipped: $error');
+    }
+  }
 
   Future<int?> nextSlotAtMillis() async {
     try {
