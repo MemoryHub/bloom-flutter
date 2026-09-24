@@ -1251,19 +1251,28 @@ class DailyContentRepository {
     int intervalMinutes,
   ) async {
     try {
-      // **Only a value that can really be the *next* slot.** A batch fetched near
-      // the end of the window can carry items far in the future (tomorrow's first
-      // ones included), and writing the earliest of those named a time hours away:
-      // measured on iOS at 21:36 the line read "22:30" instead of "21:45". The next
-      // slot is never more than one interval away, so anything further out is left
-      // alone and the authoritative value from the finished sync stands.
-      final horizon = nowMillis +
-          Duration(minutes: intervalMinutes > 0 ? intervalMinutes + 1 : 16)
-              .inMilliseconds;
-      final upcoming = plan.items
+      // **The next slot is the current slot plus one interval.**
+      //
+      // A batch fetched with the paging cursor contains only *later* items — that
+      // is exactly what the cursor asks for — so "the earliest future item in the
+      // batch" is not the next slot at all: measured on iOS at 21:36 it named
+      // "22:30" instead of "21:45", and clamping that value made the line go silent
+      // instead. Current-slot + interval is exact, immediate, and can never name a
+      // time hours away. A near-future item from the batch is only a fallback.
+      final interval = Duration(
+        minutes: intervalMinutes > 0 ? intervalMinutes : 15,
+      ).inMilliseconds;
+      final currentAt = plan.items
+          .where((item) => item.itemId == plan.currentItemId)
           .map((item) => item.displayAt.toLocal().millisecondsSinceEpoch)
-          .where((at) => at > nowMillis && at <= horizon)
-          .toList()
+          .followedBy(const [-1])
+          .first;
+      final upcoming = <int>[
+        if (currentAt > 0) currentAt + interval,
+        ...plan.items
+            .map((item) => item.displayAt.toLocal().millisecondsSinceEpoch)
+            .where((at) => at > nowMillis && at <= nowMillis + interval * 2),
+      ].where((at) => at > nowMillis).toList()
         ..sort();
       if (upcoming.isEmpty) return;
       final file = File('${dir.path}/daily.json');
