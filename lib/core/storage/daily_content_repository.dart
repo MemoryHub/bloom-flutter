@@ -93,9 +93,14 @@ class DailyContentRepository {
     DeviceCredentials credentials,
     BloomDisplaySettings settings, {
     bool next = false,
+    bool foreground = false,
   }) async {
     if (!next) {
-      return _syncCarouselPlan(credentials, settings);
+      return _syncCarouselPlan(
+        credentials,
+        settings,
+        foreground: foreground,
+      );
     }
     final dir = await _dir();
     final metadataFile = File('${dir.path}/daily.json');
@@ -174,8 +179,9 @@ class DailyContentRepository {
 
   Future<DailyContent> _syncCarouselPlan(
     DeviceCredentials credentials,
-    BloomDisplaySettings settings,
-  ) async {
+    BloomDisplaySettings settings, {
+    bool foreground = false,
+  }) async {
     final dir = await _dir();
     final lock = File('${dir.path}/carousel-sync.lock');
     var ownsLock = false;
@@ -187,7 +193,14 @@ class DailyContentRepository {
       // existing owner finish rather than downloading and rendering the same
       // four large photos in two Flutter engines.
       var removedStaleLock = false;
-      for (var attempt = 0; attempt < 180 && await lock.exists(); attempt++) {
+      // **The foreground waits briefly and then shows what it has; the
+      // background waits the full window and then fails.** The foreground's job
+      // is to put the right photo on screen now — blocking the page for the old
+      // 90 s and then throwing "正在显示上一张" is what made a slot look like it
+      // never changed. WorkManager, by contrast, *must* fail so it retries
+      // instead of reporting a success it did not earn.
+      final attempts = foreground ? 12 : 180;
+      for (var attempt = 0; attempt < attempts && await lock.exists(); attempt++) {
         final age = DateTime.now().difference((await lock.stat()).modified);
         if (age > const Duration(minutes: 3)) {
           try {
@@ -203,7 +216,11 @@ class DailyContentRepository {
       // false success to WorkManager and can leave the carousel stuck. Take
       // ownership again and perform the sync for real.
       if (removedStaleLock) {
-        return _syncCarouselPlan(credentials, settings);
+        return _syncCarouselPlan(
+          credentials,
+          settings,
+          foreground: foreground,
+        );
       }
       // The other task did not finish within the wait window. Returning the
       // previous cache here reports SUCCESS to WorkManager even though no new
@@ -212,6 +229,14 @@ class DailyContentRepository {
       // attempt will either observe the real owner finishing or remove the
       // lock once it passes the stale threshold above.
       if (await lock.exists()) {
+        if (foreground) {
+          // Another engine (the widget's background task) is mid-sync. Hand back
+          // the last complete state instead of an error: the native side may
+          // already have advanced to the due slot, and the card stays whole
+          // either way. No message — nothing actually went wrong for the reader.
+          final cached = await cachedContent();
+          if (cached != null) return cached;
+        }
         throw StateError('轮播计划同步仍在进行，等待后台重试');
       }
       final cached = await cachedContent();

@@ -125,6 +125,7 @@ class _BloomHomePageState extends State<BloomHomePage>
   String? _originalPhotoPath;
   int? _nextSlotAt;
   bool _loadInFlight = false;
+  DateTime? _loadStartedAt;
   DateTime? _pausedAt;
   String? _date;
   String? _message;
@@ -217,8 +218,19 @@ class _BloomHomePageState extends State<BloomHomePage>
     // **One load at a time.** Resume, the slot timer and the 30 s fallback can
     // all ask within the same second, and a second sync would only race the
     // first for the same files (and double the refill's network cost).
-    if (_loadInFlight) return;
+    if (_loadInFlight) {
+      final started = _loadStartedAt;
+      if (started != null &&
+          DateTime.now().difference(started) < const Duration(seconds: 60)) {
+        return;
+      }
+      // **A stuck load must not freeze every later refresh.** A download can
+      // outlive its own timeout, and the guard is only there to stop two *live*
+      // syncs racing for the same files — so once the holder is this old, let the
+      // new one through.
+    }
     _loadInFlight = true;
+    _loadStartedAt = DateTime.now();
     if (showSpinner && mounted) setState(() => _loading = true);
     try {
       final storedCredentials = await _identity.read();
@@ -399,6 +411,7 @@ class _BloomHomePageState extends State<BloomHomePage>
                     ? await repository.syncCarousel(
                       credentials,
                       displaySettings,
+                      foreground: true,
                     )
                     : await repository.sync(credentials);
           } catch (error, stack) {
