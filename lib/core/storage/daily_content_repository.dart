@@ -346,29 +346,6 @@ class DailyContentRepository {
       settings,
       afterItemId: cursor > 0 ? cursor : null,
     );
-    // **A rebuilt plan is a different plan.**
-    //
-    // Changing the active window (measured: switching both phones to an all-day
-    // window) makes the server regenerate the whole day under a *new* `plan_id`, and
-    // every item id changes with it. The stored cursor then points into a plan that no
-    // longer exists: `/carousel/plan` answers with an empty batch, the union keeps the
-    // old current item, the next slot has nothing to show and the "下次更新" stamp goes
-    // stale. Measured at 23:00: both phones stopped updating and the label vanished.
-    // Dropping the stale pool and asking again without a cursor is the same recovery
-    // the dead-cursor path uses, and it is what makes a settings change self-heal.
-    if (storedPool != null &&
-        storedPool.planId > 0 &&
-        plan.planId > 0 &&
-        storedPool.planId != plan.planId) {
-      debugPrint(
-        '[BloomSync] plan rebuilt \${storedPool.planId} -> ${plan.planId}: dropping the stale pool '
-        'and re-reading without a cursor',
-      );
-      pool.clear();
-      cursor = 0;
-      plan = await api.carouselPlan(credentials, settings);
-    }
-
 
     debugPrint(
       '[BloomSync] carousel plan=${plan.planId} items=${plan.items.length} '
