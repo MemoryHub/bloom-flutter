@@ -359,6 +359,10 @@ class DailyContentRepository {
       ..sort();
     if (earlyNextSlotMillis.isNotEmpty) {
       await _publishNextSlotAt(dir, earlyNextSlotMillis.first);
+    } else {
+      // Never silent: if this keeps appearing, the early value has no source yet and
+      // the label is once again waiting for the photos.
+      debugPrint('[BloomSync] no early next_slot (nothing future known yet)');
     }
 
 
@@ -1313,10 +1317,18 @@ class DailyContentRepository {
   Future<void> _publishNextSlotAt(Directory dir, int atMillis) async {
     final file = File('${dir.path}/daily.json');
     try {
-      if (!await file.exists()) return;
-      final raw = jsonDecode(await file.readAsString());
-      if (raw is! Map<String, Object?>) return;
-      if (raw['next_slot_at_ms'] == atMillis) return;
+      // A missing mirror is not a reason to stay silent: this runs *before* the
+      // photos are fetched, which on a cold start is exactly when the file has not
+      // been written yet. The end-of-run write replaces it wholesale a moment later.
+      final raw = <String, Object?>{};
+      if (await file.exists()) {
+        final decoded = jsonDecode(await file.readAsString());
+        if (decoded is Map<String, Object?>) raw.addAll(decoded);
+      }
+      if (raw['next_slot_at_ms'] == atMillis) {
+        debugPrint('[BloomSync] next_slot already published = $atMillis');
+        return;
+      }
       raw['next_slot_at_ms'] = atMillis;
       final temp = File('${file.path}.tmp');
       await temp.writeAsString(jsonEncode(raw), flush: true);
@@ -1326,6 +1338,7 @@ class DailyContentRepository {
       debugPrint('[BloomSync] early next_slot write skipped: $error');
     }
   }
+
 
   Future<int?> nextSlotAtMillis() async {
     try {
