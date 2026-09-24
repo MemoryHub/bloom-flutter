@@ -296,8 +296,6 @@ class BloomGlassHome extends StatelessWidget {
     return '下次更新 $day $hh:$mm';
   }
 
-
-
   /// Devices the switcher and the "设备" tab list. Hardcoded for now (F3):
   /// this phone plus the frame. See `bloom_device_pages.dart`.
   final List<BloomDevice> devices;
@@ -1398,15 +1396,13 @@ class _PhotoPage extends StatelessWidget {
                             padding: EdgeInsets.only(right: side),
                             child: Align(
                               alignment: Alignment.centerRight,
-                              child: nextSlot == null
-                                  ? const SizedBox.shrink()
-                                  : Text(
-                                      nextSlot,
-                                      key: const ValueKey('bloom-next-slot'),
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: BloomType.meta,
-                                    ),
+                              child: Text(
+                                nextSlot,
+                                key: const ValueKey('bloom-next-slot'),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: BloomType.meta,
+                              ),
                             ),
                           ),
                         ),
