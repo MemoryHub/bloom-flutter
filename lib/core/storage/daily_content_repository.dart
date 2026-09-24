@@ -817,6 +817,7 @@ class DailyContentRepository {
       await _pruneVersionedImages(dir, family, keeping: referencedImages);
     }
     await _pruneCarouselOriginals(dir, keeping: referencedOriginals);
+    await _sweepTempFiles(dir);
     // ---- everything below is reported *after* the alarm chain was re-armed ----
     if (scheduled.isEmpty) {
       // A whole page that failed to prepare and no pool to fall back on: fail so
@@ -1144,6 +1145,25 @@ class DailyContentRepository {
       }
       try {
         await file.delete();
+      } catch (_) {}
+    }
+  }
+
+  /// **A killed write leaves a full-size `.tmp` behind, and nothing else ever
+  /// looks at it.** `original.photo.tmp` matches neither pruner's name filter, so
+  /// every interruption (a force-stop, a killed background task, a low-memory
+  /// kill) used to add one whole photo to the cache forever — the exact
+  /// "unbounded growth" the user asked to not have.
+  ///
+  /// The age floor matters: a live sync may be mid-write at this very moment, and
+  /// deleting its temp file would turn a valid rename into an exception.
+  Future<void> _sweepTempFiles(Directory dir) async {
+    final cutoff = DateTime.now().subtract(const Duration(minutes: 10));
+    await for (final entity in dir.list()) {
+      if (entity is! File || !entity.path.endsWith('.tmp')) continue;
+      try {
+        if (entity.statSync().modified.isAfter(cutoff)) continue;
+        await entity.delete();
       } catch (_) {}
     }
   }

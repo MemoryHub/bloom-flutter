@@ -537,6 +537,36 @@ void main() {
     }
   });
 
+  test('剪枝顺带清掉被中断写入留下的 .tmp：旧的删、刚写的留', () async {
+    final base = DateTime.now().subtract(const Duration(minutes: 1));
+    final api = apiReturning([
+      planWith(
+        planId: 991,
+        currentItemId: 411,
+        ids: [411, 412],
+        first: base,
+      ),
+    ]);
+    // A write killed between `writeAsBytes` and `rename` used to survive forever:
+    // `original.photo.tmp` matches neither pruner's name filter.
+    final stale = File('${cacheDir.path}/original.photo.tmp');
+    await stale.writeAsBytes(pngBytes);
+    await stale.setLastModified(
+      DateTime.now().subtract(const Duration(minutes: 30)),
+    );
+    // ...while a temp file written moments ago may belong to a sync running right
+    // now, whose rename deleting it would break.
+    // (item 499 is not in this plan, so the sync never renames this one away —
+    // the point is only that an *old* temp file is what gets swept.)
+    final fresh = File('${cacheDir.path}/carousel-original-499.photo.tmp');
+    await fresh.writeAsBytes(pngBytes);
+
+    await DailyContentRepository(api: api).syncCarousel(credentials, settings);
+
+    expect(await stale.exists(), isFalse, reason: '半小时前的残留必须被清掉');
+    expect(await fresh.exists(), isTrue, reason: '可能正在写的临时文件不能删');
+  });
+
   test('池子里的图被删了：游标自动重置，同一趟就把当前槽位重新取回来', () async {
     final base = DateTime.now().subtract(const Duration(minutes: 1));
     // A pool that points at files which no longer exist (pruned by an older

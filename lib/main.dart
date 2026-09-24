@@ -124,6 +124,8 @@ class _BloomHomePageState extends State<BloomHomePage>
   DailyContent? _content;
   String? _originalPhotoPath;
   int? _nextSlotAt;
+  bool _loadInFlight = false;
+  DateTime? _pausedAt;
   String? _date;
   String? _message;
 
@@ -212,6 +214,11 @@ class _BloomHomePageState extends State<BloomHomePage>
   }
 
   Future<void> _load({bool showSpinner = true}) async {
+    // **One load at a time.** Resume, the slot timer and the 30 s fallback can
+    // all ask within the same second, and a second sync would only race the
+    // first for the same files (and double the refill's network cost).
+    if (_loadInFlight) return;
+    _loadInFlight = true;
     if (showSpinner && mounted) setState(() => _loading = true);
     try {
       final storedCredentials = await _identity.read();
@@ -563,7 +570,32 @@ class _BloomHomePageState extends State<BloomHomePage>
         _loading = false;
       });
       _scheduleMessageClear();
+    } finally {
+      _loadInFlight = false;
     }
+  }
+
+  /// **Coming back to the foreground is a moment the plan can have moved on.**
+  /// Android freezes a cached process, so the slot timer does not fire while the
+  /// app is away — the page would still be showing the photo that was due when it
+  /// left, with a "下次更新" time already in the past. Re-read on the way in: the
+  /// pool normally already holds the due item, so this is a local read plus one
+  /// short request, and both the card and the label come back in step.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    if (state == AppLifecycleState.paused) {
+      _pausedAt = DateTime.now();
+      return;
+    }
+    if (state != AppLifecycleState.resumed) return;
+    final away = _pausedAt == null ? null : DateTime.now().difference(_pausedAt!);
+    _pausedAt = null;
+    // `null` means this is the resume that every cold start produces (the first
+    // `_load` is already running), and a blink shorter than this is the
+    // notification shade, not a return.
+    if (away == null || away < const Duration(seconds: 5)) return;
+    unawaited(_load(showSpinner: false));
   }
 
   void _startPairingPoll() {
