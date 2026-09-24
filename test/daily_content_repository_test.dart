@@ -575,6 +575,52 @@ void main() {
     );
   });
 
+  test('池子里只剩未来槽位：自动从当前槽位重取一次，照片当趟就追上', () async {
+    final now = DateTime.now();
+    // Every entry the pool still has is in the future, so no page fetched *after*
+    // the cursor can ever contain the slot that should be on screen.
+    await writePool(
+      planId: 996,
+      currentItemId: 601,
+      lastItemId: 604,
+      itemIds: [603, 604],
+      displayAtOffset: const Duration(minutes: 30),
+      withFiles: true,
+    );
+    final api = apiReturning([
+      planWith(
+        planId: 996,
+        currentItemId: 601,
+        ids: [605, 606, 607, 608],
+        first: now.add(const Duration(minutes: 30)),
+      ),
+      planWith(
+        planId: 996,
+        currentItemId: 601,
+        ids: [601, 602, 603, 604],
+        first: now.subtract(const Duration(minutes: 1)),
+      ),
+    ]);
+
+    final result = await DailyContentRepository(
+      api: api,
+    ).syncCarousel(credentials, settings);
+
+    expect(planRequests, hasLength(2));
+    expect(
+      planRequests.last.containsKey('after_item_id'),
+      isFalse,
+      reason: '池子和这一页都没有"此刻该显示的那张"时必须从当前槽位重读一次，'
+          '否则它会一直冻在旧照片上，直到池子窗口自己滑过去',
+    );
+    expect(result.recommendationId, 601);
+    expect(
+      await File('${cacheDir.path}/original.photo').exists(),
+      isTrue,
+      reason: '当前槽位要在同一趟里落地成 App 显示的那张（original.photo）',
+    );
+  });
+
   test('池子上限：连续补货不无限增长，被裁掉的一页不被游标跳过', () async {
     final base = DateTime.now().subtract(const Duration(minutes: 1));
     final pages = <List<int>>[

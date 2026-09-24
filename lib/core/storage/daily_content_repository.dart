@@ -333,6 +333,35 @@ class DailyContentRepository {
     }
     if (plan.items.isEmpty && pool.isEmpty) throw StateError('轮播计划为空');
 
+    // ---- **and the union must contain the slot that is due now** ----------
+    //
+    // Same accident, other face: the pool can end up holding only *future* slots
+    // while the one that should be on screen has no file left. The walk then
+    // never asks for it again — the cursor is past it — so `dueEntry` stays null
+    // and the page keeps the previous photo until the pool's own window slides
+    // forward. Measured on the device after installing the pruning fix: the
+    // current slot was 3275, the pool held only 10:30 and later, and the photo
+    // would have stayed on the morning's first shot for another 45 minutes.
+    //
+    // A request without a cursor returns the page that *starts* at the current
+    // slot, so one extra call repairs exactly that, and the slot is re-rendered
+    // and published in this same pass instead of at the next one.
+    final poolHasDue = pool.any((entry) => _poolAt(entry) <= nowMillis);
+    final pageHasDue = plan.items.any(
+      (item) => !item.displayAt.toLocal().isAfter(now.add(const Duration(seconds: 60))),
+    );
+    if (cursor > 0 && !poolHasDue && !pageHasDue && plan.currentItemId > 0) {
+      debugPrint(
+        '[BloomSync] nothing due in the pool or the page (plan=${plan.planId}, '
+        'current=${plan.currentItemId}); re-reading from the current slot',
+      );
+      plan = await api.carouselPlan(credentials, settings);
+      debugPrint(
+        '[BloomSync] re-read plan=${plan.planId} items=${plan.items.length} '
+        'current=${plan.currentItemId}',
+      );
+    }
+
     // ---- **the plan's own "now", then the rest** ------------------------
     //
     // Two things were wrong before. The four photos were fetched one after
