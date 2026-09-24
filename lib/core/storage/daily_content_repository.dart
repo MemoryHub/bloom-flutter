@@ -343,7 +343,12 @@ class DailyContentRepository {
     // downloaded and drawn — that wait is why it appeared "after a long time".
     // Published here, any rebuild (including the 30s slot watch) picks it up while
     // the pictures are still downloading.
-    await _publishNextSlotEarly(dir, plan, DateTime.now().millisecondsSinceEpoch);
+    await _publishNextSlotEarly(
+      dir,
+      plan,
+      DateTime.now().millisecondsSinceEpoch,
+      settings.intervalMinutes,
+    );
     debugPrint(
       '[BloomSync] carousel plan=${plan.planId} items=${plan.items.length} '
       'current=${plan.currentItemId} after=${cursor > 0 ? cursor : 'none'} '
@@ -1243,11 +1248,21 @@ class DailyContentRepository {
     Directory dir,
     CarouselPlanEnvelope plan,
     int nowMillis,
+    int intervalMinutes,
   ) async {
     try {
+      // **Only a value that can really be the *next* slot.** A batch fetched near
+      // the end of the window can carry items far in the future (tomorrow's first
+      // ones included), and writing the earliest of those named a time hours away:
+      // measured on iOS at 21:36 the line read "22:30" instead of "21:45". The next
+      // slot is never more than one interval away, so anything further out is left
+      // alone and the authoritative value from the finished sync stands.
+      final horizon = nowMillis +
+          Duration(minutes: intervalMinutes > 0 ? intervalMinutes + 1 : 16)
+              .inMilliseconds;
       final upcoming = plan.items
           .map((item) => item.displayAt.toLocal().millisecondsSinceEpoch)
-          .where((at) => at > nowMillis)
+          .where((at) => at > nowMillis && at <= horizon)
           .toList()
         ..sort();
       if (upcoming.isEmpty) return;
