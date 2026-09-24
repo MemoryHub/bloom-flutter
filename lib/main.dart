@@ -164,9 +164,18 @@ class _BloomHomePageState extends State<BloomHomePage>
   /// page within half a minute of its slot.
   void _startSlotWatch() {
     _slotWatch?.cancel();
-    _slotWatch = Timer.periodic(const Duration(seconds: 30), (_) {
+    _slotWatch = Timer.periodic(const Duration(seconds: 30), (_) async {
       if (!mounted || _loading || !_widgetEnabled) return;
-      _load(showSpinner: false);
+      // **Only the fallback it was always described as.** The one-shot timer
+      // above wakes exactly at `next_slot_at_ms`; polling on top of it made the
+      // app re-sync every 30 seconds for as long as the page was on screen, and
+      // every pass fetched the next page — which the bounded pool then trimmed,
+      // while the trimming deleted the very files the pool still pointed at.
+      // Poll only when there is no usable stamp (missing, or already past).
+      final at = await DailyContentRepository(api: _api).nextSlotAtMillis();
+      if (at != null && at > DateTime.now().millisecondsSinceEpoch - 5000) return;
+      if (!mounted || _loading) return;
+      await _load(showSpinner: false);
     });
     _armNextSlotWake();
   }

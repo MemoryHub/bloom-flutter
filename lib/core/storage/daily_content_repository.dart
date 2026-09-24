@@ -71,7 +71,7 @@ class DailyContentRepository {
       final temp = File('${output.path}.tmp');
       await temp.writeAsBytes(rendered, flush: true);
       await temp.rename(output.path);
-      await _pruneVersionedImages(dir, family, keeping: output.path);
+      await _pruneVersionedImages(dir, family, keeping: {output.path});
     }
     await metadataFile.writeAsString(
       jsonEncode({
@@ -143,7 +143,7 @@ class DailyContentRepository {
       final temp = File('${output.path}.tmp');
       await temp.writeAsBytes(rendered, flush: true);
       await temp.rename(output.path);
-      await _pruneVersionedImages(dir, family, keeping: output.path);
+      await _pruneVersionedImages(dir, family, keeping: {output.path});
     }
     await metadataFile.writeAsString(
       jsonEncode({
@@ -666,6 +666,23 @@ class DailyContentRepository {
       );
 
       if (publishCurrent) {
+        // **Materialise the app's own copy too.** `original.photo` is what the
+        // photo page falls back to when the native state is stale or its file is
+        // gone, and only the in-batch publish below used to write it. With the
+        // cursor in use the fetched page starts *after* the current, so
+        // `batchCurrent` is normally null and that copy was never refreshed — the
+        // page sat on the first photo of the day. Same bytes: a copy, not a
+        // re-render.
+        final originalPath = publishEntry?['originalPhotoPath'] as String?;
+        if (originalPath != null && await File(originalPath).exists()) {
+          final target = File('${dir.path}/original.photo');
+          final temp = File('${target.path}.tmp');
+          await temp.writeAsBytes(
+            await File(originalPath).readAsBytes(),
+            flush: true,
+          );
+          await temp.rename(target.path);
+        }
         final portraitPath = publishEntry?['portraitPath'] as String?;
         if (portraitPath != null && await File(portraitPath).exists()) {
           await WidgetBridge().update(
@@ -729,14 +746,22 @@ class DailyContentRepository {
       entries: scheduled,
     );
     debugPrint('[BloomSync] scheduled ${scheduled.length} slots ok');
+    // **Prune by reference, not by age.** Everything the pool or the item on
+    // screen still points at has to survive: deleting one makes the next slot
+    // unresolvable, and the app then silently keeps showing the previous photo.
+    final referencedImages = <String>{
+      for (final family in _families)
+        _versionedImage(dir, family, currentItemId).path,
+      for (final entry in scheduled)
+        for (final family in _families) entry['${family}Path'] as String? ?? '',
+    }..removeWhere((path) => path.isEmpty);
+    final referencedOriginals = <String>{
+      for (final entry in scheduled) entry['originalPhotoPath'] as String? ?? '',
+    }..removeWhere((path) => path.isEmpty);
     for (final family in _families) {
-      await _pruneVersionedImages(
-        dir,
-        family,
-        keeping: _versionedImage(dir, family, currentItemId).path,
-      );
+      await _pruneVersionedImages(dir, family, keeping: referencedImages);
     }
-    await _pruneCarouselOriginals(dir);
+    await _pruneCarouselOriginals(dir, keeping: referencedOriginals);
     // ---- everything below is reported *after* the alarm chain was re-armed ----
     if (scheduled.isEmpty) {
       // A whole page that failed to prepare and no pool to fall back on: fail so
@@ -1005,7 +1030,20 @@ class DailyContentRepository {
     }
   }
 
-  Future<void> _pruneCarouselOriginals(Directory dir) async {
+  /// Deletes carousel originals that nothing points at any more.
+  ///
+  /// **`keeping` is not an optimisation, it is the bug fix.** This used to keep
+  /// the eight most recently *written* files and delete the rest, and the pool
+  /// fetch-then-trim cycle keeps writing files the pool then drops — so the
+  /// newest eight were exactly the ones nobody needed, and the file for the slot
+  /// that was about to come due got deleted. Measured on the device: at 08:30 the
+  /// server said `current=3271`, the pool held 3271, and the resolved current was
+  /// still 3270 because `carousel-original-3271.photo` had been pruned — the app
+  /// sat on the 08:15 photo. Nothing referenced is deleted now.
+  Future<void> _pruneCarouselOriginals(
+    Directory dir, {
+    required Set<String> keeping,
+  }) async {
     final files = <File>[];
     await for (final entity in dir.list()) {
       if (entity is File &&
@@ -1017,7 +1055,13 @@ class DailyContentRepository {
     files.sort(
       (a, b) => b.statSync().modified.compareTo(a.statSync().modified),
     );
-    for (final file in files.skip(8)) {
+    var spares = 0;
+    for (final file in files) {
+      if (keeping.contains(file.path)) continue;
+      if (spares < 8) {
+        spares++;
+        continue;
+      }
       try {
         await file.delete();
       } catch (_) {}
@@ -1027,7 +1071,7 @@ class DailyContentRepository {
   Future<void> _pruneVersionedImages(
     Directory dir,
     String family, {
-    required String keeping,
+    required Set<String> keeping,
   }) async {
     final candidates = <File>[];
     await for (final entity in dir.list()) {
@@ -1040,10 +1084,16 @@ class DailyContentRepository {
     candidates.sort(
       (a, b) => b.statSync().modified.compareTo(a.statSync().modified),
     );
-    // Keep the current item plus a complete four-item prefetched timeline and
-    // a few fallbacks. Android can then switch locally without waking Flutter.
-    for (final file in candidates.skip(8)) {
-      if (file.path == keeping) continue;
+    // Keep every referenced item plus a few unreferenced fallbacks. Android can
+    // then switch locally without waking Flutter — and, unlike the old
+    // newest-eight rule, it can still switch to the slot that is due *next*.
+    var spares = 0;
+    for (final file in candidates) {
+      if (keeping.contains(file.path)) continue;
+      if (spares < 8) {
+        spares++;
+        continue;
+      }
       try {
         await file.delete();
       } catch (_) {}

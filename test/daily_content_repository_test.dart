@@ -469,6 +469,62 @@ void main() {
     expect(scheduledIds(scheduledCalls.length - 1), isEmpty);
   });
 
+  test('剪枝按引用保留：池子里还没到点的那张图不能被新渲染的文件挤掉', () async {
+    final base = DateTime.now().subtract(const Duration(minutes: 1));
+    final api = apiReturning([
+      planWith(
+        planId: 990,
+        currentItemId: 401,
+        ids: [401, 402, 403, 404],
+        first: base,
+      ),
+    ]);
+    await DailyContentRepository(api: api).syncCarousel(credentials, settings);
+
+    final pool =
+        jsonDecode(await File('${cacheDir.path}/carousel-pool.json').readAsString())
+            as Map<String, dynamic>;
+    final referenced = [
+      for (final entry in (pool['entries'] as List).cast<Map<String, dynamic>>())
+        entry['originalPhotoPath'] as String,
+    ];
+    expect(referenced, hasLength(4));
+    for (final path in referenced) {
+      expect(await File(path).exists(), isTrue);
+    }
+
+    // The fetch-then-trim cycle keeps writing files the pool then drops, and they
+    // are the newest on disk. Under the old "keep the eight newest" rule those
+    // evicted the files the pool still pointed at.
+    final now = DateTime.now();
+    for (var i = 0; i < 12; i++) {
+      final original = File('${cacheDir.path}/carousel-original-9$i.photo');
+      await original.writeAsBytes(pngBytes);
+      await original.setLastModified(now.add(Duration(minutes: 1 + i)));
+      final png = File('${cacheDir.path}/mobile-local-portrait-9$i.png');
+      await png.writeAsBytes(pngBytes);
+      await png.setLastModified(now.add(Duration(minutes: 1 + i)));
+    }
+
+    final api2 = apiReturning([
+      planWith(
+        planId: 990,
+        currentItemId: 401,
+        ids: [405, 406, 407, 408],
+        first: base.add(const Duration(hours: 1)),
+      ),
+    ]);
+    await DailyContentRepository(api: api2).syncCarousel(credentials, settings);
+
+    for (final path in referenced) {
+      expect(
+        await File(path).exists(),
+        isTrue,
+        reason: '按引用保留：$path 仍被池子引用，任何一次剪枝都不能删它',
+      );
+    }
+  });
+
   test('池子上限：连续补货不无限增长，被裁掉的一页不被游标跳过', () async {
     final base = DateTime.now().subtract(const Duration(minutes: 1));
     final pages = <List<int>>[
