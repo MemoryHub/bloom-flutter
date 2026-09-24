@@ -1366,6 +1366,31 @@ class DailyContentRepository {
   }
 
 
+  /// Prints whatever the iOS widget extension recorded about its last timeline
+  /// builds and then clears the file, so it cannot grow without bound.
+  ///
+  /// The extension cannot be observed from the build machine, which is why every
+  /// earlier explanation of "iOS repeats a photo" was a guess; this brings its own
+  /// account of the decision into a stream the host app already writes to (visible in
+  /// Console.app for the phone). No-op on Android, where the file never exists.
+  Future<void> drainWidgetTimelineLog() async {
+    try {
+      final dir = await _dir();
+      final file = File('${dir.path}/widget-timeline.log');
+      if (!await file.exists()) return;
+      final text = await file.readAsString();
+      if (text.trim().isEmpty) return;
+      for (final line in const LineSplitter().convert(text)) {
+        if (line.trim().isNotEmpty) {
+          debugPrint('[BloomWidget] $line');
+        }
+      }
+      await file.writeAsString('');
+    } catch (error) {
+      debugPrint('[BloomWidget] timeline log unavailable: $error');
+    }
+  }
+
   /// **What the native layer currently shows.**
   ///
   /// The widget is the single authority: it advances on its own at slot boundaries

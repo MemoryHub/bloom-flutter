@@ -154,6 +154,7 @@ class _BloomHomePageState extends State<BloomHomePage>
     // it every 20 s while the page is alive removes the gap by construction.
     _followNative = Timer.periodic(const Duration(seconds: 20), (_) async {
       if (!mounted || _loading) return;
+      await DailyContentRepository(api: _api).drainWidgetTimelineLog();
       final native = await DailyContentRepository(api: _api).nativeContent();
       if (!mounted || native == null) return;
       if (native.recommendationId == _content?.recommendationId) return;
