@@ -118,6 +118,7 @@ class _BloomHomePageState extends State<BloomHomePage>
   Timer? _slotWatch;
   /// Fires exactly when the next slot begins.
   Timer? _slotWake;
+  Timer? _followNative;
   DeviceCredentials? _credentials;
   PairingInfo? _pairing;
   CachedWidgetImage? _portrait;
@@ -147,6 +148,17 @@ class _BloomHomePageState extends State<BloomHomePage>
   @override
   void initState() {
     super.initState();
+    // **Follow the widget continuously.** The app read the native current item only
+    // while it ran a sync, so between syncs the widget could advance while the card
+    // stayed behind — the "widget and app show different photos" symptom. Re-reading
+    // it every 20 s while the page is alive removes the gap by construction.
+    _followNative = Timer.periodic(const Duration(seconds: 20), (_) async {
+      if (!mounted || _loading) return;
+      final native = await DailyContentRepository(api: _api).nativeContent();
+      if (!mounted || native == null) return;
+      if (native.recommendationId == _content?.recommendationId) return;
+      setState(() => _content = native);
+    });
     WidgetsBinding.instance.addObserver(this);
     _load();
     _startSlotWatch();
@@ -206,6 +218,7 @@ class _BloomHomePageState extends State<BloomHomePage>
 
   @override
   void dispose() {
+    _followNative?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _slotWake?.cancel();
     _slotWatch?.cancel();

@@ -1366,6 +1366,24 @@ class DailyContentRepository {
   }
 
 
+  /// **What the native layer currently shows.**
+  ///
+  /// The widget is the single authority: it advances on its own at slot boundaries
+  /// even while Flutter is asleep. The app used to consult it only while running a
+  /// sync, so between two syncs the widget could move ahead and the card stayed on
+  /// the previous photo (measured on iOS: two different photos on one phone). Read
+  /// this periodically and the two cannot disagree.
+  Future<DailyContent?> nativeContent() async {
+    try {
+      final state = await WidgetBridge().readCurrentState();
+      if (state == null || state.recommendationId <= 0) return null;
+      return _nativeManifest(state);
+    } catch (error) {
+      debugPrint('[BloomSync] native current unavailable: $error');
+      return null;
+    }
+  }
+
   Future<int?> nextSlotAtMillis() async {
     try {
       final dir = await _dir();
