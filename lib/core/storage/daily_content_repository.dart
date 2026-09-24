@@ -353,9 +353,16 @@ class DailyContentRepository {
     // plus one interval. No reliance on the download loop, on the pool, or on any
     // "future entry" being prepared.
     final nowForLabel = DateTime.now().millisecondsSinceEpoch;
+    // **Only a slot one interval away can be the next one.** A page fetched with the
+    // paging cursor carries later items, so "the earliest future item in the page"
+    // named 01:15 when the next slot was 00:30 (measured). Anything further out is
+    // discarded rather than written: a stale-but-correct value beats a wrong one.
+    final step = Duration(
+      minutes: settings.intervalMinutes > 0 ? settings.intervalMinutes : 15,
+    );
     final futureFromPlan = plan.items
         .map((item) => item.displayAt.toLocal().millisecondsSinceEpoch)
-        .where((at) => at > nowForLabel)
+        .where((at) => at > nowForLabel && at <= nowForLabel + step.inMilliseconds)
         .toList()
       ..sort();
     var labelMillis = futureFromPlan.isEmpty ? null : futureFromPlan.first;
@@ -372,8 +379,10 @@ class DailyContentRepository {
                 .fold<int?>(null, (best, at) => best == null || at > best ? at : best)
           : anchorFromPage.last;
       if (anchor != null) {
-        final step = Duration(minutes: settings.intervalMinutes > 0 ? settings.intervalMinutes : 15);
-        labelMillis = anchor + step.inMilliseconds;
+        final candidate = anchor + step.inMilliseconds;
+        if (candidate <= nowForLabel + step.inMilliseconds) {
+          labelMillis = candidate;
+        }
       }
     }
     if (labelMillis != null) {
