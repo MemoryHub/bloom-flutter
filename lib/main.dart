@@ -123,6 +123,7 @@ class _BloomHomePageState extends State<BloomHomePage>
   CachedWidgetImage? _portrait;
   DailyContent? _content;
   String? _originalPhotoPath;
+  int? _nextSlotAt;
   String? _date;
   String? _message;
 
@@ -275,6 +276,7 @@ class _BloomHomePageState extends State<BloomHomePage>
       CachedWidgetImage? portrait;
       DailyContent? content;
       String? originalPhotoPath;
+      int? nextSlotAt;
       String? date;
       String? message;
       WidgetCurrentState? nativeState;
@@ -448,8 +450,23 @@ class _BloomHomePageState extends State<BloomHomePage>
             portrait = await repository.cached('portrait');
           }
           // Keep the native item selected above when it is newer than the
-          // Flutter cache. Otherwise use the normal repository paths.
-          originalPhotoPath ??= await repository.originalPhotoPath();
+          // Flutter cache. Otherwise use the item's own immutable path — never
+          // the one mutable `original.photo`, whose bytes the next background
+          // sync overwrites in place (that is what made the photo change while
+          // the caption stayed behind).
+          originalPhotoPath ??=
+              await repository.photoPathFor(content?.recommendationId) ??
+              await repository.originalPhotoPath();
+          // Read the slot stamp the same sync just wrote, so the label under the
+          // card always belongs to the plan that is on screen.
+          nextSlotAt = await repository.nextSlotAtMillis();
+          debugPrint(
+            '[BloomUI] show id=${content?.recommendationId} '
+            'photo=${originalPhotoPath ?? 'none'} '
+            'caption=${(content?.captionZh ?? '').trim()} '
+            'next=${nextSlotAt ?? 'none'} '
+            'source=${nativeStateApplied ? 'native' : 'cache'}',
+          );
           final square =
               nativeStateApplied && nativeState?.squarePath != null
                   ? CachedWidgetImage(
@@ -510,6 +527,7 @@ class _BloomHomePageState extends State<BloomHomePage>
         _portrait = portrait ?? _portrait;
         _content = content ?? _content;
         _originalPhotoPath = originalPhotoPath ?? _originalPhotoPath;
+        _nextSlotAt = nextSlotAt ?? _nextSlotAt;
         _date = date ?? _date;
         _message = message;
         _displaySettings = displaySettings;
@@ -689,7 +707,9 @@ class _BloomHomePageState extends State<BloomHomePage>
       final portrait = await repository.cached('portrait');
       final square = await repository.cached('square');
       final largeSquare = await repository.cached('largeSquare');
-      final originalPhotoPath = await repository.originalPhotoPath();
+      final originalPhotoPath =
+          await repository.photoPathFor(content.recommendationId) ??
+          await repository.originalPhotoPath();
       await _evictOriginalPhoto(originalPhotoPath);
       await _evictPreviewImages([portrait, square, largeSquare]);
       if (portrait != null) {
@@ -809,6 +829,7 @@ class _BloomHomePageState extends State<BloomHomePage>
     message: _message,
     settings: _displaySettings,
     devices: _devices,
+    nextSlotAt: _nextSlotAt,
     widgetEnabled: _widgetEnabled,
     onWidgetEnabledChanged: (enabled) => setState(() => _widgetEnabled = enabled),
     selectedDeviceId: _photoDevice?.deviceId,

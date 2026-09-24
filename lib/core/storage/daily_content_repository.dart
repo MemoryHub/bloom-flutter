@@ -132,6 +132,14 @@ class DailyContentRepository {
       await temp.rename(photoFile.path);
     }
     if (!await photoFile.exists()) throw StateError('轮播原图下载失败');
+    // Version the original too, so the manual "next" item gets an immutable path
+    // of its own (see `photoPathFor`) instead of being reachable only through the
+    // mutable `original.photo`.
+    try {
+      await photoFile.copy(
+        '${dir.path}/carousel-original-${envelope.item.itemId}.photo',
+      );
+    } catch (_) {}
     final photoBytes = await photoFile.readAsBytes();
     for (final family in ['portrait', 'square', 'largeSquare']) {
       final output = _versionedImage(dir, family, manifest.recommendationId);
@@ -861,6 +869,31 @@ class DailyContentRepository {
   Future<String?> originalPhotoPath() async {
     final file = File('${(await _dir()).path}/original.photo');
     return await file.exists() ? file.path : null;
+  }
+
+  /// The photo that belongs to [itemId] — an **immutable** path per item.
+  ///
+  /// The page used to display `${dir}/original.photo`, a single mutable file that
+  /// every sync rewrites in place. A background sync (widget recovery, the
+  /// package-replaced job) could swap its bytes while the page still held the
+  /// previous item's captions, so the photo changed and the caption did not — and
+  /// a decode that raced the rewrite showed the letter fallback for a while.
+  /// Deriving the path from the same id the caption comes from makes the card one
+  /// unit again: it cannot show item A's picture next to item B's words.
+  Future<String?> photoPathFor(int? itemId) async {
+    if (itemId == null || itemId < 1) return null;
+    final dir = await _dir();
+    final versioned = File('${dir.path}/carousel-original-$itemId.photo');
+    if (await versioned.exists()) return versioned.path;
+    // The mutable file is only trustworthy while the mirror next to it still
+    // names the same item.
+    if ((await cachedContent())?.recommendationId == itemId) {
+      final mutable = File('${dir.path}/original.photo');
+      if (await mutable.exists()) return mutable.path;
+    }
+    final portrait = _versionedImage(dir, 'portrait', itemId);
+    if (await portrait.exists()) return portrait.path;
+    return null;
   }
 
   Future<DailyContent?> cachedContent() async {

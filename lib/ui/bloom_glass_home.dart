@@ -233,6 +233,7 @@ class BloomGlassHome extends StatelessWidget {
     this.date,
     this.message,
     this.selectedDeviceId,
+    this.nextSlotAt,
   });
 
   final bool loading;
@@ -247,6 +248,12 @@ class BloomGlassHome extends StatelessWidget {
   final DailyContent? content;
   final String? date;
   final String? message;
+
+  /// When the next carousel slot is due, as epoch milliseconds
+  /// (`next_slot_at_ms` in the daily mirror). `null` outside carousel mode or
+  /// before the first sync.
+  final int? nextSlotAt;
+
   final BloomDisplaySettings settings;
 
   /// Devices the switcher and the "设备" tab list. Hardcoded for now (F3):
@@ -542,6 +549,7 @@ class BloomGlassHome extends StatelessWidget {
     // 照片 (the future photo library, an empty placeholder today) → 设备.
     final pages = [
       _PhotoPage(
+        nextSlotAt: nextSlotAt,
         originalPhotoPath: originalPhotoPath,
         content: content,
         date: date,
@@ -1055,6 +1063,7 @@ class _PaperGrainPainter extends CustomPainter {
 
 class _PhotoPage extends StatelessWidget {
   const _PhotoPage({
+    required this.nextSlotAt,
     required this.originalPhotoPath,
     required this.content,
     required this.date,
@@ -1064,6 +1073,7 @@ class _PhotoPage extends StatelessWidget {
     required this.onDeviceChanged,
   });
 
+  final int? nextSlotAt;
   final String? originalPhotoPath;
   final DailyContent? content;
   final String? date;
@@ -1071,6 +1081,25 @@ class _PhotoPage extends StatelessWidget {
   final List<BloomDevice> devices;
   final String? selectedDeviceId;
   final ValueChanged<String> onDeviceChanged;
+
+  /// "下次更新 今天 10:15" — the phone's own next carousel slot, in the reader's
+  /// own words rather than as a timestamp. `null` renders nothing.
+  static String? nextSlotLabel(int? millis) {
+    if (millis == null || millis < 1) return null;
+    final at = DateTime.fromMillisecondsSinceEpoch(millis);
+    final now = DateTime.now();
+    final days = DateTime(at.year, at.month, at.day)
+        .difference(DateTime(now.year, now.month, now.day))
+        .inDays;
+    final day = switch (days) {
+      0 => '今天',
+      1 => '明天',
+      _ => '${at.month}月${at.day}日',
+    };
+    final hh = at.hour.toString().padLeft(2, '0');
+    final mm = at.minute.toString().padLeft(2, '0');
+    return '下次更新 $day $hh:$mm';
+  }
 
   /// The device whose photos this page shows. Falls back to this phone when
   /// nothing (or something unknown) is selected.
@@ -1202,9 +1231,18 @@ class _PhotoPage extends StatelessWidget {
               child: LayoutBuilder(
                 builder: (context, constraints) {
                   const rowHeight = BloomInk.controlSize;
+                  // The "next update" line sits under the card, inside the same
+                  // width, so its height comes out of the card's budget — reserve
+                  // it here or the column overflows on a short screen.
+                  final nextSlot = nextSlotLabel(nextSlotAt);
+                  const nextSlotGap = 8.0;
+                  const nextSlotHeight = 15.0;
                   final cardBox = math.max(
                     0.0,
-                    constraints.maxHeight - rowHeight - BloomGlassHome.cardGap,
+                    constraints.maxHeight -
+                        rowHeight -
+                        BloomGlassHome.cardGap -
+                        (nextSlot == null ? 0.0 : nextSlotGap + nextSlotHeight),
                   );
                   // Same formula as `AspectRatio` itself: fill the width unless
                   // the height says otherwise (the card is portrait, 720x1200).
@@ -1219,6 +1257,18 @@ class _PhotoPage extends StatelessWidget {
                     0.0,
                     (constraints.maxWidth - cardWidth) / 2,
                   );
+                  // The card is `AspectRatio`-locked, so on a screen where the
+                  // width runs out first it is *shorter* than the box it is
+                  // handed. Hanging the label off that box would then leave a
+                  // stray gap; measure the card itself so the label sits exactly
+                  // [nextSlotGap] under its bottom edge on every screen.
+                  final cardHeight =
+                      hasPhoto
+                          ? math.min(
+                            cardBox,
+                            cardWidth / _LetterPhotoCard.aspectRatio,
+                          )
+                          : cardBox;
                   return Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
@@ -1262,7 +1312,7 @@ class _PhotoPage extends StatelessWidget {
                       // Half of [headerGap]: see [cardGap].
                       const SizedBox(height: BloomGlassHome.cardGap),
                       SizedBox(
-                        height: cardBox,
+                        height: cardHeight,
                         // **Top, not centre.** The card's height comes from
                         // whichever of width/height runs out first; when the
                         // width does, the leftover height used to be split
@@ -1305,6 +1355,28 @@ class _PhotoPage extends StatelessWidget {
                           ),
                         ),
                       ),
+                      if (nextSlot != null) ...[
+                        const SizedBox(height: nextSlotGap),
+                        SizedBox(
+                          height: nextSlotHeight,
+                          // Right-aligned to the **card**, not to the page: the
+                          // card is centred with `side` px of slack on each edge,
+                          // so the label carries the same inset.
+                          child: Padding(
+                            padding: EdgeInsets.only(right: side),
+                            child: Align(
+                              alignment: Alignment.centerRight,
+                              child: Text(
+                                nextSlot,
+                                key: const ValueKey('bloom-next-slot'),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: BloomType.meta,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                     ],
                   );
                 },
