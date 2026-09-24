@@ -379,11 +379,25 @@ class DailyContentRepository {
     // A request without a cursor returns the page that *starts* at the current
     // slot, so one extra call repairs exactly that, and the slot is re-rendered
     // and published in this same pass instead of at the next one.
-    final poolHasDue = pool.any((entry) => _poolAt(entry) <= nowMillis);
+    // **The pool must not merely hold *a* due entry; it must hold the one due
+    // now.** With a cursor the page starts *after* the pool, so when a slot's
+    // photo timed out and its entry was dropped, the pool's newest due entry
+    // stayed on the previous slot and the page never even mentioned the current
+    // one — measured at 15:00: page [3305…], newest due 14:45, and opening the app
+    // still showed 14:45. Item ids ascend with time within a plan, so comparing
+    // against the server's own `current_item_id` is the sharp test; the cursorless
+    // page it triggers starts exactly at the current slot.
+    final newestPoolDue = pool
+        .where((entry) => _poolAt(entry) <= nowMillis)
+        .map(_poolItemId)
+        .fold<int>(0, (a, b) => a > b ? a : b);
     final pageHasDue = plan.items.any(
       (item) => !item.displayAt.toLocal().isAfter(now.add(const Duration(seconds: 60))),
     );
-    if (cursor > 0 && !poolHasDue && !pageHasDue && plan.currentItemId > 0) {
+    if (cursor > 0 &&
+        !pageHasDue &&
+        plan.currentItemId > 0 &&
+        newestPoolDue < plan.currentItemId) {
       debugPrint(
         '[BloomSync] nothing due in the pool or the page (plan=${plan.planId}, '
         'current=${plan.currentItemId}); re-reading from the current slot',
@@ -484,11 +498,15 @@ class DailyContentRepository {
         );
       }
     }
-    for (final item in plan.items) {
-      if (batchCurrent != null && item.itemId == batchCurrent.itemId) continue;
-      // Deliberately not awaited: they download while the loop renders.
-      unawaited(fetchPhoto(item.itemId).catchError((Object _) {}));
-    }
+    // **Sequential, not four-at-once.** These are large photos and the phone has
+    // one connection: kicking all four off together is what blew the 25s leash
+    // (`skipping future photo ... TimeoutException after 0:00:25`) and, through
+    // the old "drop the slot" path, made a 15-minute cadence look like 30 or 45.
+    // The current slot is fetched above and keeps its own generous leash; the rest
+    // are fetched by the render loop one at a time, each with the whole link.
+    //
+    // (Nothing to pre-start here: the loop below awaits each item in order, so the
+    // downloads happen in the same order — just without competing for bandwidth.)
     final incoming = <Map<String, Object?>>[];
     DailyContent? currentManifest;
 
@@ -714,10 +732,18 @@ class DailyContentRepository {
     // `next_slot_at_ms` is the union's earliest future slot — the same number the
     // native alarm chain arms itself with, so an open page turns with the widget
     // instead of polling for it.
-    final upcoming = scheduled
-        .map(_poolAt)
-        .where((at) => at > nowMillis)
-        .toList()
+    // **`next_slot_at_ms` is the plan's next slot, not the next *prepared* one.**
+    // When a future photo times out — the server can take longer than the 25s
+    // leash — that slot used to vanish from the union, and with it its alarm and
+    // the page's own wake-up. Measured on device: 15:00 and 15:15 disappeared and
+    // the next update was announced as 15:30, so both were skipped. The batch
+    // knows those times whether or not the photo arrived, so it is asked too; a
+    // slot whose photo is still missing is simply retried when its turn comes.
+    final upcoming = <int>{
+      ...scheduled.map(_poolAt),
+      for (final item in plan.items)
+        item.displayAt.toLocal().millisecondsSinceEpoch,
+    }.where((at) => at > nowMillis).toList()
       ..sort();
     final nextSlotMillis = upcoming.isEmpty ? null : upcoming.first;
     final nextSlotLabel = nextSlotMillis == null

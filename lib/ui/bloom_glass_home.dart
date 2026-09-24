@@ -276,6 +276,10 @@ class BloomGlassHome extends StatelessWidget {
         (stamp != null && stamp.isAfter(now))
             ? stamp
             : _gridNextSlot(settings, now);
+    // **A window that cannot hold a slot is a settings state, not a schedule.**
+    // start == end (or a zero interval) made the grid answer "明天 06:00" on the
+    // device at 14:47. Saying nothing is honest; naming a time is not.
+    if (at == null) return null;
     final days =
         DateTime(
           at.year,
@@ -292,12 +296,11 @@ class BloomGlassHome extends StatelessWidget {
     return '下次更新 $day $hh:$mm';
   }
 
-  static DateTime _gridNextSlot(BloomDisplaySettings settings, DateTime now) {
+  static DateTime? _gridNextSlot(BloomDisplaySettings settings, DateTime now) {
     final start = _clockOffset(settings.activeStart);
     final end = _clockOffset(settings.activeEnd);
-    final step = Duration(
-      minutes: settings.intervalMinutes > 0 ? settings.intervalMinutes : 15,
-    );
+    if (end <= start || settings.intervalMinutes < 1) return null;
+    final step = Duration(minutes: settings.intervalMinutes);
     final midnight = DateTime(now.year, now.month, now.day);
     final first = midnight.add(start);
     if (now.isBefore(first)) return first;
