@@ -143,9 +143,20 @@ private enum BloomWidgetRemoteLoader {
         if let local = localCarouselTimeline(family: family, defaults: defaults) {
           logTimelineChoice(
             "family=\(family) source=local entries=\(local.0.count) "
-              + "first=\(Int(local.0.first?.date.timeIntervalSince1970 ?? 0))"
+              + "first=\(Int(local.0.first?.date.timeIntervalSince1970 ?? 0)) "
+              + "last=\(Int(local.0.last?.date.timeIntervalSince1970 ?? 0))"
           )
-          return local
+          // **Never serve a timeline that can only repeat.** The local plan is
+          // preferred because it needs no network, but when every entry it holds is
+          // already in the past the wall simply shows the last one again at the next
+          // boundary — the "iOS repeats a photo" symptom. That happens whenever the
+          // photos for the coming slots were never downloaded on this device, and the
+          // local path never downloads them. Falling through to the fetch path is what
+          // breaks the loop: it pulls the next page *and* its pictures.
+          if let last = local.0.last, last.date > Date() {
+            return local
+          }
+          logTimelineChoice("local timeline has no future entry: fetching instead")
         }
         logTimelineChoice("family=\(family) source=online (no usable local plan)")
         return try await carouselTimeline(
