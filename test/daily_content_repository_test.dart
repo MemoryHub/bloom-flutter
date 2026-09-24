@@ -411,12 +411,10 @@ void main() {
       },
     ]);
 
-    // **前移**：当前槽位（201）的照片没准备好，就把下一张已经在本地的照片
-    // （202）提到这一格顶上 —— 时间格不动，照片前移，既不跳过也不重复旧图。
-    final published = await DailyContentRepository(
-      api: api,
-    ).syncCarousel(credentials, settings);
-    expect(published.recommendationId, 202);
+    await expectLater(
+      DailyContentRepository(api: api).syncCarousel(credentials, settings),
+      throwsA(isA<StateError>()),
+    );
     expect(
       scheduledCalls,
       isNotEmpty,
@@ -437,10 +435,12 @@ void main() {
       ),
     ], failingPhotoIds: {201});
 
-    await expectLater(
-      DailyContentRepository(api: api).syncCarousel(credentials, settings),
-      throwsA(isA<StateError>()),
-    );
+    // **前移**：当前槽位（201）的照片没准备好，就把下一张已经在本地的照片
+    // （202）提到这一格顶上 —— 时间格不动，照片前移，既不跳过也不重复旧图。
+    final published = await DailyContentRepository(
+      api: api,
+    ).syncCarousel(credentials, settings);
+    expect(published.recommendationId, 202);
 
     expect(
       scheduledCalls,

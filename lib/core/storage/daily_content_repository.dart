@@ -643,6 +643,9 @@ class DailyContentRepository {
 
     var currentItemId = batchCurrent?.itemId ?? 0;
     Map<String, Object?>? publishEntry;
+    // Set when this slot's own photo was missing and the next ready photo was
+    // pulled into its place. That is a *handled* slot, not a failed one.
+    var pulledForward = false;
     var publishCurrent = false;
     if (currentManifest == null) {
       // **Step 5 — the current slot is not decided by the batch.**
@@ -683,6 +686,7 @@ class DailyContentRepository {
           final path = entry['originalPhotoPath'] as String?;
           if (path != null && await File(path).exists()) {
             dueEntry = entry;
+            pulledForward = true;
             debugPrint(
               '[BloomSync] this slot has no photo yet; pulling item=$id forward '
               '(already shown $shownId)',
@@ -910,9 +914,13 @@ class DailyContentRepository {
     if (currentReady == null || currentItemId < 1) {
       throw StateError('当前轮播照片既不在计划批次中，也没有可用的本地副本');
     }
-    if (batchCurrentFailed) {
+    if (batchCurrentFailed && !pulledForward) {
       // The schedule is already submitted, so the alarm chain survives this; the
       // failure only asks the caller to try again sooner than the next slot.
+      //
+      // Not thrown when a photo was pulled forward: the slot did get a fresh
+      // picture, which is the whole point of the shift, so there is nothing for
+      // the caller to retry.
       throw StateError('当前轮播照片未能准备，已保留原照片并重排闹钟');
     }
     return currentReady;
