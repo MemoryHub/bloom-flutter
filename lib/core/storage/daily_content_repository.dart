@@ -365,26 +365,13 @@ class DailyContentRepository {
         .where((at) => at > nowForLabel && at <= nowForLabel + step.inMilliseconds)
         .toList()
       ..sort();
-    var labelMillis = futureFromPlan.isEmpty ? null : futureFromPlan.first;
-    if (labelMillis == null) {
-      final anchorFromPage = plan.items
-          .map((item) => item.displayAt.toLocal().millisecondsSinceEpoch)
-          .where((at) => at <= nowForLabel)
-          .toList()
-        ..sort();
-      final anchor = anchorFromPage.isEmpty
-          ? pool
-                .map(_poolAt)
-                .where((at) => at <= nowForLabel)
-                .fold<int?>(null, (best, at) => best == null || at > best ? at : best)
-          : anchorFromPage.last;
-      if (anchor != null) {
-        final candidate = anchor + step.inMilliseconds;
-        if (candidate <= nowForLabel + step.inMilliseconds) {
-          labelMillis = candidate;
-        }
-      }
-    }
+    // **No guessing.** The bounded page lookup above is trustworthy; the
+    // "anchor slot + interval" fallback was not — measured on device it wrote a value
+    // 22.5 hours out (05:15 tomorrow when the next slot was 06:45). Per the rule we
+    // settled on — never show a wrong time, showing none is acceptable — the fallback
+    // is gone: if the page carries no slot within one interval, nothing is written
+    // here and the end-of-run union write supplies the value a moment later.
+    final labelMillis = futureFromPlan.isEmpty ? null : futureFromPlan.first;
     if (labelMillis != null) {
       await _publishNextSlotAt(dir, labelMillis);
     } else {
