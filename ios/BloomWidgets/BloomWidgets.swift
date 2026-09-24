@@ -315,8 +315,31 @@ private enum BloomWidgetRemoteLoader {
     }.sorted { $0.0 < $1.0 }
     guard !resolved.isEmpty else { return nil }
 
-    let current = resolved.last { $0.0 <= now }
-    let future = resolved.filter { $0.0 > now }
+    // **The slot that is due comes from the plan, not from the files.**
+    //
+    // `resolved` can only hold items whose image is really on disk. So when the
+    // slot that is due now has no image yet, `resolved.last { $0.0 <= now }` is an
+    // *older* entry — a photo the user has already seen, which is exactly the
+    // "it updated, but to a photo I have seen" bug. The grid does not move: the
+    // due time is read from the plan (files or no files), and the pictures shift
+    // forward to the next item that does have an image, never backwards.
+    let dueAt = plan.compactMap { item -> Date? in
+      guard let millis = (item["displayAtMillis"] as? NSNumber)?.doubleValue else {
+        return nil
+      }
+      let at = Date(timeIntervalSince1970: millis / 1000)
+      return at <= now ? at : nil
+    }.max()
+    let current =
+      resolved.first { entry in
+        guard let dueAt else { return false }
+        return abs(entry.0.timeIntervalSince(dueAt)) < 1
+      }
+      ?? resolved.first { $0.0 > now }
+      ?? resolved.last { $0.0 <= now }
+    let future = current.map { picked in
+      resolved.filter { $0.0 > picked.0 }
+    } ?? []
     // **No local floor on how many future entries there are.** Android builds
     // whatever union it has and lets the recovery alarm refill it, and the two
     // platforms have to behave identically: refusing to build a timeline because
