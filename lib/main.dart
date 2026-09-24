@@ -881,8 +881,12 @@ class _BloomHomePageState extends State<BloomHomePage>
   /// Re-reads the next-slot stamp while a sync is running, so "下次更新" can appear
   /// as soon as the plan is known rather than at the end of the batch.
   Future<void> _watchNextSlot(DailyContentRepository repository) async {
-    for (var i = 0; i < 15 && mounted; i++) {
-      await Future<void>.delayed(const Duration(milliseconds: 400));
+    // **Cover the whole sync, not six seconds of it.** The label is written ~200 ms
+    // after the plan response (measured), but a sync can run 13-50 s behind photo
+    // downloads; a 15x400 ms window expired long before the value landed, so the label
+    // only appeared when the whole load finished. Poll for the length of a slow run.
+    for (var i = 0; i < 100 && mounted; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 500));
       if (!mounted) return;
       final at = await repository.nextSlotAtMillis();
       if (!mounted || at == null || at == _nextSlotAt) continue;
