@@ -458,7 +458,7 @@ void main() {
     );
   });
 
-  test('整页都失败：仍提交（空）排程保住恢复闹钟，然后才上报失败', () async {
+  test('整页都失败：槽位照样提交（保住恢复闹钟与后续格子），然后才上报失败', () async {
     final base = DateTime.now().subtract(const Duration(minutes: 1));
     final api = apiReturning([
       planWith(
@@ -480,7 +480,11 @@ void main() {
       isNotEmpty,
       reason: '空排程也必须提交：原生层仍会据此排下恢复闹钟',
     );
-    expect(scheduledIds(scheduledCalls.length - 1), isEmpty);
+    // **A slot whose photo failed is still a slot.** Dropping it deletes that
+    // quarter hour from the timeline: the label's next time jumps over it (21:00
+    // vanished and 21:15 appeared instead) and the widget has nothing new to move
+    // to, so it repeats a photo that has already been seen.
+    expect(scheduledIds(scheduledCalls.length - 1), containsAll([301, 302, 303, 304]));
   });
 
   test('剪枝按引用保留：池子里还没到点的那张图不能被新渲染的文件挤掉', () async {

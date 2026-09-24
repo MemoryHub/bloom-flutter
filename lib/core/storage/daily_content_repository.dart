@@ -237,6 +237,17 @@ class DailyContentRepository {
           final cached = await cachedContent();
           if (cached != null) return cached;
         }
+        // **The open page never fails on the lock.** WorkManager has to fail so it
+        // retries, but the foreground only has to show what it has: throwing here is
+        // what produced the failure toast and left the card on the previous slot
+        // while the background was still downloading (measured on iOS: the widget
+        // advanced, the in-app card did not until the app was relaunched).
+        if (foreground) {
+          final cached = await cachedContent();
+          if (cached != null) return cached;
+          final native = await WidgetBridge().readCurrentState();
+          if (native != null) return _nativeManifest(native);
+        }
         throw StateError('轮播计划同步仍在进行，等待后台重试');
       }
       final cached = await cachedContent();
@@ -597,6 +608,24 @@ class DailyContentRepository {
           // would never grow past it; one skipped slot beats a stalled day, and
           // the caller's retry still re-requests it whenever it is the page head.
           batchCurrentFailed = true;
+          // **Keep its slot too.** This is the branch that swallowed the slot the
+          // label was about to name: at 20:45 the current slot (21:00) failed to
+          // prepare, its entry was dropped, and `next_slot` jumped straight to
+          // 21:15 — the quarter hour simply disappeared from the timeline, and the
+          // widget had no new photo to move to. The *cursor* still does not hold a
+          // place (a permanently broken asset must not stall the day), but the
+          // slot stays in the union with the paths it will have.
+          incoming.add(
+            _poolEntry(
+              item,
+              item.asDailyContent(),
+              {
+                for (final family in _families)
+                  family: _versionedImage(dir, family, item.itemId).path,
+              },
+              '${dir.path}/carousel-original-${item.itemId}.photo',
+            ),
+          );
           debugPrint(
             '[BloomSync] current photo item=${item.itemId} failed: $error',
           );
