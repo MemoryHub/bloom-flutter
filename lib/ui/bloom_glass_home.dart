@@ -272,14 +272,13 @@ class BloomGlassHome extends StatelessWidget {
         (stampMillis == null || stampMillis < 1)
             ? null
             : DateTime.fromMillisecondsSinceEpoch(stampMillis);
-    final at =
-        (stamp != null && stamp.isAfter(now))
-            ? stamp
-            : _gridNextSlot(settings, now);
-    // **A window that cannot hold a slot is a settings state, not a schedule.**
-    // start == end (or a zero interval) made the grid answer "明天 06:00" on the
-    // device at 14:47. Saying nothing is honest; naming a time is not.
-    if (at == null) return null;
+    // **Only the plan's own stamp — never a guess from the phone's settings.**
+    // The grid fallback that used to stand here read the *local* window, which on
+    // this phone did not match the plan the server is actually running, so at
+    // 15:00 it announced "明天 06:00"; a settings state is not a schedule. If the
+    // stamp is missing or already past, the honest answer is to say nothing.
+    if (stamp == null || !stamp.isAfter(now)) return null;
+    final at = stamp;
     final days =
         DateTime(
           at.year,
@@ -296,31 +295,7 @@ class BloomGlassHome extends StatelessWidget {
     return '下次更新 $day $hh:$mm';
   }
 
-  static DateTime? _gridNextSlot(BloomDisplaySettings settings, DateTime now) {
-    final start = _clockOffset(settings.activeStart);
-    final end = _clockOffset(settings.activeEnd);
-    if (end <= start || settings.intervalMinutes < 1) return null;
-    final step = Duration(minutes: settings.intervalMinutes);
-    final midnight = DateTime(now.year, now.month, now.day);
-    final first = midnight.add(start);
-    if (now.isBefore(first)) return first;
-    final passed = now.difference(first);
-    final next = first.add(
-      step * (passed.inMicroseconds ~/ step.inMicroseconds + 1),
-    );
-    // The end of the window is itself a slot when it lands on the grid.
-    if (!next.isAfter(midnight.add(end))) return next;
-    return midnight.add(const Duration(days: 1)).add(start);
-  }
 
-  static Duration _clockOffset(String text) {
-    final parts = text.split(':');
-    if (parts.length < 2) return Duration.zero;
-    return Duration(
-      hours: int.tryParse(parts[0].trim()) ?? 0,
-      minutes: int.tryParse(parts[1].trim()) ?? 0,
-    );
-  }
 
   /// Devices the switcher and the "设备" tab list. Hardcoded for now (F3):
   /// this phone plus the frame. See `bloom_device_pages.dart`.

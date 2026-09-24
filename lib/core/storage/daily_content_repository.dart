@@ -655,9 +655,41 @@ class DailyContentRepository {
       for (final entry in scheduled) {
         if (_poolAt(entry) <= nowMillis) dueEntry = entry;
       }
+      // A slot is due when its time has come — its photo being absent does not
+      // change that. Before the window's first slot (or after its last) nothing is
+      // due, and a future photo must not be pulled in early.
+      var slotIsDue = dueEntry != null;
+      final serverSaysDue = plan.items.any(
+        (item) =>
+            item.itemId == plan.currentItemId &&
+            !item.displayAt.toLocal().isAfter(now.add(const Duration(seconds: 60))),
+      );
       if (dueEntry != null) {
         final path = dueEntry['originalPhotoPath'] as String?;
         if (path == null || !await File(path).exists()) dueEntry = null;
+      }
+      // **If this slot's photo is not here yet, the next one takes its place.**
+      // The grid does not move — 15:00 stays 15:00 — so the only way to keep a
+      // *fresh* photo in every slot (not a skip, and not the previous slot's
+      // picture held over) is to shift the pictures forward: the entry that would
+      // have been shown next is pulled into this slot. `cachedContent()` is the id
+      // already on screen, so a pulled-forward entry is not shown a second time
+      // when its own slot comes around.
+      if (dueEntry == null && (slotIsDue || serverSaysDue)) {
+        final shownId = (await cachedContent())?.recommendationId ?? 0;
+        for (final entry in scheduled) {
+          final id = _poolItemId(entry);
+          if (id <= shownId) continue;
+          final path = entry['originalPhotoPath'] as String?;
+          if (path != null && await File(path).exists()) {
+            dueEntry = entry;
+            debugPrint(
+              '[BloomSync] this slot has no photo yet; pulling item=$id forward '
+              '(already shown $shownId)',
+            );
+            break;
+          }
+        }
       }
       final native = await WidgetBridge().readCurrentState();
       final nativeCarousel =
