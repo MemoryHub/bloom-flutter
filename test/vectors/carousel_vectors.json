@@ -1,0 +1,385 @@
+{
+  "version": 1,
+  "note": "Bloom 轮播算法共享测试向量。Dart 与 Swift 各自读取本文件并断言同一组期望输出。任何一侧不符合即为缺陷。所有时间为 UTC 纪元毫秒（此处用较小的示意值）。",
+  "groups": [
+    {
+      "rule": "next_slot_after_now",
+      "description": "「下次更新」= 栅格中严格晚于此刻的最小值；当天用尽则落明天第一格。",
+      "cases": [
+        {
+          "description": "栅格中间时刻，取下一格",
+          "input": { "grid_ms": [1000, 2000, 3000], "now_ms": 1500, "tomorrow_first_ms": 9000 },
+          "expected": { "next_slot_at_ms": 2000, "used_fallback": false }
+        },
+        {
+          "description": "now 恰好等于某格时间，该格不算未来格，取再下一格",
+          "input": { "grid_ms": [1000, 2000, 3000], "now_ms": 2000, "tomorrow_first_ms": 9000 },
+          "expected": { "next_slot_at_ms": 3000, "used_fallback": false }
+        },
+        {
+          "description": "栅格乱序，仍取最小值",
+          "input": { "grid_ms": [3000, 1000, 2000], "now_ms": 500, "tomorrow_first_ms": 9000 },
+          "expected": { "next_slot_at_ms": 1000, "used_fallback": false }
+        },
+        {
+          "description": "当天最后一格之后，落明天第一格",
+          "input": { "grid_ms": [1000, 2000], "now_ms": 2500, "tomorrow_first_ms": 9000 },
+          "expected": { "next_slot_at_ms": 9000, "used_fallback": true }
+        },
+        {
+          "description": "栅格为空，落明天第一格",
+          "input": { "grid_ms": [], "now_ms": 1000, "tomorrow_first_ms": 9000 },
+          "expected": { "next_slot_at_ms": 9000, "used_fallback": true }
+        },
+        {
+          "description": "回归：栅格用尽且无兜底，返回 null 而不是错误时间",
+          "input": { "grid_ms": [1000], "now_ms": 2000, "tomorrow_first_ms": null },
+          "expected": { "next_slot_at_ms": null, "used_fallback": false }
+        },
+        {
+          "description": "兜底值也在过去，视为不可用，返回 null",
+          "input": { "grid_ms": [1000], "now_ms": 2000, "tomorrow_first_ms": 1500 },
+          "expected": { "next_slot_at_ms": null, "used_fallback": false }
+        },
+        {
+          "description": "回归：默认设置（一天一格）当天格子已过，必须落明天第一格",
+          "input": { "grid_ms": [6000], "now_ms": 1132000, "tomorrow_first_ms": 86400000 },
+          "expected": { "next_slot_at_ms": 86400000, "used_fallback": true }
+        }
+      ]
+    },
+    {
+      "rule": "current_slot_from_grid",
+      "description": "此刻所在格子 = 栅格中不晚于此刻的最后一个。",
+      "cases": [
+        {
+          "description": "落在两格之间，取前一格",
+          "input": { "grid_ms": [1000, 2000, 3000], "now_ms": 2500 },
+          "expected": { "current_slot_at_ms": 2000 }
+        },
+        {
+          "description": "恰好等于某格",
+          "input": { "grid_ms": [1000, 2000], "now_ms": 2000 },
+          "expected": { "current_slot_at_ms": 2000 }
+        },
+        {
+          "description": "全部在未来，没有当前格",
+          "input": { "grid_ms": [1000, 2000], "now_ms": 500 },
+          "expected": { "current_slot_at_ms": null }
+        },
+        {
+          "description": "全部已过去，取最后一格",
+          "input": { "grid_ms": [1000, 2000], "now_ms": 5000 },
+          "expected": { "current_slot_at_ms": 2000 }
+        }
+      ]
+    },
+    {
+      "rule": "plan_generation",
+      "description": "计划身份任一组成变化即为换代。",
+      "cases": [
+        {
+          "description": "plan_id 变化",
+          "input": {
+            "current": { "plan_id": 151, "settings_hash": "abc", "day": "2026-09-28" },
+            "incoming": { "plan_id": 152, "settings_hash": "abc", "day": "2026-09-28" }
+          },
+          "expected": { "is_new_generation": true }
+        },
+        {
+          "description": "settings_hash 变化",
+          "input": {
+            "current": { "plan_id": 151, "settings_hash": "abc", "day": "2026-09-28" },
+            "incoming": { "plan_id": 151, "settings_hash": "def", "day": "2026-09-28" }
+          },
+          "expected": { "is_new_generation": true }
+        },
+        {
+          "description": "day 变化（跨天）",
+          "input": {
+            "current": { "plan_id": 151, "settings_hash": "abc", "day": "2026-09-28" },
+            "incoming": { "plan_id": 152, "settings_hash": "abc", "day": "2026-09-29" }
+          },
+          "expected": { "is_new_generation": true }
+        },
+        {
+          "description": "完全相同，不换代",
+          "input": {
+            "current": { "plan_id": 151, "settings_hash": "abc", "day": "2026-09-28" },
+            "incoming": { "plan_id": 151, "settings_hash": "abc", "day": "2026-09-28" }
+          },
+          "expected": { "is_new_generation": false }
+        },
+        {
+          "description": "首启无既有计划，视为换代",
+          "input": {
+            "current": null,
+            "incoming": { "plan_id": 151, "settings_hash": "abc", "day": "2026-09-28" }
+          },
+          "expected": { "is_new_generation": true }
+        },
+        {
+          "description": "取数失败没有新计划，不换代",
+          "input": {
+            "current": { "plan_id": 151, "settings_hash": "abc", "day": "2026-09-28" },
+            "incoming": null
+          },
+          "expected": { "is_new_generation": false }
+        }
+      ]
+    },
+    {
+      "rule": "cache_retention",
+      "description": "常态只留上一张、当前与已预取的下一张（上限 3）；换代时按 item_id 与新计划求交集；跨天清空。",
+      "cases": [
+        {
+          "description": "正常切换后，只留当前与上一张",
+          "input": {
+            "mode": "normal",
+            "photos": [11, 12, 13, 14],
+            "current_item_id": 14,
+            "previous_item_id": 13,
+            "next_item_ids": []
+          },
+          "expected": { "kept_item_ids": [13, 14] }
+        },
+        {
+          "description": "没有上一张时只留当前",
+          "input": {
+            "mode": "normal",
+            "photos": [11, 12],
+            "current_item_id": 12,
+            "previous_item_id": null,
+            "next_item_ids": []
+          },
+          "expected": { "kept_item_ids": [12] }
+        },
+        {
+          "description": "提前量窗口内：已预取的下一张必须保留，否则预取白做",
+          "input": {
+            "mode": "normal",
+            "photos": [11, 12, 13],
+            "current_item_id": 12,
+            "previous_item_id": 11,
+            "next_item_ids": [13]
+          },
+          "expected": { "kept_item_ids": [11, 12, 13] }
+        },
+        {
+          "description": "预取多格：已取回的后续若干张都必须保留（时间线烘焙深度 > 1）",
+          "input": {
+            "mode": "normal",
+            "photos": [11, 12, 13, 14, 15],
+            "current_item_id": 12,
+            "previous_item_id": 11,
+            "next_item_ids": [13, 14, 15]
+          },
+          "expected": { "kept_item_ids": [11, 12, 13, 14, 15] }
+        },
+        {
+          "description": "无主的旧照片一律删除",
+          "input": {
+            "mode": "normal",
+            "photos": [8, 9, 11, 12, 13],
+            "current_item_id": 12,
+            "previous_item_id": 11,
+            "next_item_ids": [13]
+          },
+          "expected": { "kept_item_ids": [11, 12, 13] }
+        },
+        {
+          "description": "换代：保留与新栅格 item_id 重合的部分",
+          "input": {
+            "mode": "generation",
+            "photos": [11, 12, 13, 14],
+            "new_grid_item_ids": [13, 14, 15, 16]
+          },
+          "expected": { "kept_item_ids": [13, 14] }
+        },
+        {
+          "description": "换代：完全无重合则全部删除",
+          "input": {
+            "mode": "generation",
+            "photos": [11, 12],
+            "new_grid_item_ids": [21, 22]
+          },
+          "expected": { "kept_item_ids": [] }
+        },
+        {
+          "description": "跨天：清空",
+          "input": {
+            "mode": "new_day",
+            "photos": [11, 12, 13],
+            "new_grid_item_ids": [31, 32]
+          },
+          "expected": { "kept_item_ids": [] }
+        }
+      ]
+    },
+    {
+      "rule": "failure_classification",
+      "description": "三类失败映射到状态取值。",
+      "cases": [
+        {
+          "description": "取计划失败（没网或服务端不可达）",
+          "input": { "plan_fetched": false, "photo_available": false },
+          "expected": { "current_status": "offline" }
+        },
+        {
+          "description": "取计划成功但照片不可得",
+          "input": { "plan_fetched": true, "photo_available": false },
+          "expected": { "current_status": "download_failed" }
+        },
+        {
+          "description": "照片可用",
+          "input": { "plan_fetched": true, "photo_available": true },
+          "expected": { "current_status": "ok" }
+        }
+      ]
+    },
+    {
+      "rule": "newer_wins",
+      "description": "写入冲突裁定：先比 plan_id，再比 revision。",
+      "cases": [
+        {
+          "description": "既有状态无计划，接受",
+          "input": { "existing": null, "incoming_plan_id": 151, "incoming_revision": 1 },
+          "expected": { "accept": true }
+        },
+        {
+          "description": "同计划、revision 更大，接受",
+          "input": {
+            "existing": { "plan_id": 151, "revision": 5 },
+            "incoming_plan_id": 151,
+            "incoming_revision": 6
+          },
+          "expected": { "accept": true }
+        },
+        {
+          "description": "同计划、revision 更小，拒绝（App 不得覆盖小组件的更新）",
+          "input": {
+            "existing": { "plan_id": 151, "revision": 6 },
+            "incoming_plan_id": 151,
+            "incoming_revision": 5
+          },
+          "expected": { "accept": false }
+        },
+        {
+          "description": "同计划、revision 相同，拒绝（空写）",
+          "input": {
+            "existing": { "plan_id": 151, "revision": 6 },
+            "incoming_plan_id": 151,
+            "incoming_revision": 6
+          },
+          "expected": { "accept": false }
+        },
+        {
+          "description": "计划更新（plan_id 更大），接受",
+          "input": {
+            "existing": { "plan_id": 151, "revision": 9 },
+            "incoming_plan_id": 152,
+            "incoming_revision": 1
+          },
+          "expected": { "accept": true }
+        },
+        {
+          "description": "计划更旧（plan_id 更小），拒绝",
+          "input": {
+            "existing": { "plan_id": 152, "revision": 1 },
+            "incoming_plan_id": 151,
+            "incoming_revision": 99
+          },
+          "expected": { "accept": false }
+        },
+        {
+          "description": "己方无计划身份，拒绝覆盖既有计划",
+          "input": {
+            "existing": { "plan_id": 151, "revision": 3 },
+            "incoming_plan_id": null,
+            "incoming_revision": 4
+          },
+          "expected": { "accept": false }
+        }
+      ]
+    },
+    {
+      "rule": "current_from_entries",
+      "description": "iOS：由烘焙好的条目列表推算此刻画面，取日期不晚于此刻的最后一条。",
+      "cases": [
+        {
+          "description": "落在两条之间，取前一条",
+          "input": {
+            "entries": [
+              { "date_ms": 1000, "item_id": 41 },
+              { "date_ms": 2000, "item_id": 42 },
+              { "date_ms": 3000, "item_id": 43 }
+            ],
+            "now_ms": 2500
+          },
+          "expected": { "item_id": 42 }
+        },
+        {
+          "description": "恰好等于某条时间",
+          "input": {
+            "entries": [
+              { "date_ms": 1000, "item_id": 41 },
+              { "date_ms": 2000, "item_id": 42 }
+            ],
+            "now_ms": 2000
+          },
+          "expected": { "item_id": 42 }
+        },
+        {
+          "description": "并列时刻取先出现的那条（安卓/iOS/Dart 三端必须一致，否则同一时刻会各显示一张）",
+          "input": {
+            "entries": [
+              { "date_ms": 1000, "item_id": 41 },
+              { "date_ms": 1000, "item_id": 42 }
+            ],
+            "now_ms": 1500
+          },
+          "expected": { "item_id": 41 }
+        },
+        {
+          "description": "列表为空，返回 null",
+          "input": { "entries": [], "now_ms": 1500 },
+          "expected": { "item_id": null }
+        },
+        {
+          "description": "列表尚未覆盖此刻，返回 null 由调用方回退到 current 指针",
+          "input": {
+            "entries": [{ "date_ms": 5000, "item_id": 45 }],
+            "now_ms": 1000
+          },
+          "expected": { "item_id": null }
+        }
+      ]
+    },
+    {
+      "rule": "lead_and_probe",
+      "description": "提前量 = min(5 分钟, 间隔/3)；后续格试探上限 = min(2 × 间隔, 15 分钟)。",
+      "cases": [
+        {
+          "description": "15 分钟间隔",
+          "input": { "interval_minutes": 15 },
+          "expected": { "lead_minutes": 5, "probe_minutes": 15 }
+        },
+        {
+          "description": "30 分钟间隔",
+          "input": { "interval_minutes": 30 },
+          "expected": { "lead_minutes": 5, "probe_minutes": 15 }
+        },
+        {
+          "description": "5 分钟间隔（非常规设置，试探上限按 2×间隔）",
+          "input": { "interval_minutes": 5 },
+          "expected": { "lead_minutes": 1, "probe_minutes": 10 }
+        },
+        {
+          "description": "回归：1440 分钟间隔不得让试探上限失控为两天",
+          "input": { "interval_minutes": 1440 },
+          "expected": { "lead_minutes": 5, "probe_minutes": 15 }
+        }
+      ]
+    }
+  ]
+}

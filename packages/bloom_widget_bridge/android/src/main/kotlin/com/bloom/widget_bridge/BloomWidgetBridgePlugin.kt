@@ -1,23 +1,25 @@
 package com.bloom.widget_bridge
 
-import android.app.AlarmManager
-import android.app.PendingIntent
 import android.appwidget.AppWidgetManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.provider.Settings
+import android.util.Log
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.security.MessageDigest
-import android.provider.Settings
-import android.os.Build
-import android.util.Log
-import org.json.JSONArray
-import org.json.JSONObject
-import java.util.Calendar
 
+/**
+ * Dart 与原生小组件之间的桥。
+ *
+ * 轮播部分已经收敛到「Dart 是唯一决策者」：条目不再由 Dart 推送
+ * （旧的 `scheduleCarousel(planId, entries)` 整条路径删除），闹钟由原生直接
+ * 读权威状态 `carousel-state.json` 推导（见 [BloomCarouselAlarms]）。因此这里
+ * 只剩一个通知口：[refreshWidgets] —— 刷新 provider，并重排闹钟。
+ */
 class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private lateinit var context: Context
     private lateinit var channel: MethodChannel
@@ -26,14 +28,12 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         context = binding.applicationContext
         channel = MethodChannel(binding.binaryMessenger, "com.bloom/widget")
         channel.setMethodCallHandler(this)
-        // Package replacement preserves SharedPreferences and AlarmManager
-        // entries. Convert a previously cached plan to provider-targeted
-        // alarms as soon as the new engine attaches, without asking the user
-        // to reselect carousel mode or download the photos again.
+        // 包替换会清掉 AlarmManager 里的闹钟但保留状态文件。引擎重新挂上时
+        // 直接按状态重排一次，用户不必重新选模式、也不必重新下载照片。
         try {
-            rescheduleStoredCarousel()
+            BloomCarouselAlarms.arm(context)
         } catch (error: Exception) {
-            Log.w(TAG, "Unable to migrate stored carousel alarms", error)
+            Log.w(TAG, "Unable to rebuild carousel alarms", error)
         }
     }
 
@@ -50,21 +50,23 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             }
             "updateWidgetCache" -> {
                 val arguments = call.arguments as? Map<*, *>
-                context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
-                    .edit()
+                val prefs = context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
+                val recommendationId = (arguments?.get("recommendationId") as? Number)?.toInt() ?: 0
+                val mode = arguments?.get("mode") as? String
+                val editor = prefs.edit()
                     .putString("mobileLocalPortraitPath", arguments?.get("portraitPath") as? String)
                     .putString("mobileLocalSquarePath", arguments?.get("squarePath") as? String)
                     .putString("mobileLocalLargeSquarePath", arguments?.get("largeSquarePath") as? String)
                     .putString("originalPhotoPath", arguments?.get("originalPhotoPath") as? String)
                     .putString("date", arguments?.get("date") as? String)
-                    .putInt("recommendationId", (arguments?.get("recommendationId") as? Number)?.toInt() ?: 0)
+                    .putInt("recommendationId", recommendationId)
                     .putString("captionZh", arguments?.get("captionZh") as? String)
                     .putString("captionEn", arguments?.get("captionEn") as? String)
                     .putString("capturedDateText", arguments?.get("capturedDateText") as? String)
                     .putString("locationText", arguments?.get("locationText") as? String)
-                    .putString("mode", arguments?.get("mode") as? String)
+                    .putString("mode", mode)
                     .putLong("updatedAtMillis", System.currentTimeMillis())
-                    .apply()
+                editor.apply()
                 refreshWidgets()
                 result.success(null)
             }
@@ -72,20 +74,18 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 refreshWidgets()
                 result.success(null)
             }
+            // 保留方法名以免旧客户端调用报错；条目参数已不再使用，状态文件
+            // 才是唯一真相。收到调用时按状态重排一次闹钟即可。
             "scheduleCarousel" -> {
-                val arguments = call.arguments as? Map<*, *>
-                val planId = (arguments?.get("planId") as? Number)?.toInt()
-                val entries = arguments?.get("entries") as? List<*>
-                if (planId == null || entries == null) {
-                    result.error("invalid_carousel_plan", null, null)
-                } else {
-                    scheduleCarousel(planId, entries)
-                    result.success(null)
+                try {
+                    BloomCarouselAlarms.arm(context)
+                } catch (error: Exception) {
+                    Log.w(TAG, "scheduleCarousel is deprecated; rearm failed", error)
                 }
+                result.success(null)
             }
             "clearCarouselSchedule" -> {
-                val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-                cancelRefillAlarm(alarmManager)
+                BloomCarouselAlarms.cancelAll(context)
                 context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
                     .edit().putInt("scheduledCarouselPlanId", -1).apply()
                 result.success(null)
@@ -121,6 +121,20 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     "deviceToken" to token,
                 ))
             }
+            // 后台保活自检：哪些开关还没开，以及怎么去开。列表本身由原生按机型
+            // 与系统版本推导，Dart 侧只负责渲染，不认识任何版本号。
+            "keepAliveStatus" -> {
+                result.success(BloomKeepAlive.items(context).map { it.toMap() })
+            }
+            "acknowledgeKeepAlive" -> {
+                val id = call.argument<String>("id")
+                if (id != null) BloomKeepAlive.acknowledge(context, id)
+                result.success(null)
+            }
+            "openKeepAlive" -> {
+                val id = call.argument<String>("id")
+                result.success(id != null && BloomKeepAlive.open(context, id))
+            }
             else -> result.notImplemented()
         }
     }
@@ -129,231 +143,40 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         .digest(value.toByteArray(Charsets.UTF_8))
         .joinToString("") { "%02x".format(it) }
 
-    private fun scheduleCarousel(planId: Int, entries: List<*>) {
-        val storedEntries = JSONArray()
-        entries.forEach { raw ->
-            val entry = raw as? Map<*, *> ?: return@forEach
-            storedEntries.put(
-                JSONObject()
-                    .put("itemId", (entry["itemId"] as? Number)?.toInt())
-                    .put("displayAtMillis", (entry["displayAtMillis"] as? Number)?.toLong())
-                    .put("date", entry["date"] as? String)
-                    .put("portraitPath", entry["portraitPath"] as? String)
-                    .put("squarePath", entry["squarePath"] as? String)
-                    .put("largeSquarePath", entry["largeSquarePath"] as? String)
-                    .put("originalPhotoPath", entry["originalPhotoPath"] as? String)
-                    .put("captionZh", entry["captionZh"] as? String)
-                    .put("captionEn", entry["captionEn"] as? String)
-                    .put("capturedDateText", entry["capturedDateText"] as? String)
-                    .put("locationText", entry["locationText"] as? String)
-            )
-        }
-        context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
-            .edit()
-            .putInt("scheduledCarouselPlanId", planId)
-            .putString("scheduledCarouselEntries", storedEntries.toString())
-            .apply()
-        scheduleWidgetAlarms(planId, storedEntries)
-    }
-
-    private fun rescheduleStoredCarousel() {
-        val prefs = context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
-        val planId = prefs.getInt("scheduledCarouselPlanId", -1)
-        val rawEntries = prefs.getString("scheduledCarouselEntries", null)
-        if (planId < 1 || rawEntries.isNullOrBlank()) return
-        scheduleWidgetAlarms(planId, JSONArray(rawEntries))
-    }
-
-    private fun scheduleWidgetAlarms(planId: Int, entries: JSONArray) {
-        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val widgetManager = AppWidgetManager.getInstance(context)
-        val widgetProviders = listOf(
-            "BloomPortraitWidgetProvider",
-            "BloomSquareWidgetProvider",
-            "BloomLargeSquareWidgetProvider",
-        ).mapIndexedNotNull { familyIndex, className ->
-            val component = ComponentName(context.packageName, "${context.packageName}.$className")
-            val widgetIds = widgetManager.getAppWidgetIds(component)
-            if (widgetIds.isEmpty()) null else Triple(familyIndex, component, widgetIds)
-        }
-        val now = System.currentTimeMillis()
-        cancelRefillAlarm(alarmManager)
-        val futureEntries = (0 until entries.length())
-            .mapNotNull { entries.optJSONObject(it) }
-            .filter { it.optLong("displayAtMillis", 0L) > now + 5_000L }
-        // **Why this line matters.** Every slot whose time has already passed is
-        // dropped just below, and the previous refill alarm was cancelled a few
-        // lines up. So a batch that arrives "late" (which is what a phone that
-        // was asleep or offline produces) arms *nothing* — Dart reports success
-        // while `dumpsys alarm` shows zero alarms. This line makes that state
-        // visible instead of silent.
-        Log.i(
-            "BloomCarousel",
-            "schedule plan=$planId entries=${entries.length()} " +
-                "future=${futureEntries.size} now=$now",
-        )
-        for (entryIndex in 0 until entries.length()) {
-            val entry = entries.optJSONObject(entryIndex) ?: continue
-            val itemId = entry.optInt("itemId", 0)
-            val displayAt = entry.optLong("displayAtMillis", 0L)
-            if (itemId < 1 || displayAt < 1L) continue
-
-            // Remove alarms created by version 9015 and earlier. Those target
-            // a custom receiver that MIUI can suppress after SwipeUpClean.
-            val legacyIntent = Intent("com.bloom.bloom.CAROUSEL_ALARM")
-                .setPackage(context.packageName)
-            PendingIntent.getBroadcast(
-                context,
-                itemId,
-                legacyIntent,
-                PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE,
-            )?.let { legacyPending ->
-                alarmManager.cancel(legacyPending)
-                legacyPending.cancel()
-            }
-
-            if (displayAt <= now + 5_000L) {
-                Log.i(
-                    "BloomCarousel",
-                    "skip past slot item=$itemId at=$displayAt now=$now",
-                )
-                continue
-            }
-            widgetProviders.forEach { (familyIndex, component, widgetIds) ->
-                // Xiaomi may refuse to start a custom receiver after the user
-                // swipes the app away. A standard, explicit APPWIDGET_UPDATE
-                // directed at the installed provider remains eligible to run.
-                val intent = Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE)
-                    .setComponent(component)
-                    .putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, widgetIds)
-                    .putExtra("bloomCarouselAlarm", true)
-                    .putExtra("planId", planId)
-                    .putExtra("itemId", itemId)
-                val requestCode = itemId * 10 + familyIndex
-                val pending = PendingIntent.getBroadcast(
-                    context,
-                    requestCode,
-                    intent,
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-                )
-                // The image is already local, so this alarm performs no network
-                // or Flutter work.
-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarmManager.canScheduleExactAlarms()) {
-                    alarmManager.setExactAndAllowWhileIdle(
-                        AlarmManager.RTC_WAKEUP,
-                        displayAt,
-                        pending,
-                    )
-                    Log.i(TAG, "Scheduled exact widget alarm item=$itemId family=$familyIndex at=$displayAt")
-                } else {
-                    alarmManager.setAndAllowWhileIdle(
-                        AlarmManager.RTC_WAKEUP,
-                        displayAt,
-                        pending,
-                    )
-                    Log.i(TAG, "Scheduled fallback widget alarm item=$itemId family=$familyIndex at=$displayAt")
-                }
-            }
-        }
-        // Ask the provider to refill before the cached plan is exhausted.
-        // Near the end of the active window the server may return fewer than
-        // four items, so a "second-to-last only" rule can leave no refill
-        // alarm at all. Use the final item when only one remains, and when no
-        // future item remains schedule a short in-window retry or the next
-        // configured active start.
-        if (widgetProviders.isNotEmpty()) {
-            val refillEntry = when {
-                futureEntries.size >= 2 -> futureEntries[futureEntries.size - 2]
-                futureEntries.size == 1 -> futureEntries.last()
-                else -> null
-            }
-            val (familyIndex, component, widgetIds) = widgetProviders.first()
-            val refillIntent = Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE)
-                .setComponent(component)
-                .putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, widgetIds)
-                .putExtra("bloomCarouselAlarm", true)
-                .putExtra("bloomCarouselRefill", true)
-                .putExtra("planId", planId)
-                .putExtra("itemId", refillEntry?.optInt("itemId", 0) ?: 0)
-            val refillPending = PendingIntent.getBroadcast(
-                context,
-                REFILL_REQUEST_CODE,
-                refillIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            )
-            val refillAt = refillEntry?.optLong("displayAtMillis", 0L)
-                ?: nextCarouselRecoveryAt(now)
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarmManager.canScheduleExactAlarms()) {
-                alarmManager.setExactAndAllowWhileIdle(
-                    AlarmManager.RTC_WAKEUP,
-                    refillAt,
-                    refillPending,
-                )
-            } else {
-                alarmManager.setAndAllowWhileIdle(
-                    AlarmManager.RTC_WAKEUP,
-                    refillAt,
-                    refillPending,
-                )
-            }
-            Log.i(TAG, "Scheduled provider refill plan=$planId item=${refillEntry?.optInt("itemId", 0) ?: 0} at=$refillAt family=$familyIndex")
-        }
-    }
-
-    private fun nextCarouselRecoveryAt(now: Long): Long {
-        val settings = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
-        val startMinutes = parseClockMinutes(
-            settings.getString("flutter.bloom.carousel_active_start", "06:00"),
-            6 * 60,
-        )
-        val endMinutes = parseClockMinutes(
-            settings.getString("flutter.bloom.carousel_active_end", "22:00"),
-            22 * 60,
-        )
-        val calendar = Calendar.getInstance().apply { timeInMillis = now }
-        val currentMinutes = calendar.get(Calendar.HOUR_OF_DAY) * 60 + calendar.get(Calendar.MINUTE)
-        if (currentMinutes in startMinutes until endMinutes) {
-            return now + 5 * 60_000L
-        }
-        if (currentMinutes >= endMinutes) {
-            calendar.add(Calendar.DAY_OF_YEAR, 1)
-        }
-        calendar.set(Calendar.HOUR_OF_DAY, startMinutes / 60)
-        calendar.set(Calendar.MINUTE, startMinutes % 60)
-        calendar.set(Calendar.SECOND, 0)
-        calendar.set(Calendar.MILLISECOND, 0)
-        return calendar.timeInMillis
-    }
-
-    private fun parseClockMinutes(value: String?, fallback: Int): Int {
-        val parts = value?.split(":") ?: return fallback
-        val hour = parts.getOrNull(0)?.toIntOrNull() ?: return fallback
-        val minute = parts.getOrNull(1)?.toIntOrNull() ?: return fallback
-        if (hour !in 0..23 || minute !in 0..59) return fallback
-        return hour * 60 + minute
-    }
-
-    private fun cancelRefillAlarm(alarmManager: AlarmManager) {
-        listOf(
-            "BloomPortraitWidgetProvider",
-            "BloomSquareWidgetProvider",
-            "BloomLargeSquareWidgetProvider",
-        ).forEach { className ->
-            val component = ComponentName(context.packageName, "${context.packageName}.$className")
-            val intent = Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE).setComponent(component)
-            PendingIntent.getBroadcast(
-                context,
-                REFILL_REQUEST_CODE,
-                intent,
-                PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE,
-            )?.let { pending ->
-                alarmManager.cancel(pending)
-                pending.cancel()
-            }
-        }
-    }
-
+    /**
+     * 刷新所有 provider，并按权威状态重排闹钟。
+     *
+     * 每次 tick 提交后 Dart 都会调用它，因此这里是幂等的：provider 刷新只是
+     * 让画面跟上 prefs，闹钟重排只是让排期跟上栅格。
+     */
     private fun refreshWidgets() {
+        try {
+            // 没有精确闹钟权限时，[BloomCarouselAlarms] 会降级成 `setAndAllowWhileIdle`，
+            // 系统把唤醒推迟几分钟——实测小米14（Android 16）小组件比整点晚约 2 分钟，
+            // 而 iOS 不用闹钟、精确重放烘焙时间线，所以准时。
+            //
+            // 这里是每次 tick 之后的**前台**路径，顺手补一次权限申请最自然。
+            // 只主动弹一次；用户拒绝过就不再打扰，改由自检卡片持续展示。
+            BloomKeepAlive.ensureExactAlarm(context)
+            BloomCarouselAlarms.arm(context)
+        } catch (error: Exception) {
+            Log.w(TAG, "Unable to rearm carousel alarms", error)
+        }
+        // **只在画面真的会变时才刷新 provider。**
+        //
+        // 每次 tick 都会走到这里，而一次换图前后会有好几次 tick（对表、预取、替补、
+        // 提交），再加上闹钟在「格子前 3 分钟」的重排，一个整点能刷四五遍——观感就是
+        // 小组件连闪三四次（实测小米14 在 :27/:28 和整点都会闪）。
+        //
+        // 判据用「当前格 + 它所处的格子时刻」：这两项没变，画出来的东西就一样，
+        // 没有任何理由重绘。**注意不能用 `revision`**——它每次提交都递增，那样等于
+        // 没有去重。
+        val state = BloomCarouselState.read(context)
+        val stamp = "${state?.optInt("current_item_id", 0)}@${state?.optLong("current_slot_at_ms", 0L)}"
+        val prefs = context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
+        if (prefs.getString("lastPushedWidgetStamp", null) == stamp) return
+        prefs.edit().putString("lastPushedWidgetStamp", stamp).apply()
+
         val manager = AppWidgetManager.getInstance(context)
         listOf("BloomPortraitWidgetProvider", "BloomSquareWidgetProvider", "BloomLargeSquareWidgetProvider").forEach { className ->
             val component = ComponentName(context.packageName, "${context.packageName}.$className")
@@ -370,6 +193,5 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     private companion object {
         const val TAG = "BloomCarousel"
-        const val REFILL_REQUEST_CODE = 0xB10
     }
 }

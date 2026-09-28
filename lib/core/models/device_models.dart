@@ -94,6 +94,7 @@ class CarouselItemContent {
     required this.itemId,
     required this.displayAt,
     required this.photo,
+    this.assetId = '',
     this.captionZh,
     this.captionEn,
     this.capturedDateText,
@@ -104,6 +105,11 @@ class CarouselItemContent {
   final int itemId;
   final DateTime displayAt;
   final PhotoAsset photo;
+
+  /// 该格照片对应的相册 asset。计划换代时按 item_id 求交集，替补时需要把
+  /// 当天计划里已出现的 asset 全部排除，因此必须保留。
+  final String assetId;
+
   final String? captionZh;
   final String? captionEn;
   final String? capturedDateText;
@@ -116,6 +122,7 @@ class CarouselItemContent {
       itemId: (json['item_id'] as num).toInt(),
       displayAt: DateTime.parse(json['display_at'] as String),
       photo: PhotoAsset.fromJson(json['photo'] as Map<String, dynamic>),
+      assetId: json['asset_id'] as String? ?? '',
       captionZh: caption['zh'] as String?,
       captionEn: caption['en'] as String?,
       capturedDateText: json['captured_date_text'] as String?,
@@ -157,12 +164,31 @@ class CarouselPlanEnvelope {
     required this.currentItemId,
     required this.nextCheckAt,
     required this.items,
+    this.hasMore = false,
+    this.settingsHash,
+    this.localDate,
+    this.intervalMinutes,
+    this.activeStart,
+    this.activeEnd,
   });
 
   final int planId;
   final int currentItemId;
   final DateTime nextCheckAt;
   final List<CarouselItemContent> items;
+
+  /// 本页之后是否还有条目。全天拉取据此循环。
+  final bool hasMore;
+
+  /// 计划身份的一部分：与 planId 共同判定是否换代。
+  final String? settingsHash;
+
+  /// 计划所属本地日期，格式 YYYY-MM-DD。
+  final String? localDate;
+
+  final int? intervalMinutes;
+  final String? activeStart;
+  final String? activeEnd;
 
   factory CarouselPlanEnvelope.fromJson(Map<String, dynamic> json) =>
       CarouselPlanEnvelope(
@@ -177,6 +203,12 @@ class CarouselPlanEnvelope {
                   ),
                 )
                 .toList(growable: false),
+        hasMore: json['has_more'] as bool? ?? false,
+        settingsHash: json['settings_hash'] as String?,
+        localDate: json['local_date'] as String?,
+        intervalMinutes: (json['interval_minutes'] as num?)?.toInt(),
+        activeStart: json['active_start'] as String?,
+        activeEnd: json['active_end'] as String?,
       );
 }
 

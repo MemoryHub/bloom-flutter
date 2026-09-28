@@ -1,5 +1,8 @@
 import 'package:bloom_widget_bridge/bloom_widget_bridge.dart';
 
+export 'package:bloom_widget_bridge/bloom_widget_bridge.dart'
+    show KeepAliveItem;
+
 class WidgetBridge {
   Future<String?> cacheDirectory() =>
       BloomWidgetBridgePlatform.cacheDirectory();
@@ -33,6 +36,21 @@ class WidgetBridge {
   }
 
   Future<void> refresh() => BloomWidgetBridgePlatform.refresh();
+
+  /// 后台保活自检：哪些开关还没开、以及怎么去开。
+  ///
+  /// **iOS 上恒为空列表**（见 [BloomWidgetBridgePlatform.keepAliveStatus]），
+  /// 所以调用方不必判断平台，直接按「空就不渲染」处理即可。
+  Future<List<KeepAliveItem>> keepAliveStatus() =>
+      BloomWidgetBridgePlatform.keepAliveStatus();
+
+  /// 跳到某一项的设置页。**false 表示跳不过去**，界面应改展示文字步骤。
+  Future<bool> openKeepAlive(String id) =>
+      BloomWidgetBridgePlatform.openKeepAlive(id);
+
+  /// 用户确认「我已经开好了」。只对读不到状态的那一项有意义。
+  Future<void> acknowledgeKeepAlive(String id) =>
+      BloomWidgetBridgePlatform.acknowledgeKeepAlive(id);
 
   Future<void> scheduleCarousel({
     required int planId,

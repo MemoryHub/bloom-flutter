@@ -6,20 +6,40 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.util.Log
-import org.json.JSONArray
+import com.bloom.widget_bridge.BloomCarouselAlarms
+import com.bloom.widget_bridge.BloomCarouselState
+import java.io.File
 
+/**
+ * 格子到点。只做两件事：查表上屏、刷新 provider。
+ *
+ * **这里不再有任何选取逻辑。** 旧实现自带一套 `latestDueEntry`：在已烘焙的
+ * 条目里挑「最晚的一个已到点条目」，还要处理并列打破（取最大 itemId）与
+ * 「不得倒退到已看过的照片」（`lastShownItemId` 地板）。那套启发式与 iOS、
+ * Dart 各自的实现互不相同，正是「App 和小组件显示两张不同照片」以及
+ * 「刚切换完几分钟又变一张」的来源。
+ *
+ * 现在唯一的决策者是 Dart 的 tick 引擎；原生侧只回答「`date_ms` 不晚于此刻
+ * 的最后一条是谁」，与 iOS 完全同一条规则（共享向量 `current_from_entries`）。
+ */
 class BloomCarouselAlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == Intent.ACTION_MY_PACKAGE_REPLACED ||
             intent.action == Intent.ACTION_BOOT_COMPLETED) {
-            // App upgrades and device reboots must rebuild the refill chain
-            // without waiting for the user to open Bloom. The persisted Dart
-            // callback and device credentials are enough for WorkManager to
-            // fetch/schedule the next plan once connectivity is available.
+            // 包替换与设备重启都要重建闹钟链，不必等用户打开 App。
             try {
                 BloomWidgetRefresh.prepareCarouselRecoveryAfterRestart(context)
                 BloomWidgetRefresh.enqueueRecoveryAfterRestart(context)
-            } catch (_: Exception) { }
+            } catch (error: Exception) {
+                Log.w(TAG, "carousel recovery after restart failed", error)
+            }
+            try {
+                // 闹钟由权威状态的栅格推导，重启后直接重排即可，不需要
+                // Dart 重新推送任何东西。
+                BloomCarouselAlarms.arm(context)
+            } catch (error: Exception) {
+                Log.w(TAG, "Unable to rebuild carousel alarms", error)
+            }
         }
         if (!BloomCarouselSchedule.applyLatestDueEntry(context, intent)) return
 
@@ -43,111 +63,80 @@ class BloomCarouselAlarmReceiver : BroadcastReceiver() {
             }
         }
     }
+
+    private companion object {
+        const val TAG = "BloomCarousel"
+    }
 }
 
 /**
- * Applies the newest locally-prefetched carousel entry without starting
- * Flutter or touching the network. Widget providers also call this helper
- * before handling alarm-backed APPWIDGET_UPDATE broadcasts. This matters on
- * MIUI, which may drop a custom receiver after the user swipes the app away
- * while still allowing the system-recognized AppWidgetProvider to run.
+ * 把权威状态里「此刻该显示的那一条」搬到 provider 读取的 prefs 上。
+ *
+ * provider 也在这里被调用（小米可能在用户上划清后台后丢掉自定义 receiver，
+ * 但系统识别的 AppWidgetProvider 仍会运行）。
  */
 object BloomCarouselSchedule {
-    fun applyLatestDueEntry(context: Context, intent: Intent): Boolean {
-        val prefs = context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
-        val planId = intent.getIntExtra(
-            "planId",
-            prefs.getInt("scheduledCarouselPlanId", -1),
-        )
-        if (planId < 1 || prefs.getInt("scheduledCarouselPlanId", -1) != planId) {
-            Log.i(TAG, "Ignoring stale carousel alarm: action=${intent.action} plan=$planId")
+    private const val TAG = "BloomCarousel"
+    private const val PREFS = "bloom_widget"
+
+    /**
+     * @return 是否值得继续刷新 provider。返回 false 表示此刻没有可显示的条目，
+     *         保持画面不变即可。
+     */
+    fun applyLatestDueEntry(context: Context, intent: Intent? = null): Boolean {
+        val now = System.currentTimeMillis()
+        val entry = BloomCarouselState.currentEntry(context, now)
+        if (entry == null) {
+            Log.i(
+                TAG,
+                "no baked entry covers now action=${intent?.action} now=$now; keeping current",
+            )
             return false
         }
 
-        // MIUI and Doze may deliver an alarm after one or more later slots are
-        // already due. Always resolve against the cached plan instead of using
-        // the item embedded in this particular alarm; an old alarm must never
-        // overwrite a newer image.
-        val resolved = latestDueEntry(
-            prefs.getString("scheduledCarouselEntries", null),
-        ) ?: run {
-            Log.w(TAG, "No due cached carousel entry for action=${intent.action}")
-            return false
-        }
+        val itemId = entry.optInt("item_id", 0)
+        val portrait = entry.nullableString("portrait_path")
+        val original = entry.nullableString("original_path")
 
-        // **Never move onto a file that is not there.** A slot is kept in the plan
-        // even while its photo is still downloading (a slow server must not cost a
-        // quarter hour), so the newest due entry is not always displayable;
-        // applying it would put an empty frame on the wall. Keep the current photo
-        // but still return true, so the provider runs and its refill sync fetches
-        // the missing image moments later.
-        val candidates = listOfNotNull(
-            resolved["portraitPath"] as? String,
-            resolved["originalPhotoPath"] as? String,
-        )
-        if (candidates.none { java.io.File(it).exists() }) {
-            Log.i(TAG, "Due item ${resolved["itemId"]} has no image yet; keeping current")
+        // 宁可显示上一张，也不显示空图。文件不在就保持当前画面，但仍然返回
+        // true，让 provider 跑一次顺带触发补货——缺失的那张会在下一次 tick
+        // 补上。
+        val candidates = listOfNotNull(portrait, original)
+        if (candidates.isEmpty() || candidates.none { File(it).exists() }) {
+            Log.i(TAG, "due item=$itemId has no image on disk; keeping current")
             return true
         }
 
-        prefs.edit()
-            .putString("mobileLocalPortraitPath", resolved["portraitPath"] as? String)
-            .putString("mobileLocalSquarePath", resolved["squarePath"] as? String)
-            .putString("mobileLocalLargeSquarePath", resolved["largeSquarePath"] as? String)
-            .putString("originalPhotoPath", resolved["originalPhotoPath"] as? String)
-            .putString("date", resolved["date"] as? String)
-            .putInt("recommendationId", resolved["itemId"] as? Int ?: 0)
-            .putString("captionZh", resolved["captionZh"] as? String)
-            .putString("captionEn", resolved["captionEn"] as? String)
-            .putString("capturedDateText", resolved["capturedDateText"] as? String)
-            .putString("locationText", resolved["locationText"] as? String)
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val editor = prefs.edit()
+            .putString("mobileLocalPortraitPath", portrait)
+            .putString("mobileLocalSquarePath", entry.nullableString("square_path"))
+            .putString(
+                "mobileLocalLargeSquarePath",
+                entry.nullableString("large_square_path"),
+            )
+            .putString("originalPhotoPath", original)
+            .putString("date", entry.nullableString("date"))
+            .putInt("recommendationId", itemId)
+            .putString("captionZh", entry.nullableString("caption_zh"))
+            .putString("captionEn", entry.nullableString("caption_en"))
+            .putString("capturedDateText", entry.nullableString("captured_date_text"))
+            .putString("locationText", entry.nullableString("location_text"))
             .putString("mode", "carousel")
-            .putLong("updatedAtMillis", System.currentTimeMillis())
-            .apply()
+            .putLong("updatedAtMillis", now)
+        editor.apply()
 
-        // **The diagnostic that separates the two possible faults.** `at` is the
-        // time the plan gives this item and `now` is the moment it went up:
-        //   at  > now  -> the widget advanced *early* (it showed a slot before its
-        //                 turn, which is what makes a photo look "seen before" when
-        //                 the slot's own picture arrives later);
-        //   at <= now  -> the item was due, so a repeat means the *selection* is
-        //                 wrong: another entry with a later `at` (or a larger id at
-        //                 the same `at`) should have won instead.
-        val dueAt = (resolved["displayAtMillis"] as? Number)?.toLong() ?: 0L
         Log.i(
             TAG,
-            "Applied cached carousel item=${resolved["itemId"]} at=$dueAt " +
-                "now=${System.currentTimeMillis()} action=${intent.action}",
+            "applied item=$itemId at=${entry.optLong("date_ms", 0L)} now=$now " +
+                "action=${intent?.action}",
         )
         return true
     }
 
-    private const val TAG = "BloomCarousel"
-
-    private fun latestDueEntry(raw: String?): Map<String, Any?>? {
-        if (raw.isNullOrBlank()) return null
-        val entries = try { JSONArray(raw) } catch (_: Exception) { return null }
-        val now = System.currentTimeMillis()
-        var selected: Map<String, Any?>? = null
-        var selectedAt = Long.MIN_VALUE
-        for (index in 0 until entries.length()) {
-            val entry = entries.optJSONObject(index) ?: continue
-            val displayAt = entry.optLong("displayAtMillis", Long.MAX_VALUE)
-            if (displayAt > now || displayAt < selectedAt) continue
-            selectedAt = displayAt
-            selected = mapOf(
-                "itemId" to entry.optInt("itemId", 0),
-                "date" to entry.optString("date", null),
-                "portraitPath" to entry.optString("portraitPath", null),
-                "squarePath" to entry.optString("squarePath", null),
-                "largeSquarePath" to entry.optString("largeSquarePath", null),
-                "originalPhotoPath" to entry.optString("originalPhotoPath", null),
-                "captionZh" to entry.optString("captionZh", null),
-                "captionEn" to entry.optString("captionEn", null),
-                "capturedDateText" to entry.optString("capturedDateText", null),
-                "locationText" to entry.optString("locationText", null),
-            )
-        }
-        return selected
+    private fun org.json.JSONObject.nullableString(key: String): String? {
+        if (isNull(key)) return null
+        val value = optString(key, "")
+        return value.ifEmpty { null }
     }
 }

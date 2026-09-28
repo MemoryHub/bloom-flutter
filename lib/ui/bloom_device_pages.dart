@@ -10,6 +10,7 @@ import '../core/api/bloom_api_client.dart';
 import '../core/models/device_models.dart';
 import '../core/storage/display_preferences.dart';
 import 'bloom_glass_home.dart';
+import 'bloom_keep_alive_card.dart';
 
 /// One row of the F3 device list.
 ///
@@ -1167,6 +1168,9 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
                   // ("这些文字完全不要了"), so what is left is only what can be
                   // changed or read.
                   if (carousel) _cadenceCard() else _RecommendationCard(),
+                  // 后台保活自检：**这台手机自己的事**，所以只在本机（手机小组件）
+                  // 的详情页出现，相框上没有。iOS 上原生返回空列表，卡片整个不渲染。
+                  if (widget.device.isLocal) const BloomKeepAliveCard(),
                 ],
                 const SizedBox(height: 28),
                 _deviceInfo(),

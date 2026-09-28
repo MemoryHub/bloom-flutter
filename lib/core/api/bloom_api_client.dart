@@ -199,7 +199,10 @@ class BloomApiClient {
             'active_start': settings.activeStart,
             'active_end': settings.activeEnd,
             'interval_minutes': settings.intervalMinutes,
-            'batch_limit': batchLimit.clamp(1, 4),
+            // 上限 4 原本是相框固件的照片缓存深度，与计划元数据无关。手机端
+            // 需要一次拿全天计划，因此不再按 4 截断；若服务端尚未放开上限，
+            // 响应里的 has_more 会让调用方自行循环补齐。
+            'batch_limit': batchLimit.clamp(1, 200),
             if (afterItemId != null) 'after_item_id': afterItemId,
           }),
         )
@@ -230,6 +233,37 @@ class BloomApiClient {
       _throw(response);
     }
     return response;
+  }
+
+  /// 替补：某格的原照片不可用时，请服务端换一张「当天计划之外」的合规照片。
+  ///
+  /// 服务端会在计划里就地替换该 item 的 asset（item_id 与格子时间不变），
+  /// 因此替补之后重新取图即可。服务端接口尚未上线时本调用会抛异常，由调用方
+  /// 按「替补不可用」降级处理（保持上一张 + 下载失败），不影响其余流程。
+  Future<CarouselItemContent> substituteCarouselItem(
+    DeviceCredentials credentials, {
+    required int planId,
+    required int itemId,
+  }) async {
+    final response = await _client
+        .post(
+          _uri(
+            '/api/frame/devices/${Uri.encodeComponent(credentials.deviceId)}/carousel/item/substitute',
+          ),
+          headers: {
+            ..._headers(credentials.deviceToken),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'target': 'mobile',
+            'plan_id': planId,
+            'item_id': itemId,
+          }),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    final json = _json(response);
+    return CarouselItemContent.fromJson(json['item'] as Map<String, dynamic>);
   }
 
   /// Reads the carousel settings the server stores for [target].

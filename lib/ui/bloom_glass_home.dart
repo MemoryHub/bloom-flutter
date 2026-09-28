@@ -1264,6 +1264,16 @@ class _PhotoPage extends StatelessWidget {
                   // The "next update" line sits under the card, inside the same
                   // width, so its height comes out of the card's budget — reserve
                   // it here or the column overflows on a short screen.
+                  //
+                  // This reservation is unconditional (unlike the row itself,
+                  // which is hidden while remote-selected): the label's text can
+                  // flip between null and non-null from one frame to the next
+                  // (the plan hasn't returned yet, then it has), and if the
+                  // reserved space changed with it the card would resize under
+                  // that flip — "card grows, then gets squeezed once the label
+                  // shows up". Reserving the slot always and only swapping what
+                  // renders inside it keeps the card's box constant regardless
+                  // of whether the label is showing.
                   final nextSlot = remoteSelected ? null : nextSlotText;
                   const nextSlotGap = 8.0;
                   const nextSlotHeight = 15.0;
@@ -1272,7 +1282,7 @@ class _PhotoPage extends StatelessWidget {
                     constraints.maxHeight -
                         rowHeight -
                         BloomGlassHome.cardGap -
-                        (nextSlot == null ? 0.0 : nextSlotGap + nextSlotHeight),
+                        (remoteSelected ? 0.0 : nextSlotGap + nextSlotHeight),
                   );
                   // Same formula as `AspectRatio` itself: fill the width unless
                   // the height says otherwise (the card is portrait, 720x1200).

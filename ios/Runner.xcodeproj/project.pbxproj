@@ -16,6 +16,8 @@
 		97C146FE1CF9000F007C117D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FD1CF9000F007C117D /* Assets.xcassets */; };
 		97C147011CF9000F007C117D /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */; };
 		B10000000000000000000001 /* BloomWidgets.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000011 /* BloomWidgets.swift */; };
+		B10000000000000000000005 /* BloomSharedState.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000015 /* BloomSharedState.swift */; };
+		B10000000000000000000006 /* BloomSharedState.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000015 /* BloomSharedState.swift */; };
 		B10000000000000000000002 /* BloomWidgets.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = B10000000000000000000014 /* BloomWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		E1A0098783402137A02458DA /* Pods_Runner.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 564A6DE65ED6F202D86AC25B /* Pods_Runner.framework */; };
 /* End PBXBuildFile section */
@@ -83,6 +85,7 @@
 		97C147001CF9000F007C117D /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		97C147021CF9000F007C117D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B10000000000000000000011 /* BloomWidgets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BloomWidgets.swift; sourceTree = "<group>"; };
+		B10000000000000000000015 /* BloomSharedState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BloomSharedState.swift; sourceTree = "<group>"; };
 		B10000000000000000000012 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B10000000000000000000013 /* BloomWidgets.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = BloomWidgets.entitlements; sourceTree = "<group>"; };
 		B10000000000000000000014 /* BloomWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = BloomWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -193,6 +196,7 @@
 			isa = PBXGroup;
 			children = (
 				B10000000000000000000011 /* BloomWidgets.swift */,
+				B10000000000000000000015 /* BloomSharedState.swift */,
 				B10000000000000000000012 /* Info.plist */,
 				B10000000000000000000013 /* BloomWidgets.entitlements */,
 			);
@@ -452,6 +456,7 @@
 			files = (
 				74858FAF1ED2DC5600515810 /* AppDelegate.swift in Sources */,
 				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
+				B10000000000000000000006 /* BloomSharedState.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -460,6 +465,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				B10000000000000000000001 /* BloomWidgets.swift in Sources */,
+				B10000000000000000000005 /* BloomSharedState.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

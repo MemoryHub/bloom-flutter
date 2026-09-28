@@ -3,6 +3,16 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     <!-- Photo rotation is a user-configured, time-based widget feature. -->
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>
+    <!-- 让「允许后台不受限」能走到系统那个免优化确认框。targetSdk 35 下
+         `setExactAndAllowWhileIdle` 在 Doze 里每个应用最多 9~15 分钟才放行一次，
+         而轮播间隔就是 15 分钟——这是保活清单里第二项的由来。 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+    <!-- Android 11 起查不到未声明包名。小米自启动页要先 resolve 再 start
+         （HyperOS 与各 MIUI 版本路径不一致，硬跳会抛 ActivityNotFoundException），
+         所以必须在这里声明可见性。 -->
+    <queries>
+        <package android:name="com.miui.securitycenter"/>
+    </queries>
     <application
         android:label="bloom"
         android:name="${applicationName}"

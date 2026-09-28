@@ -188,9 +188,17 @@ class _BloomHomePageState extends State<BloomHomePage>
       // app re-sync every 30 seconds for as long as the page was on screen, and
       // every pass fetched the next page — which the bounded pool then trimmed,
       // while the trimming deleted the very files the pool still pointed at.
-      // Poll only when there is no usable stamp (missing, or already past).
-      final at = await DailyContentRepository(api: _api).nextSlotAtMillis();
-      if (at != null && at > DateTime.now().millisecondsSinceEpoch - 5000) return;
+      // **判据必须是「落后了吗」，不能是「下一格还在未来吗」。**
+      //
+      // 后者按定义恒为真——`nextSlotAtMillis()` 返回的永远是未来的一格，
+      // `at > now - 5000` 没有例外——于是这个兜底此前**一次都没有执行过**。
+      // 页面一旦错过上面那次一次性唤醒，就再无补救（实测：21:15 该换的图
+      // 拖到 21:17 才换）。
+      //
+      // 现在改成问「此刻应有的那一格，比状态里记的当前格更新吗」。只有真落后
+      // 才补一次 sync，没落后就安静地跳过——30 秒一轮，代价可以忽略。
+      final repository = DailyContentRepository(api: _api);
+      if (!await repository.isBehind()) return;
       if (!mounted || _loading) return;
       await _load(showSpinner: false);
     });
@@ -247,7 +255,6 @@ class _BloomHomePageState extends State<BloomHomePage>
     _loadStartedAt = DateTime.now();
     if (showSpinner && mounted) setState(() => _loading = true);
     try {
-      final storedCredentials = await _identity.read();
       final credentials = await _identity.initialize();
       // Device identity is local state and must remain visible even when the
       // following server/status/photo request fails.
@@ -290,19 +297,27 @@ class _BloomHomePageState extends State<BloomHomePage>
       if (mounted && !_widgetEnabled) setState(() => _widgetEnabled = true);
       DeviceStatus? status;
       PairingInfo? pairing;
-      if (storedCredentials == null) {
-        pairing = await _api.register(credentials, name: 'Bloom 手机');
+      // **Always probe the server first, regardless of local cache state.**
+      // `storedCredentials == null` used to gate straight to `register()`,
+      // treating "no local cache" as "server has never seen this device".
+      // That is only true on iOS. On Android, `initialize()` re-derives a
+      // deterministic id from `ANDROID_ID` when the local cache is missing
+      // (a fresh install, or the app's data being cleared), so the server
+      // may already recognize this exact device — calling `register()`
+      // unconditionally in that case can reset an already-paired device back
+      // to unpaired, which is exactly the "stuck on the pairing screen even
+      // though the device is bound server-side" symptom. `status()` is the
+      // only call that can tell the two cases apart; `register()` must stay
+      // reserved for the case the server actually says it doesn't know this
+      // device (401 device_authentication_required).
+      try {
         status = await _api.status(credentials);
-      } else {
-        try {
-          status = await _api.status(credentials);
-        } on BloomApiException catch (error) {
-          if (error.statusCode == 401 &&
-              error.code == 'device_authentication_required') {
-            pairing = await _api.register(credentials, name: 'Bloom 手机');
-          } else {
-            rethrow;
-          }
+      } on BloomApiException catch (error) {
+        if (error.statusCode == 401 &&
+            error.code == 'device_authentication_required') {
+          pairing = await _api.register(credentials, name: 'Bloom 手机');
+        } else {
+          rethrow;
         }
       }
 
@@ -420,6 +435,17 @@ class _BloomHomePageState extends State<BloomHomePage>
               '(mode=${displaySettings.mode.name} '
               'window=${displaySettings.activeStart}-${displaySettings.activeEnd})',
             );
+            if (displaySettings.mode == BloomDisplayMode.carousel) {
+              // **This path needed the same catch-up as the manual "下一张"
+              // button.** `_watchNextSlot` was wired only to that button, so
+              // "下次更新" appeared within ~1 s after a manual advance but sat
+              // blank for up to a minute on cold start, the 30 s fallback and
+              // resume-from-background — every route that lands here instead.
+              // The label is written moments after the plan response, well
+              // before the batch's downloads finish; start the same poll here
+              // so this path catches it just as early.
+              unawaited(_watchNextSlot(repository));
+            }
             content =
                 displaySettings.mode == BloomDisplayMode.carousel
                     ? await repository.syncCarousel(

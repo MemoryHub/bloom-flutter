@@ -32,6 +32,9 @@ migrate_working_dir/
 .pub-cache/
 .pub/
 /build/
+# Xcode 的 target 方式构建（xcodebuild -target）把产物写在 ios/build/，
+# 与 Flutter 的 /build/ 是两个目录，锚定规则匹配不到它。
+ios/build/
 
 # Symbolication related
 app.*.symbols

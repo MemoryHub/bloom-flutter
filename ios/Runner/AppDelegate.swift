@@ -2,6 +2,7 @@ import Flutter
 import Security
 import UIKit
 import WidgetKit
+import workmanager
 
 @main
 @objc class AppDelegate: FlutterAppDelegate {
@@ -23,10 +24,85 @@ import WidgetKit
     // The storyboard FlutterViewController is attached after the launch
     // callback. Register only Bloom's own channel on the next main-loop turn;
     // no Flutter plugin registrar is involved here.
+    // **一次性清掉重写前遗留的键。** 现在没有任何代码读它们了，但老版本写下的
+    // 值还躺在 App Group 的 UserDefaults 里，`iosLastShownItemId` 就是其中之一。
+    // 留着它们只会让后来人误以为还存在第二份真相。
+    Self.purgeLegacyCarouselKeys()
+    Self.registerBackgroundSync()
     DispatchQueue.main.async { [weak self] in
       self?.configureBloomWidgetChannelWhenReady()
     }
     return didFinish
+  }
+
+  /// 当前显示内容的指纹：`item_id@slot_at_ms`。**与安卓侧用同一个判据。**
+  ///
+  /// 用它去重，避免每次 tick 都消耗一次 WidgetKit 的重绘配额。
+  private static let widgetStampKey = "lastPushedWidgetStamp"
+
+  private static func currentEntryStamp() -> String {
+    guard let state = BloomSharedState.load(),
+          let entry = BloomCarouselRule.currentEntry(
+            BloomSharedState.timelineEntries(state),
+            nowMillis: Date().timeIntervalSince1970 * 1000
+          ) else { return "0@0" }
+    let id = (entry["item_id"] as? NSNumber)?.intValue ?? 0
+    let at = (entry["date_ms"] as? NSNumber)?.int64Value ?? 0
+    return "\(id)@\(at)"
+  }
+
+  /// **把后台周期任务登记到 iOS。** 这是 iOS 与安卓同构的那一半。
+  ///
+  /// 安卓侧早已接好：`WorkManager` 周期唤醒 → `BloomFlutterSync` 起 headless
+  /// FlutterEngine → 跑 `lib/background_sync.dart` 里那个
+  /// `@pragma('vm:entry-point')` 回调。而 iOS 侧一直缺这段登记——
+  /// `Info.plist` 里声明了标识符、Dart 里也写好了任务，但**没有任何代码调用
+  /// `BGTaskScheduler.register`**，系统因此永远不会唤我们。
+  ///
+  /// 后果与安卓实测一致：原生只剩精确闹钟链，而它**只做纯查表、不下载照片**，
+  /// 所以窗口（当前格 + 未来 4 格）用完之后小组件就定格，直到用户手动打开 App。
+  ///
+  /// `registerPeriodicTask` 内部就是 `BGTaskScheduler.shared.register`，
+  /// **必须在 didFinishLaunching 里调用**（iOS 的硬性要求），所以放在这里。
+  ///
+  /// 注意 iOS 的行为边界：执行时机由系统按用户使用习惯决定，**不保证准点**。
+  /// 它负责"不断备货"，准点仍由闹钟/WidgetKit 负责。
+  private static func registerBackgroundSync() {
+    if #available(iOS 13.0, *) {
+      // 标识符必须与 Info.plist 的 BGTaskSchedulerPermittedIdentifiers 一致。
+      WorkmanagerPlugin.registerPeriodicTask(
+        withIdentifier: "com.bloom.bloom.dailySync",
+        frequency: NSNumber(value: 15 * 60)
+      )
+      // 后台 isolate 里也要能拿到插件，否则 Dart 侧的同步跑不起来。
+      WorkmanagerPlugin.setPluginRegistrantCallback { registry in
+        GeneratedPluginRegistrant.register(with: registry)
+      }
+    }
+  }
+
+  /// 删除轮播重写（2026-09）之前遗留的持久化键。
+  ///
+  /// 这些键比轮播重写早一个多月（最初提交 2026-08-17）。它们的读取端已全部
+  /// 删除，写入端也已停止；这里把最后残留的值抹掉，让共享状态成为唯一的真相。
+  /// 幂等：删不存在的键没有副作用。
+  private static func purgeLegacyCarouselKeys() {
+    guard let defaults = UserDefaults(suiteName: bloomAppGroup) else { return }
+    for key in [
+      "iosCarouselPlan",          // 扩展自建的第二份计划表（陈旧表，曾让文案恒为 4406）
+      "iosCarouselPlanDay",
+      "iosHostCarouselPlanId",
+      "iosLastShownItemId",       // 「不得倒退」的地板阈值，已无读者
+      "iosWidgetPhotoPath",       // 旧的照片/文案持久化——照片与文案存在两个键里
+      "iosWidgetRevision",
+      "iosWidgetCaptionZh",
+      "iosWidgetCaptionEn",
+      "iosWidgetCapturedDate",
+      "iosWidgetLocation",
+    ] {
+      defaults.removeObject(forKey: key)
+    }
+    defaults.synchronize()
   }
 
   private func configureBloomWidgetChannelWhenReady(attempt: Int = 0) {
@@ -110,29 +186,35 @@ import WidgetKit
         }
         result(nil)
       case "refreshWidgets":
-        WidgetCenter.shared.reloadAllTimelines()
+        // **只在画面真的会变时才请小组件重绘。**
+        //
+        // WidgetKit 的重绘是有配额的。这里原本**每次 tick 都无条件**调用
+        // `reloadAllTimelines()`，而一次换图前后会有好几次 tick（对表、预取、替补、
+        // 提交），配额很快被烧光——于是**真正要紧的那次被系统推迟**。
+        //
+        // 实测 23:22：App 已经把当前格推进到 4431 并发了重绘请求，小组件却还停在
+        // 上一次烘焙的旧时间线上（显示「花开得正好，你也刚好在看我」，而该条目
+        // 已经不在时间线里了）。这不是"数据没前进"，是"重绘没生效"。
+        //
+        // 判据与安卓侧完全一致：`current_item_id@current_slot_at_ms` 变了才重绘。
+        let stamp = Self.currentEntryStamp()
+        if UserDefaults.standard.string(forKey: Self.widgetStampKey) != stamp {
+          UserDefaults.standard.set(stamp, forKey: Self.widgetStampKey)
+          WidgetCenter.shared.reloadAllTimelines()
+        }
         result(nil)
       case "scheduleCarousel":
-        guard
-          let arguments = call.arguments as? [String: Any],
-          let planId = arguments["planId"] as? NSNumber,
-          let entries = arguments["entries"] as? [[String: Any]],
-          JSONSerialization.isValidJSONObject(entries),
-          let data = try? JSONSerialization.data(withJSONObject: entries),
-          let encoded = String(data: data, encoding: .utf8),
-          let defaults = UserDefaults(suiteName: Self.bloomAppGroup)
-        else {
-          result(FlutterError(code: "invalid_carousel_plan", message: nil, details: nil))
-          return
-        }
-        defaults.set(planId.intValue, forKey: "iosHostCarouselPlanId")
-        defaults.set(encoded, forKey: "iosCarouselPlan")
-        // The widget extension uses this to reset its paging cursor when the day
-        // changes, mirroring the Dart pool's `{day, last_item_id}` bookkeeping.
-        // It has to be written here too, or the extension would treat the host
-        // app's freshly scheduled plan as stale.
-        defaults.set(Self.localDay(), forKey: "iosCarouselPlanDay")
-        defaults.synchronize()
+        // **Retired.** The host app used to push a baked entry list here, which
+        // the extension then merged into `iosCarouselPlan` — a *second* writer
+        // of the carousel plan next to the extension's own fetches, and the
+        // reason the app and the widget could disagree about what was on the
+        // wall.
+        //
+        // The authoritative plan now travels through the shared state file
+        // (`carousel-state.json`, written by the single Dart writer and read by
+        // the extension through `BloomSharedState`). The method name is kept so
+        // an older client calling it does not crash; it simply reloads the
+        // timelines and lets the extension read the shared state.
         WidgetCenter.shared.reloadAllTimelines()
         result(nil)
       case "clearCarouselSchedule":
@@ -215,39 +297,35 @@ import WidgetKit
     put("capturedDateText", defaults.string(forKey: "capturedDateText"))
     put("locationText", defaults.string(forKey: "locationText"))
 
-    // WidgetKit advances future entries without launching Flutter. Resolve
-    // the same shared plan here when the app is opened later. A plan from a
-    // previous day is ignored: its entries are all in the past, and resolving
-    // them would report yesterday's last photo as the current one.
+    // **旧的 `iosCarouselPlan` 路径已删除。**
+    //
+    // 那是重写之前（2026-08-17 初始提交）的第二写者留下的计划表。它是个陷阱：
+    // 表里的最后一条永远胜出——实测 17:00 之后任何时刻都解析出 item 4406，
+    // 于是不管小组件正在显示哪张照片，首页文案都被覆盖成 4406 的
+    // 「被稳稳抱在怀里的安全感，比什么都重要」。照片来自新源、文案来自旧表，
+    // 两者必然错配。
+    //
+    // 现在与小组件走**同一条规则、同一份数据**：共享状态里 `date_ms <= now`
+    // 的最后一条。照片与文案取自**同一条目**，错配在结构上就不可能发生。
+    // 安卓原生读的也是这份状态，三端因此同源。
     if mode == "carousel",
-       defaults.string(forKey: "iosCarouselPlanDay") == Self.localDay(),
-       let rawPlan = defaults.string(forKey: "iosCarouselPlan"),
-       let data = rawPlan.data(using: .utf8),
-       let plan = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-      let now = Date().timeIntervalSince1970 * 1000
-      let due = plan.compactMap { item -> [String: Any]? in
-        guard let at = (item["displayAtMillis"] as? NSNumber)?.doubleValue, at <= now else { return nil }
-        return item
-      }.max { (left, right) in
-        ((left["displayAtMillis"] as? NSNumber)?.doubleValue ?? 0) <
-          ((right["displayAtMillis"] as? NSNumber)?.doubleValue ?? 0)
-      }
-      if let due,
-         let id = (due["itemId"] as? NSNumber)?.intValue,
-         let path = (due["photoPath"] as? String) ?? (due["originalPhotoPath"] as? String),
-         FileManager.default.fileExists(atPath: path) {
-        state["recommendationId"] = id
-        state["originalPhotoPath"] = path
-        put("portraitPath", due["portraitPath"] as? String)
-        put("squarePath", due["squarePath"] as? String)
-        put("largeSquarePath", due["largeSquarePath"] as? String)
-        put("date", due["date"] as? String)
-        put("captionZh", due["captionZh"] as? String)
-        put("captionEn", due["captionEn"] as? String)
-        put("capturedDateText", due["capturedDateText"] as? String)
-        put("locationText", due["locationText"] as? String)
-        state["updatedAtMillis"] = Int((due["displayAtMillis"] as? NSNumber)?.doubleValue ?? now)
-      }
+       let shared = BloomSharedState.load(),
+       let due = BloomCarouselRule.currentEntry(
+         BloomSharedState.timelineEntries(shared),
+         nowMillis: Date().timeIntervalSince1970 * 1000
+       ) {
+      state["recommendationId"] = (due["item_id"] as? NSNumber)?.intValue ?? 0
+      put("originalPhotoPath", due["original_path"] as? String)
+      put("portraitPath", due["portrait_path"] as? String)
+      put("squarePath", due["square_path"] as? String)
+      put("largeSquarePath", due["large_square_path"] as? String)
+      put("date", due["date"] as? String)
+      // 文案与照片出自同一条目——这是本次修复的核心。
+      put("captionZh", due["caption_zh"] as? String)
+      put("captionEn", due["caption_en"] as? String)
+      put("capturedDateText", due["captured_date_text"] as? String)
+      put("locationText", due["location_text"] as? String)
+      state["updatedAtMillis"] = Int((due["date_ms"] as? NSNumber)?.doubleValue ?? 0)
     }
     guard (state["recommendationId"] as? Int ?? 0) > 0 else { return nil }
     return state
