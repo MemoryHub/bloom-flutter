@@ -417,11 +417,13 @@ class _PresenceDot extends StatelessWidget {
 ///
 /// Two rules make the two `target`s behave differently, and they are the whole
 /// point of this screen:
-/// - the frame (`eink`) is **read-only** for the display mode: its firmware
-///   cannot read the server's `mode` yet, and a save omits `mode` entirely (the
-///   server keeps the stored value) and never writes the local mirror;
+/// - the frame (`eink`) **can** now pick its display mode: the server selects
+///   the ordering from `frame_device_settings.mode` and the firmware merely
+///   follows it, so switching modes needs no reflash. A frame save therefore
+///   carries `mode`, exactly like a phone save — but it still never writes the
+///   local mirror, which belongs to this phone's home-screen widget;
 /// - this phone (`mobile`) owns the local mirror, so only its saves call
-///   `cacheLocal`, and only its request carries `mode`.
+///   `cacheLocal`.
 class BloomDeviceDetailPage extends StatefulWidget {
   const BloomDeviceDetailPage({
     super.key,
@@ -555,6 +557,23 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
   /// own `bloom.display_mode`.
   bool _modeTouched = false;
 
+  /// 这台设备当前生效的来源。null 表示"还不知道"，用打开页面时的值兜底。
+  /// 服务器回显后会被覆盖 —— 与 _serverMode 同一个套路。
+  List<BloomPhotoSource>? _sources;
+
+  /// 用户这次会话里动过来源没有。与 _modeTouched 一字不差的同一规矩：
+  /// 没动过就不发送这个键，服务器保持已存的值。
+  bool _sourcesTouched = false;
+
+  /// 用户自己的轮播作息，在切到「推荐」之前记下来。
+  ///
+  /// 服务器的 mode 与作息是【正交】的：四个字段只有一个存储位，切到推荐时
+  /// 必须把固定作息（06:00/22:00/12h）写进去，否则推荐会用一个不相干的作息
+  /// 去跑。代价是【用户原来的轮播作息被覆盖】。所以切过去之前先记一份，
+  /// 切回来时原样还回去 —— 否则用户只是去看了一眼推荐，回来发现自己的
+  /// 作息没了。
+  BloomDisplaySettings? _carouselSchedule;
+
   bool _saving = false;
 
   /// Set by any unsaved edit, and by a completed save: an in-flight server read
@@ -680,8 +699,19 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
       target: _target,
     );
     if (!mounted || remote == null) return;
+    // 取回用户自己的轮播作息（在 setState 之外 await —— 回调不是 async）。
+    // 持久化的，所以【返回首页再进来也还在】；内存版会在页面被销毁时丢掉，
+    // 用户第二次切换就还原不回去了。**按 target 分开取**：手机与相框各有各的。
+    final stashedCarouselSchedule = await widget.preferences
+        .recallCarouselSchedule(target: _target);
+    if (!mounted) return;
     setState(() {
       _serverMode = remote.mode;
+      // ⚠️ 用户已经动过来源就不要被这次（可能更早发出的）读回覆盖 —— 与
+      //    `_edited` 挡住 `_draft` 是同一条规矩。否则用户勾完来源、服务器读
+      //    刚好返回，勾选会被悄悄抹掉。
+      if (!_sourcesTouched) _sources = remote.sources;
+      _carouselSchedule = stashedCarouselSchedule;
       if (_edited || _savedOnce) return;
       _draft = remote;
     });
@@ -717,7 +747,15 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
         credentials: credentials,
         callerDeviceId: callerDeviceId,
         target: _target,
-        mode: _ownsLocalMirror && _modeTouched ? draft.mode : null,
+        // 带不带 mode 只看用户有没有动过它，与 target 无关 —— 相框同样需要
+        // 把自己的选择发给服务器。（本地镜像是另一回事，见下面
+        // _ownsLocalMirror 的分支：只有手机才写镜像。）
+        mode: _modeTouched ? draft.mode : null,
+        // 与 mode 同一规矩：没碰过就不带这个键，服务器保持已存的值。
+        // 空列表也不能发 —— 见 _toggleSource 的注释。
+        sources: _sourcesTouched && _displaySources.isNotEmpty
+            ? _displaySources
+            : null,
       );
       final saved = _fromServer(result.settings, draft);
       // 2. Only after the server accepted, and only for the record the mirror
@@ -756,6 +794,18 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
       setState(() {
         _draft = saved;
         _serverMode = saved.mode;
+        _sources = saved.sources;
+        // 用户自己在轮播上调过之后，那份"自己的作息"要跟着更新，
+        // 否则下次切推荐会把旧值记下来、切回来还原成过期的设置。
+        if (saved.mode == BloomDisplayMode.carousel) {
+          _carouselSchedule = saved;
+          unawaited(
+            widget.preferences.rememberCarouselSchedule(
+              saved,
+              target: _target,
+            ),
+          );
+        }
         if (_modeTouched) _mirrorMode = saved.mode;
         _edited = false;
         _savedOnce = true;
@@ -764,6 +814,9 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
         // cadence-only request, which is the same "only send a mode somebody
         // chose" rule the save path has always had.
         _modeTouched = false;
+        // 来源同一条规矩：这次已经送出去了，就回到"用户没碰过"。
+        // 不清掉的话，推荐模式下「保存」按钮会因为 `_sourcesTouched` 永远亮着。
+        _sourcesTouched = false;
       });
       _showToast(_successMessage(result));
       unawaited(HapticFeedback.mediumImpact());
@@ -795,6 +848,7 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
     // for `eink` the untouched stored value. A payload without a mode keeps the
     // fallback (`copyWith` treats `null` as "leave it").
     mode: bloomModeFromWire(remote.mode),
+    sources: BloomDisplaySettings.sourcesFromWire(remote.sources),
     intervalMinutes: remote.intervalMinutes,
     activeStart: remote.activeStart,
     activeEnd: remote.activeEnd,
@@ -847,12 +901,74 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
   /// [_modeTouched] is still what tells the save to include `mode` in the
   /// request; a cadence-only save still omits it and leaves the phone's own
   /// value alone.
+  /// 打开页面时该显示的来源：服务器回显优先，否则用打开时的值。
+  List<BloomPhotoSource> get _displaySources =>
+      _sources ?? widget.settings.sources;
+
+  void _toggleSource(BloomPhotoSource source) {
+    // ⚠️ 界面只放出 BloomPhotoSource.implemented。art / news 还没有取片能力，
+    //    给它们一个能勾的框，用户设完相框毫无变化 —— 就是"设了没反应"。
+    if (!BloomPhotoSource.implemented.contains(source)) return;
+    final next = List<BloomPhotoSource>.from(_displaySources);
+    if (next.contains(source)) {
+      // 至少留一个：全不选等于没有来源，相框就没有候选照片可取了。
+      // 服务器的空列表语义是"回落到 personal"，那会让这次点击看起来
+      // 什么都没发生 —— 不如直接不允许取消最后一个。
+      if (next.length <= 1) return;
+      next.remove(source);
+    } else {
+      next.add(source);
+    }
+    setState(() {
+      _sourcesTouched = true;
+      _sources = next;
+      // 「保存」按钮的显示条件里有 `_sourcesTouched`：**推荐模式下也必须有办法
+      // 提交来源**。推荐模式没有作息表单，原来那个按钮是 carousel-only，于是
+      // 在推荐模式里点来源只改草稿、永远送不出去 —— 就是"点了没反应"。
+      _edited = true;
+    });
+    // 只改草稿，不提交 —— 与「更换频率」「生效时间」一样，等页面底部
+    // 那个统一的「保存」按钮。mode 是开关所以立刻提交，来源不是。
+    unawaited(HapticFeedback.selectionClick());
+  }
+
   void _selectMode(BloomDisplayMode mode) {
     if (_saving || _draft.mode == mode) return;
     setState(() {
       _edited = true;
       _modeTouched = true;
-      _draft = _draft.copyWith(mode: mode);
+      if (mode == BloomDisplayMode.recommendation) {
+        // 先把用户自己的轮播作息记下来（内存 + 磁盘），再填固定值。
+        // ⚠️ 按 target 记：手机和相框各有各的作息，共用一组 key 会互相覆盖。
+        _carouselSchedule = _draft;
+        unawaited(
+          widget.preferences.rememberCarouselSchedule(
+            _draft,
+            target: _target,
+          ),
+        );
+        // 推荐模式的作息是固定的：把三个值【真的填进草稿】，随这次保存一起
+        // 提交。服务器对四个参数零特例，不会"因为推荐就忽略间隔"，
+        // 所以不填就等于用一个不相干的作息去跑推荐。
+        _draft = _draft.copyWith(
+          mode: mode,
+          activeStart: recommendActiveStart,
+          activeEnd: recommendActiveEnd,
+          intervalMinutes: recommendIntervalMinutes,
+        );
+      } else {
+        // 切回轮播：把用户自己那份作息原样还回去，而不是留着推荐的固定值。
+        // 只改 mode 的话，用户会看到自己的设置被"看一眼推荐"这件事改掉了。
+        final own = _carouselSchedule;
+        _draft = own == null
+            ? _draft.copyWith(mode: mode)
+            : _draft.copyWith(
+                mode: mode,
+                activeStart: own.activeStart,
+                activeEnd: own.activeEnd,
+                intervalMinutes: own.intervalMinutes,
+              );
+      }
     });
     unawaited(HapticFeedback.selectionClick());
     unawaited(_save());
@@ -1128,10 +1244,14 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
     // The floating bar is 56 tall and 6 below the status bar; the body has to
     // start under it.
     final barHeight = topInset + 68.0;
-    // The floating save belongs to the carousel form only: in 推荐 there is
-    // nothing on this page to save, so a save button would be a button that does
-    // nothing. It also disappears with the master switch.
-    final showSave = _widgetEnabled && carousel;
+    // The floating save belongs to the forms on this page, and those differ by mode:
+    // 轮播 has the cadence form, 推荐 has none — but **both** have the「照片来源」
+    // card, which is a form too. Gating this on `carousel` alone is what made 来源
+    // impossible to save in 推荐：点一下只改草稿，而页面上根本没有提交它的按钮。
+    //
+    // 推荐模式下没动过任何东西时仍然不显示按钮（那才是"一个什么都不做的按钮"）；
+    // 碰过来源它就会出现。它也随总开关一起消失。
+    final showSave = _widgetEnabled && (carousel || _sourcesTouched);
     final toast = _toast;
     return Scaffold(
       // The bar is glass, so the content has to run *under* it: that is what the
@@ -1168,6 +1288,10 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
                   // ("这些文字完全不要了"), so what is left is only what can be
                   // changed or read.
                   if (carousel) _cadenceCard() else _RecommendationCard(),
+                  _SourcesCard(
+                    selected: _displaySources,
+                    onToggle: _saving ? null : _toggleSource,
+                  ),
                   // 后台保活自检：**这台手机自己的事**，所以只在本机（手机小组件）
                   // 的详情页出现，相框上没有。iOS 上原生返回空列表，卡片整个不渲染。
                   if (widget.device.isLocal) const BloomKeepAliveCard(),
@@ -1233,8 +1357,9 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
               Center(
                 child: _ModePill(
                   carousel: carousel,
-                  onChanged:
-                      _saving || widget.device.isFrame ? null : _selectMode,
+                  // 相框现在也能改模式：服务器按 frame_device_settings.mode
+                  // 选排序方式，固件只是照做，改模式不需要重烧固件。
+                  onChanged: _saving ? null : _selectMode,
                 ),
               ),
             Row(
@@ -1381,8 +1506,9 @@ class _ModePill extends StatelessWidget {
 
   final bool carousel;
 
-  /// Null while saving, and null for the frame (whose firmware cannot read the
-  /// server's `mode` yet, so the pill is a read-out rather than a control there).
+  /// Null while saving. It is a real control for both targets now: the frame's
+  /// mode used to be a read-out because its firmware could not read the server's
+  /// `mode`, which is no longer true.
   final ValueChanged<BloomDisplayMode>? onChanged;
 
   @override
@@ -1557,6 +1683,99 @@ class _GlassAction extends StatelessWidget {
 /// 产品的角度，给观众看的角度"). The server picks one photo a day
 /// (`frame_daily_recommendation` is keyed by date); the app merely checks
 /// whether it changed.
+/// 推荐模式一天醒来几次 —— 由固定作息算出，供文案使用。
+///
+/// 单独放一个 getter 而不是在文案里写死数字：数字和作息必须永远一致，
+/// 否则改了间隔而忘了改文案，界面就会给出错的一天几张。
+int get recommendPhotosPerDay => BloomDisplaySettings(
+  intervalMinutes: recommendIntervalMinutes,
+  activeStart: recommendActiveStart,
+  activeEnd: recommendActiveEnd,
+).expectedDailyItems;
+
+/// 照片来源。
+///
+/// ⚠️ 只列出 BloomPhotoSource.implemented —— 服务器登记了四个名字，但只有
+/// personal 真正取得出照片。给还没实现的来源一个能勾的框，用户设完相框
+/// 毫无变化，就是"设了没反应"。等 art 真能取片了，把它加进 implemented，
+/// 这里自动多一项，界面代码一个字都不用改。
+class _SourcesCard extends StatelessWidget {
+  const _SourcesCard({required this.selected, required this.onToggle});
+
+  final List<BloomPhotoSource> selected;
+
+  /// Null while saving.
+  final ValueChanged<BloomPhotoSource>? onToggle;
+
+  @override
+  Widget build(BuildContext context) => BloomPanel(
+    lifted: true,
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('照片来源', style: BloomType.sectionTitle),
+        const SizedBox(height: 4),
+        for (final source in BloomPhotoSource.implemented)
+          _SourceRow(
+            key: ValueKey('bloom-source-${source.wire}'),
+            source: source,
+            checked: selected.contains(source),
+            // 只剩这一个时不能再取消 —— 全不选就没有来源了。
+            // 把 onTap 置空，行会呈现为不可点，比"点了没反应"清楚。
+            onTap: onToggle == null || (selected.length <= 1 && selected.contains(source))
+                ? null
+                : () => onToggle!(source),
+          ),
+      ],
+    ),
+  );
+}
+
+class _SourceRow extends StatelessWidget {
+  const _SourceRow({
+    super.key,
+    required this.source,
+    required this.checked,
+    required this.onTap,
+  });
+
+  final BloomPhotoSource source;
+  final bool checked;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) => InkWell(
+    onTap: onTap,
+    borderRadius: BorderRadius.circular(12),
+    child: Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Row(
+        children: [
+          // 用方框而不是圆圈：这是一个【多选】，圆圈看起来像单选。
+          // 颜色用 accent（#8FA99C）而不是 accentDeep（#2C3A34）——
+          // 后者和底色几乎一样，选中态看上去像被禁用了。
+          Icon(
+            checked
+                ? Icons.check_box_rounded
+                : Icons.check_box_outline_blank_rounded,
+            size: 22,
+            color: checked ? BloomInk.accent : BloomInk.textFaint,
+          ),
+          const SizedBox(width: 12),
+          Text(
+            source.label,
+            style: TextStyle(
+              // 未选中的文字压暗，选中/未选中的区别不只靠一个小图标。
+              color: checked ? BloomInk.text : BloomInk.textFaint,
+              fontSize: 16,
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
 class _RecommendationCard extends StatelessWidget {
   const _RecommendationCard();
 
@@ -1578,9 +1797,11 @@ class _RecommendationCard extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 12),
-        const Text(
-          '每天一张。把你带回那年今天，你当时也在场的那个瞬间。',
-          style: TextStyle(
+        // 张数从固定作息【算出来】，不写死：卡片说"每天一张"而作息是 12 小时
+        // 的话，界面就在骗人。改 recommendIntervalMinutes 时这里会跟着变。
+        Text(
+          '一天$recommendPhotosPerDay张。把你带回那年今天，你当时也在场的那个瞬间。',
+          style: const TextStyle(
             color: BloomInk.text,
             fontSize: 16,
             height: 1.45,

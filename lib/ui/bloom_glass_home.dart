@@ -591,12 +591,15 @@ class BloomGlassHome extends StatelessWidget {
     final pages = [
       _PhotoPage(
         // The switch being off freezes this phone's card, so a "下次更新" under it
-        // would be a promise the app is not keeping; and the label describes this
-        // phone's own plan, so it goes away with it.
-        nextSlotText:
-            widgetEnabled && settings.mode == BloomDisplayMode.carousel
-                ? nextSlotText(settings, nextSlotAt)
-                : null,
+        // would be a promise the app is not keeping.
+        //
+        // ⚠️ 这里原来还写死了 `settings.mode == carousel`，于是【推荐模式永远
+        //    没有这一行】—— 明明 main.dart 已经为推荐模式算好了下一格
+        //    （推荐没有服务端计划戳，它的节奏由固定作息给出），却在这一层被
+        //    丢掉。两种模式都有下一次更新，这个条件本身就是错的。
+        nextSlotText: widgetEnabled
+            ? nextSlotText(settings, nextSlotAt)
+            : null,
         originalPhotoPath: originalPhotoPath,
         content: content,
         date: date,

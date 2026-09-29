@@ -44,6 +44,7 @@ class DailyContentRepository {
     final manifest = await api.daily(credentials, target: 'mobile');
     final dir = await _dir();
     final metadataFile = File('${dir.path}/daily.json');
+
     String? previousEtag;
     if (await metadataFile.exists()) {
       try {
@@ -52,6 +53,49 @@ class DailyContentRepository {
                     as Map<String, dynamic>)['photo_etag']
                 as String?;
       } catch (_) {}
+    }
+
+    // ⭐ 这一版推荐的三张图都已经在本地了，就【不要再下载原图、再渲染一次】。
+    //
+    // sync() 原来每次都会：拉 /daily -> 下载原图（可能好几 MB）-> 在手机上把
+    // 它渲染成 portrait / square / largeSquare 三种尺寸。这三步是纯本机 CPU 活，
+    // 一次要几十秒到几分钟。
+    //
+    // 而设置保存之后也要重跑一次 sync（好让首页文案与小组件跟上），于是
+    // "切一下模式"就变成一次全量重下重渲染 —— 用户看到的就是等好几分钟。
+    // 版本号是图片的一部分，所以版本没变就没有任何东西需要重做。
+    final alreadyRendered = <String>[
+      'portrait',
+      'square',
+      'largeSquare',
+    ].every(
+      (family) =>
+          _versionedImage(dir, family, manifest.recommendationId).existsSync(),
+    );
+    if (alreadyRendered) {
+      // 元数据仍然补写一次：它很便宜，而且能修好"图在但 daily.json 丢了"的状态。
+      await metadataFile.writeAsString(
+        jsonEncode({
+          // ⚠️ photo_etag 必须一起写。漏掉它，下一次 sync 就没有 ETag 可用，
+          //    只能无条件重下原图 —— 正好抵消掉这个跳过分支省下来的时间。
+          'photo_etag': previousEtag,
+          'date': manifest.date,
+          'recommendation_id': manifest.recommendationId,
+          'caption_zh': manifest.captionZh,
+          'caption_en': manifest.captionEn,
+          'captured_date_text': manifest.capturedDateText,
+          'location_text': manifest.locationText,
+          'photo_orientation': manifest.photoOrientation,
+        }),
+        flush: true,
+      );
+      // ⭐ 和轮播引擎 tick 之后一样，必须通知原生小组件重载。
+      //    少了这一句，App 里的文案已经换成新的、桌面小组件却还是上一张，
+      //    App 的照片又取自小组件状态 —— 于是"文案新、照片旧"。
+      try {
+        await WidgetBridge().refresh();
+      } catch (_) {}
+      return manifest;
     }
     var response = await api.originalPhoto(credentials, etag: previousEtag);
     final photoFile = File('${dir.path}/original.photo');
@@ -90,6 +134,11 @@ class DailyContentRepository {
       }),
       flush: true,
     );
+    // ⭐ 同上：推荐这条路原来【从不通知小组件重载】（轮播引擎每次都通知），
+    //    所以推荐模式下桌面小组件会一直停在旧图上。
+    try {
+      await WidgetBridge().refresh();
+    } catch (_) {}
     return manifest;
   }
 
@@ -99,6 +148,15 @@ class DailyContentRepository {
   /// 「下一格」——那一整套正是历史上文案空白、两端各显示一张的根源，已整体
   /// 删除。现在这里只做两件事：手动「下一张」时先让服务端把当前格后移，
   /// 然后跑一次 tick。
+  ///
+  /// ⭐ **关键路径与预取是分开的。** [CarouselEngine.tickCurrent] 只备「此刻该
+  /// 显示的那一格」，落盘并通知原生之后立刻返回；另外 4 格由
+  /// [CarouselEngine.prefetchAhead] 单独一轮去备。前台（界面）路径不 await 预取
+  /// —— 这正是首屏出图从 69 秒降到十几秒的原因：原来 5 张备齐才返回，其中一格
+  /// 超时 27 秒、替补又 15 秒，全算在了界面上。
+  ///
+  /// 后台路径仍然等预取做完：那里没有界面，而时间线必须烘焙完整 —— 预取失败
+  /// 留的洞会让小组件在 App 被杀之后卡死在同一张照片上。
   Future<DailyContent> syncCarousel(
     DeviceCredentials credentials,
     BloomDisplaySettings settings, {
@@ -114,14 +172,41 @@ class DailyContentRepository {
       await _sweepTempFiles(await _dir());
     } catch (_) {}
     final engine = CarouselEngine(api: api);
-    final outcome = await engine.tick(
+    final writer = foreground ? 'app-foreground' : 'app-background';
+    final outcome = await engine.tickCurrent(
       credentials: credentials,
       settings: settings,
-      writer: foreground ? 'app-foreground' : 'app-background',
+      writer: writer,
     );
     debugPrint('[BloomSync] $outcome');
-    // 清理必须在 tick **之后**：状态此时才落盘，`alive` 集合才是权威的。
-    await _sweepOrphanPhotos(await _dir(), settings);
+
+    // 预取与「清理无主照片」必须绑在一起、且都在当前格提交之后：
+    // 清理删的是「权威状态里不存在的照片文件」，而预取正在下载的那些文件在它
+    // 提交之前恰好不在状态里 —— 两者并行会把刚下好的图删掉，时间线上留下一个洞。
+    Future<void> rest() async {
+      final plan = outcome.plan;
+      if (plan != null) {
+        await engine.prefetchAhead(
+          credentials: credentials,
+          settings: settings,
+          writer: writer,
+          plan: plan,
+        );
+      }
+      try {
+        await _sweepOrphanPhotos(await _dir(), settings);
+      } catch (error) {
+        debugPrint('[BloomSync] orphan sweep failed: $error');
+      }
+    }
+
+    if (foreground) {
+      // 界面路径：内容已经可以读了，把控制权立刻交回去，剩下的在后台跑。
+      unawaited(rest());
+    } else {
+      await rest();
+    }
+
     final content = await cachedContent();
     if (content == null) {
       throw StateError('轮播内容不可用: $outcome');

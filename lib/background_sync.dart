@@ -109,6 +109,13 @@ void _backgroundCallback() {
       final settings = await DisplayPreferences().read();
       debugPrint('[BloomSync] mode=${settings.mode.name}');
       stage = 'sync-content';
+      // ⚠️ 推荐【不能】改走轮播引擎。
+      //
+      // 接口是一套（同一批端点、同一份设置），但推荐有自己的**推荐算法** ——
+      // 由服务器实现（按天出推荐，不是把轮播计划的间隔调慢）。曾经试过让
+      // 推荐复用 syncCarousel，结果是: 推荐的节奏被换成"作息 + 间隔"的格子，
+      // 当前格 12 小时不变 → 照片不换；切回轮播时作息又被推荐值覆盖 →
+      // 变成半天一次。所以两条路必须各自保留。
       final daily =
           settings.mode == BloomDisplayMode.carousel
               ? await repository.syncCarousel(credentials, settings)
@@ -133,7 +140,7 @@ void _backgroundCallback() {
           mode:
               settings.mode == BloomDisplayMode.carousel
                   ? 'carousel'
-                  : 'recommendation',
+                  : 'recommend',
         );
       }
       debugPrint(

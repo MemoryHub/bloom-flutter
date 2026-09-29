@@ -154,11 +154,26 @@ class _BloomHomePageState extends State<BloomHomePage>
     // it every 20 s while the page is alive removes the gap by construction.
     _followNative = Timer.periodic(const Duration(seconds: 20), (_) async {
       if (!mounted || _loading) return;
-      await DailyContentRepository(api: _api).drainWidgetTimelineLog();
-      final native = await DailyContentRepository(api: _api).nativeContent();
+      final repository = DailyContentRepository(api: _api);
+      await repository.drainWidgetTimelineLog();
+      final native = await repository.nativeContent();
       if (!mounted || native == null) return;
       if (native.recommendationId == _content?.recommendationId) return;
-      setState(() => _content = native);
+      // ⚠️ **照片要跟着动，不能只换文案。** 原来这里只 setState 了 `_content`
+      //    （文案），照片仍是上一张 —— 而 [Repository.photoPathFor] 按 id 取
+      //    路径这件事本来就是为「照片与文案同源」做的。只换文案正好把这条
+      //    保证拆掉：卡片会显示 A 的图配 B 的字。
+      //    冷启动时这个定时器以前被 `_loading` 挡着（一轮 sync 要 60 秒），
+      //    现在本机那张会先被画上去，`_loading` 提前转 false，它就会真的跑 ——
+      //    所以这里必须把路径一起换掉。
+      final path =
+          await repository.photoPathFor(native.recommendationId) ??
+          await repository.originalPhotoPath();
+      if (!mounted) return;
+      setState(() {
+        _content = native;
+        if (path != null) _originalPhotoPath = path;
+      });
     });
     WidgetsBinding.instance.addObserver(this);
     _load();
@@ -213,7 +228,12 @@ class _BloomHomePageState extends State<BloomHomePage>
   /// when the file is missing, the slot is in the past, or the write raced the
   /// read — it is no longer the mechanism.
   Future<void> _armNextSlotWake() async {
-    final at = await DailyContentRepository(api: _api).nextSlotAtMillis();
+    // ⚠️ 推荐的下一格**不在** `next_slot_at_ms` 里（那是轮播的戳，推荐路径不写）。
+    //    在推荐模式下读它只会拿到上一轮轮播留下的过期值，于是这次唤醒要么永远
+    //    不响、要么在错误的时刻响。两边用同一个来源：推荐按固定作息算。
+    final at = _displaySettings.mode == BloomDisplayMode.recommendation
+        ? _nextRecommendSlotMs(_displaySettings)
+        : await DailyContentRepository(api: _api).nextSlotAtMillis();
     if (!mounted || at == null) return;
     final delay = at - DateTime.now().millisecondsSinceEpoch;
     if (delay <= 0) return;
@@ -225,6 +245,39 @@ class _BloomHomePageState extends State<BloomHomePage>
     });
   }
 
+  /// 推荐模式的下一次更新时间。
+  ///
+  /// 推荐【没有服务端计划戳】—— 那是轮播的概念。它的节奏由固定作息给出:
+  /// 在 06:00–22:00 之间每 12 小时落一格，所以是 06:00 与 18:00，窗口结束
+  /// 之后就是明天 06:00。这样推荐模式下首页也有「下次更新」。
+  static int? _nextRecommendSlotMs(BloomDisplaySettings settings) {
+    (int, int) parseClock(String raw, int fallbackHour, int fallbackMinute) {
+      final bits = raw.split(':');
+      return (
+        int.tryParse(bits.first) ?? fallbackHour,
+        bits.length > 1
+            ? (int.tryParse(bits.last) ?? fallbackMinute)
+            : fallbackMinute,
+      );
+    }
+
+    final now = DateTime.now();
+    final (startHour, startMinute) = parseClock(settings.activeStart, 6, 0);
+    final (endHour, endMinute) = parseClock(settings.activeEnd, 22, 0);
+    final start = DateTime(now.year, now.month, now.day, startHour, startMinute);
+    final end = DateTime(now.year, now.month, now.day, endHour, endMinute);
+    final step = Duration(minutes: settings.intervalMinutes);
+    if (step.inMinutes <= 0) return null;
+    var at = start;
+    for (var i = 0; i < 2000 && !at.isAfter(now); i++) {
+      at = at.add(step);
+    }
+    if (at.isAfter(end)) {
+      return start.add(const Duration(days: 1)).millisecondsSinceEpoch;
+    }
+    return at.millisecondsSinceEpoch;
+  }
+
   @override
   void dispose() {
     _followNative?.cancel();
@@ -234,6 +287,90 @@ class _BloomHomePageState extends State<BloomHomePage>
     _pairingPoll?.cancel();
     _messageTimer?.cancel();
     super.dispose();
+  }
+
+  /// **先把本机已经有的那张画上去，再谈联网。**
+  ///
+  /// 冷启动时首页原来要等 `/status` 回来、再等整轮 sync（下载 + 渲染）走完才
+  /// 拿到 `_originalPhotoPath`，所以卡片一直停在骨架屏 —— 而那张照片**早就在
+  /// 本机了**。两个来源，按可信度排序：
+  ///
+  /// 1. 原生共享状态（`carousel-state.json` / `bloom_widget` 偏好）：后台同步或
+  ///    闹钟可能已经把当前项推进到下一格，它比 Flutter 自己的缓存新；
+  /// 2. Flutter 的 `daily.json` + 版本化图片。
+  ///
+  /// ⚠️ **照片路径必须走 [DailyContentRepository.photoPathFor]（按 id 取），
+  ///    不能用 [DailyContentRepository.originalPhotoPath]。** 后者是推荐模式的
+  ///    可变文件 `original.photo`；轮播模式写的是
+  ///    `carousel-original-<id>.photo`，于是它在轮播下返回 null。下面那条
+  ///    "先显示缓存"的老路正是这么写的，所以在轮播模式下**等于没有**：
+  ///    实测 15:07:03 启动、15:07:06 计划就回来了，`[BloomUI] show` 却拖到
+  ///    15:08:12 —— 69 秒全花在下载与渲染上，只为显示一张本机已有的照片。
+  ///
+  /// 画完就把 `_loading` 转 false 并置 `_paired`：前者让页面离开骨架屏，后者
+  /// 让它离开"正在准备设备标识…"。两个都只是"我们已经证明过自己在显示照片"
+  /// 的推论 —— 随后真实的 `/status` 仍然可以把它们改回去（未配对、无素材）。
+  Future<void> _paintLocalContent() async {
+    final repository = DailyContentRepository(api: _api);
+    CachedWidgetImage? portrait;
+    DailyContent? content;
+    String? photoPath;
+    try {
+      final native = await WidgetBridge().readCurrentState();
+      if (native != null) {
+        final path =
+            await repository.photoPathFor(native.recommendationId) ??
+            native.originalPhotoPath ??
+            native.portraitPath;
+        if (path != null && await File(path).exists()) {
+          photoPath = path;
+          content = DailyContent(
+            date: native.date ?? '',
+            recommendationId: native.recommendationId,
+            captionZh: native.captionZh,
+            captionEn: native.captionEn,
+            capturedDateText: native.capturedDateText,
+            locationText: native.locationText,
+          );
+          portrait = CachedWidgetImage(
+            path: path,
+            orientation: 'portrait',
+            date: native.date,
+            recommendationId: native.recommendationId,
+          );
+        }
+      }
+    } catch (_) {
+      // 原生桥不可用（widget 测试、或平台还没挂上）：继续看 Flutter 缓存。
+    }
+    if (photoPath == null) {
+      try {
+        final cached = await repository.cachedContent();
+        final path =
+            await repository.photoPathFor(cached?.recommendationId) ??
+            await repository.originalPhotoPath();
+        if (cached != null && path != null) {
+          photoPath = path;
+          content = cached;
+          portrait = await repository.cached('portrait');
+        }
+      } catch (_) {
+        // 什么都没有（第一次安装 / 缓存被清）：交给下面正常的联网路径。
+      }
+    }
+    if (photoPath == null || !mounted) return;
+    debugPrint(
+      '[BloomUI] local-first show id=${content?.recommendationId} '
+      'photo=$photoPath',
+    );
+    setState(() {
+      _paired = true;
+      _originalPhotoPath = photoPath;
+      _content = content;
+      _portrait = portrait ?? _portrait;
+      _date = content?.date ?? _date;
+      _loading = false;
+    });
   }
 
   Future<void> _load({bool showSpinner = true}) async {
@@ -295,6 +432,35 @@ class _BloomHomePageState extends State<BloomHomePage>
         return;
       }
       if (mounted && !_widgetEnabled) setState(() => _widgetEnabled = true);
+      // ⭐ **推荐模式的「下次更新」一帧都不要等网络。**
+      //
+      // 它的节奏由固定作息唯一决定（06:00–22:00 / 12 小时 → 06:00、18:00），
+      // 本机就能算；而轮播那一份要等计划落盘才有 `next_slot_at_ms`。
+      // 放在 `/status` 之前算，冷启动和"保存过一次设置"两条路就都走同一个来源。
+      //
+      // ⚠️ 原来这个值只在 `_resyncCarouselAfterSave` 里算 —— 于是推荐模式下的
+      //    「下次更新」**只有保存过设置之后才会出现**，冷启动永远没有那一行。
+      //    下面同步路径里那一处赋值只是复核（设置可能刚被改过），不是唯一来源。
+      final localSettings = await displaySettingsFuture;
+      if (localSettings.mode == BloomDisplayMode.recommendation && mounted) {
+        setState(() => _nextSlotAt = _nextRecommendSlotMs(localSettings));
+      }
+      // ⭐ **本机已有的那张，先画上去 —— 在任何网络请求之前。**
+      //
+      // 这一段原来是缺的：下面那条"先显示缓存"的路在轮播模式下取不到路径
+      // （原因见 [_paintLocalContent]），于是冷启动要等整轮 sync 走完才有照片。
+      // 实测：15:07:03 启动，`/status` + `/plan` 在 15:07:06 就回来了，但
+      // `[BloomUI] show` 直到 15:08:12 —— 69 秒，全花在下载与渲染上，
+      // 而屏幕上的照片其实早就在本机。
+      //
+      // ⚠️ **必须有界。** 这是一次平台通道调用 + 几次本机文件读，正常在毫秒级；
+      //    但通道没人应答时（widget 测试里就是这样，真机上一个卡住的平台调用
+      //    同理）它会永远不返回，而它一旦不返回，`_load` 就永远走不到 `/status`
+      //    —— 首屏反而更慢。600ms 足够，超时就当"本机没有"，照常往下走。
+      await _paintLocalContent().timeout(
+        const Duration(milliseconds: 600),
+        onTimeout: () => debugPrint('[BloomUI] local-first paint timed out'),
+      );
       DeviceStatus? status;
       PairingInfo? pairing;
       // **Always probe the server first, regardless of local cache state.**
@@ -446,6 +612,8 @@ class _BloomHomePageState extends State<BloomHomePage>
               // so this path catches it just as early.
               unawaited(_watchNextSlot(repository));
             }
+            // ⚠️ 推荐走它自己的算法路径，不与轮播共用引擎（见
+            //    background_sync.dart 的说明）。
             content =
                 displaySettings.mode == BloomDisplayMode.carousel
                     ? await repository.syncCarousel(
@@ -488,7 +656,7 @@ class _BloomHomePageState extends State<BloomHomePage>
           final expectedMode =
               displaySettings.mode == BloomDisplayMode.carousel
                   ? 'carousel'
-                  : 'recommendation';
+                  : 'recommend';
           final networkId = content?.recommendationId ?? 0;
           if (native != null &&
               nativePhotoExists &&
@@ -527,7 +695,16 @@ class _BloomHomePageState extends State<BloomHomePage>
               await repository.originalPhotoPath();
           // Read the slot stamp the same sync just wrote, so the label under the
           // card always belongs to the plan that is on screen.
-          nextSlotAt = await repository.nextSlotAtMillis();
+          //
+          // ⚠️ **推荐模式没有这个戳。** `next_slot_at_ms` 是轮播的概念（由引擎在
+          //    计划落盘时写进 daily.json），推荐路径从不写它，所以这里原来在推荐
+          //    模式下永远是 null —— 首页那行「下次更新」只在【保存过一次设置】
+          //    之后才出现（那条路会把 `_nextRecommendSlotMs` 塞进 `_nextSlotAt`）。
+          //    推荐的节奏由固定作息唯一决定（06:00–22:00 / 12 小时 → 06:00、18:00），
+          //    所以这里直接按作息算，冷启动和保存后走同一个来源。
+          nextSlotAt = displaySettings.mode == BloomDisplayMode.recommendation
+              ? _nextRecommendSlotMs(displaySettings)
+              : await repository.nextSlotAtMillis();
           debugPrint(
             '[BloomUI] show id=${content?.recommendationId} '
             'photo=${originalPhotoPath ?? 'none'} '
@@ -577,7 +754,7 @@ class _BloomHomePageState extends State<BloomHomePage>
               mode:
                   displaySettings.mode == BloomDisplayMode.carousel
                       ? 'carousel'
-                      : 'recommendation',
+                      : 'recommend',
             );
           }
         } else {
@@ -756,7 +933,56 @@ class _BloomHomePageState extends State<BloomHomePage>
   void _applySavedSettings(BloomDevice device, BloomDisplaySettings settings) {
     if (!mounted || !device.isLocal) return;
     setState(() => _displaySettings = settings);
+    // ⭐ 保存之后必须让取图链路【重跑一次】。
+    //
+    // 为什么: 服务器的 mode 与作息改完之后，「下一次更新时间」和「小组件该
+    // 显示哪张」都变了，但这两个东西【只在下一次 syncCarousel 落地时才更新】。
+    // 原来这里只 setState 了 _displaySettings —— 于是首页的「下次更新」文案、
+    // Android/iOS 小组件读到的共享状态，全都停在上一份计划上，
+    // 用户要【杀死 App 重进】才会好。这正是那个症状的根因。
+    unawaited(_resyncCarouselAfterSave(settings));
   }
+
+  /// 保存设置后立刻重跑一次 carousel 同步，并刷新首页的「下次更新」。
+  ///
+  /// 失败不能影响保存结果 —— 设置已经写进服务器了，重同步只是让界面和
+  /// 小组件跟上；拉不到就等下一次后台同步，不该弹错误。
+  Future<void> _resyncCarouselAfterSave(BloomDisplaySettings settings) async {
+    final credentials = _credentials;
+    if (credentials == null) return;
+    final repository = DailyContentRepository(api: _api);
+    try {
+      if (settings.mode == BloomDisplayMode.carousel) {
+        await repository.syncCarousel(
+          credentials,
+          settings,
+          // foreground: 用前台写入者身份，这样后台任务拿到的是最新计划，
+          // 也能顺带把 iOS 小组件要读的共享状态重写一遍。
+          foreground: true,
+        );
+        final at = await repository.nextSlotAtMillis();
+        if (!mounted) return;
+        setState(() => _nextSlotAt = at);
+        debugPrint('[BloomUI] resynced (carousel) after save: next=${at ?? 'none'}');
+      } else {
+        await repository.sync(credentials);
+        if (!mounted) return;
+        setState(() => _nextSlotAt = _nextRecommendSlotMs(settings));
+        debugPrint('[BloomUI] resynced (recommend) after save');
+      }
+      // ⭐ 最后一步：让原生小组件【立刻重载】。
+      //
+      // 少了这一步就会出现用户报的那个现象: App 里的文案已经换成新的了，
+      // 照片却还是上一张（桌面小组件也还是上一张）—— 因为 App 的照片取自
+      // 原生小组件状态，而那个状态要等小组件自己按时间线刷新才更新，
+      // 推荐模式下那是【按天】的，所以会一直停在旧图上。
+      // 文案来自 Flutter 缓存、照片来自原生状态，两个源不同步，就"对不上"了。
+      await WidgetBridge().refresh();
+    } catch (error) {
+      debugPrint('[BloomUI] resync after save failed (ignored): $error');
+    }
+  }
+
 
   /// A mode change made **on a device's own detail page**.
   ///

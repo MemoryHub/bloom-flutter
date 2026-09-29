@@ -119,13 +119,29 @@ class CarouselPhotoStore {
       var lastReason = 'unknown';
       for (var attempt = 0; attempt < attempts; attempt++) {
         try {
+          final downloadStartedMs = DateTime.now().millisecondsSinceEpoch;
           final bytes = await _download(
             credentials: credentials,
             itemId: itemId,
             etag: etag,
             destination: originalFile(dir, itemId),
           );
+          final downloadMs = DateTime.now().millisecondsSinceEpoch - downloadStartedMs;
+
+          final renderStartedMs = DateTime.now().millisecondsSinceEpoch;
           await _renderAll(dir, item, bytes);
+          final renderMs = DateTime.now().millisecondsSinceEpoch - renderStartedMs;
+
+          // **关键路径的耗时分解，必须分开记。**
+          //
+          // 首页首图就等这两段：下载（网络 + 落盘）和渲染（三个规格的 CPU）。
+          // 只看总时长无法判断该动网络还是动渲染，而这两种优化方向完全相反。
+          // 实测（小米 14，2026-09-29）首次启动当前格耗时 6.1s，但拆不开。
+          debugPrint(
+            '[BloomCarousel] photo item=$itemId download=${downloadMs}ms '
+            'render=${renderMs}ms bytes=${bytes.length}',
+          );
+
           return PhotoFetchResult(
             outcome: PhotoFetchOutcome.ready,
             photo: _pathsFor(dir, item, etag: etag),

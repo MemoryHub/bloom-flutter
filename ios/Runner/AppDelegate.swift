@@ -239,7 +239,7 @@ import workmanager
       case "readDisplayPreferences":
         let defaults = UserDefaults(suiteName: Self.bloomAppGroup)
         result([
-          "mode": defaults?.string(forKey: "bloom.display_mode") ?? "recommendation",
+          "mode": defaults?.string(forKey: "bloom.display_mode") ?? "recommend",
           "intervalMinutes": defaults?.integer(forKey: "bloom.carousel_interval_minutes") ?? 1440,
           "activeStart": defaults?.string(forKey: "bloom.carousel_active_start") ?? "06:00",
           "activeEnd": defaults?.string(forKey: "bloom.carousel_active_end") ?? "22:00",

@@ -8,23 +8,123 @@ import '../models/device_models.dart';
 
 enum BloomDisplayMode { recommendation, carousel }
 
+/// 照片【来源】。与 `mode` 正交：sources 决定"从哪些池子里取候选"，
+/// mode 决定"怎么给候选排序"。两者是独立的两件事，任意组合都合法。
+///
+/// ⚠️ wire 值必须与服务器的 `carousel.SUPPORTED_SOURCES` 完全一致 ——
+/// 那是最权威的一份名单。服务器现在【登记了四个】但只实现了 personal：
+/// 登记不等于能取到片。
+enum BloomPhotoSource {
+  /// 用户自己上传 / Immich 图库里的照片。目前唯一真正实现的来源。
+  personal('personal', '我的照片'),
+
+  /// 名画 / 油画。服务器已登记，取片能力待实现。
+  art('art', '名画'),
+
+  /// 新闻图片。服务器已登记，取片能力待实现。
+  news('news', '新闻'),
+
+  /// 小组件生成的内容（天气 / 股票 / 自创）。注意它是【内容来源】，
+  /// 不是设备类型 —— 设备类型是 target，两者不要混。
+  widget('widget', '小组件'),
+  ;
+
+  const BloomPhotoSource(this.wire, this.label);
+
+  /// 协议值（小写，永不翻译，永远不要改）。
+  final String wire;
+
+  /// 界面显示名。可以随时改，不影响协议。
+  final String label;
+
+  /// 服务器【真正能取到照片】的来源。UI 只应该给出这些选项 ——
+  /// 给出还没实现的来源，用户设完之后相框毫无变化，就是"设了没反应"。
+  static const implemented = <BloomPhotoSource>[BloomPhotoSource.personal];
+
+  /// 从协议值解析；认不出来返回 null（调用方当作"保持现状"）。
+  static BloomPhotoSource? fromWire(String? value) {
+    for (final source in BloomPhotoSource.values) {
+      if (source.wire == value) return source;
+    }
+    return null;
+  }
+}
+
+/// 把选中的来源转成服务器的 wire 形状。
+///
+/// 服务器同时接受纯字符串与 `{name, weight}` 两种写法，这里一律发对象 ——
+/// 权重现在恒为 1，但形状先站住，将来做混合权重时客户端不用再改协议。
+///
+/// ⚠️ 空列表【不发送】而不是发 `[]`：服务器的语义是"没送 = 别动已存的值"
+///    （与 mode 一字不差的同一规矩）。发 `[]` 会被 normalize_sources 当成
+///    "什么都没说"而回退到 personal，等于把用户的选择悄悄改掉。
+List<Map<String, Object?>> bloomSourcesToWire(Iterable<BloomPhotoSource> sources) =>
+    <Map<String, Object?>>[
+      for (final source in sources)
+        <String, Object?>{'name': source.wire, 'weight': 1},
+    ];
+
+/// 解析服务器回显的 `sources` 字段。
+///
+/// 服务器同时回 `sources_key`（规范串）与 `sources`（列表），这里用列表，
+/// 因为它不用再解析格式。认不出来的名字直接跳过 —— 服务器加了新来源而
+/// 这个 App 版本还不认识时，不该因此崩掉或清空用户的选择。
+List<BloomPhotoSource> bloomSourcesFromWire(Object? value) {
+  if (value is! List) return const <BloomPhotoSource>[];
+  final out = <BloomPhotoSource>[];
+  for (final entry in value) {
+    final String? name = switch (entry) {
+      String raw => raw,
+      Map raw => (raw['name'] ?? raw['id']) as String?,
+      _ => null,
+    };
+    final parsed = BloomPhotoSource.fromWire(name);
+    if (parsed != null && !out.contains(parsed)) out.add(parsed);
+  }
+  return out;
+}
+
+/// 协议里登记的全部来源（= 服务器 `SUPPORTED_SOURCES`）。
+///
+/// 单独列出来是为了让"客户端认识的名单"和"服务器登记的名单"有一个
+/// 可断言的对照点；加了新来源时两处一起改，测试会提醒。
+const List<String> bloomSourceWireValues = <String>[
+  'personal',
+  'art',
+  'news',
+  'widget',
+];
+
+
 /// The value the server stores for [mode] in `frame_device_settings.mode`.
 ///
-/// The server only accepts `carousel` / `recommend` (a 422 otherwise), while
-/// the local mirror the native widgets read spells the second value
-/// `recommendation`. The two spellings are a cross-language contract on both
-/// sides, so they stay separate and are converted here, in one place.
+/// **This is now the same spelling everywhere**: the wire protocol, the local
+/// mirror the native widgets read, and the Kotlin/Swift sides all say
+/// `carousel` / `recommend`. There used to be a second spelling
+/// (`recommendation`) for the local mirror alone; it was removed because one
+/// concept with two names is how a cross-language contract drifts.
+///
+/// These two functions stay even though they are near-identity now: they are
+/// the single place a mode crosses between "what we store" and "what we send",
+/// so any future rename has exactly one edit to make.
 String bloomModeToWire(BloomDisplayMode mode) =>
     mode == BloomDisplayMode.carousel
         ? DeviceCarouselSettings.modeCarousel
         : DeviceCarouselSettings.modeRecommend;
 
-/// Parses the server's `mode`; `null` for a missing or unrecognised value.
+/// Parses a `mode` from the server or from the local mirror.
+///
+/// Accepts the retired `recommendation` spelling on the way in: an install that
+/// last wrote its mirror before the rename still has that string on disk, and
+/// refusing it would silently flip such a user back to carousel. `null` is
+/// returned for a missing or unrecognised value, which callers treat as "leave
+/// the current setting alone".
 BloomDisplayMode? bloomModeFromWire(String? value) {
   if (value == DeviceCarouselSettings.modeCarousel) {
     return BloomDisplayMode.carousel;
   }
-  if (value == DeviceCarouselSettings.modeRecommend) {
+  if (value == DeviceCarouselSettings.modeRecommend ||
+      value == DeviceCarouselSettings.modeRecommendLegacy) {
     return BloomDisplayMode.recommendation;
   }
   return null;
@@ -41,9 +141,27 @@ String _intervalLabelText(int minutes) {
   return '每$minutes分钟';
 }
 
+/// 推荐模式的固定作息：开始 / 结束 / 间隔。
+///
+/// ⚠️ 这三个值必须【真的写进请求】。服务器对四个参数零特例 —— 它不会
+/// "因为在推荐模式就忽略间隔"，所以 App 必须自己把值填好，而不是指望
+/// 服务器替它兜底。
+///
+/// 06:00–22:00 配 12 小时，一天醒两次（photosPerDay == 2），正好覆盖推荐
+/// 算法打分的那一批照片；夜里 22:00–06:00 不唤醒，省电也不打扰。
+///
+/// 放在这里而不是 UI 文件里：它是一份【协议约定】，和 720 这个档位同级，
+/// 不是排版细节 —— 测试与界面都从这里取，避免两处各写一份而漂移。
+const String recommendActiveStart = '06:00';
+const String recommendActiveEnd = '22:00';
+const int recommendIntervalMinutes = 720;
+
 class BloomDisplaySettings {
   const BloomDisplaySettings({
     this.mode = BloomDisplayMode.recommendation,
+    // 默认只有一个来源 —— personal 是目前唯一真正取得出照片的来源，
+    // 与服务器 carousel.SUPPORTED_SOURCES / IMPLEMENTED_SOURCES 保持一致。
+    this.sources = const <BloomPhotoSource>[BloomPhotoSource.personal],
     this.intervalMinutes = 1440,
     this.activeStart = '06:00',
     this.activeEnd = '22:00',
@@ -65,6 +183,19 @@ class BloomDisplaySettings {
   /// from `items`, which is exactly what a server-sent 45 would otherwise do.
   static const allowedIntervals = <int>[15, 30, 60, 120, 720, 1440];
 
+  /// 把 wire 上的来源名字翻成枚举。
+  ///
+  /// 认不出来的名字【跳过】而不是崩掉：服务器加了新来源而 App 还没跟上时，
+  /// 界面少显示一项，但用户的其余选择原样保留 —— 丢掉会让用户觉得
+  /// "我选的来源没了"。
+  static List<BloomPhotoSource> sourcesFromWire(Iterable<String> names) {
+    final out = names
+        .map(BloomPhotoSource.fromWire)
+        .whereType<BloomPhotoSource>()
+        .toList();
+    return out.isEmpty ? const <BloomPhotoSource>[BloomPhotoSource.personal] : out;
+  }
+
   /// Whether [value] can describe a schedule at all.
   ///
   /// The server owns the authoritative tier list
@@ -76,6 +207,12 @@ class BloomDisplaySettings {
 
   final BloomDisplayMode mode;
   final int intervalMinutes;
+
+  /// 这台设备的内容来源。
+  ///
+  /// 与 mode 正交：sources 决定"从哪些池子里取候选"，mode 决定"怎么排序"。
+  /// 服务器对四个参数零特例，任何组合都合法。
+  final List<BloomPhotoSource> sources;
   final String activeStart;
   final String activeEnd;
 
@@ -94,6 +231,7 @@ class BloomDisplaySettings {
   BloomDisplaySettings copyWith({
     BloomDisplayMode? mode,
     int? intervalMinutes,
+    List<BloomPhotoSource>? sources,
     String? activeStart,
     String? activeEnd,
     String? timezone,
@@ -105,6 +243,7 @@ class BloomDisplaySettings {
     return BloomDisplaySettings(
       mode: mode ?? this.mode,
       intervalMinutes: intervalMinutes ?? this.intervalMinutes,
+      sources: sources ?? this.sources,
       activeStart: activeStart ?? this.activeStart,
       activeEnd: activeEnd ?? this.activeEnd,
       timezone: timezone ?? this.timezone,
@@ -181,6 +320,24 @@ class DisplayPreferences {
   static const modeKey = 'bloom.display_mode';
   static const intervalKey = 'bloom.carousel_interval_minutes';
   static const startKey = 'bloom.carousel_active_start';
+  // 用户自己的轮播作息，切到「推荐」之前存一份。
+  //
+  // 为什么必须【持久化】而不是放在页面内存里：服务器的 mode 与作息正交，
+  // 切到推荐会把固定值（06:00/22:00/12h）写进同一个存储位，覆盖掉用户的。
+  // 而用户切走之后常常会返回首页再回来 —— 页面 State 被销毁重建，内存里的
+  // 那一份就没了，切回轮播时还原不回去。这几个 key 是 Dart 私有的，
+  // 小组件不读它们，所以新增不会影响原生侧。
+  //
+  // ⚠️ **必须按 target 分开存。** 手机和相框是两条独立的服务器记录、两份独立的
+  //    作息，而这一份是"用户自己的那一份"。用同一组全局 key 会互相覆盖：
+  //    先给相框切一次推荐（存下相框的作息），再给手机切推荐（把相框那份盖掉），
+  //    然后手机的详情页切回轮播，还回去的就是**相框的作息**。
+  static String carouselStashIntervalKey(String target) =>
+      'bloom.carousel_stash_interval_$target';
+  static String carouselStashStartKey(String target) =>
+      'bloom.carousel_stash_start_$target';
+  static String carouselStashEndKey(String target) =>
+      'bloom.carousel_stash_end_$target';
   static const endKey = 'bloom.carousel_active_end';
 
   /// Marks that the local mirror has been taken over from the server once.
@@ -244,6 +401,7 @@ class DisplayPreferences {
       // reports the server's mode without touching the mirror).
       mode: local.mode,
       intervalMinutes: remote.intervalMinutes,
+      sources: BloomDisplaySettings.sourcesFromWire(remote.sources),
       activeStart: remote.activeStart,
       activeEnd: remote.activeEnd,
       timezone: remote.timezone,
@@ -307,6 +465,11 @@ class DisplayPreferences {
     return BloomDisplaySettings(
       // Last resort: the app-wide default, never a guess about the device.
       mode: mode ?? const BloomDisplaySettings().mode,
+      // ⚠️ 这一行原来漏了，于是详情页的「照片来源」永远读回默认的 [personal]：
+      //    服务器上真存了什么，界面根本看不到 —— 用户勾了别的来源再进来，
+      //    卡片显示的仍是 personal，看起来就像"设了没反应"。
+      //    与 [read] 走同一个转换（认不出来的名字跳过，不崩、不清空）。
+      sources: BloomDisplaySettings.sourcesFromWire(remote.sources),
       intervalMinutes: remote.intervalMinutes,
       activeStart: remote.activeStart,
       activeEnd: remote.activeEnd,
@@ -344,6 +507,7 @@ class DisplayPreferences {
     String? timezone,
     BloomApiClient? api,
     BloomDisplayMode? mode,
+    List<BloomPhotoSource>? sources,
   }) => (api ?? _api).setDeviceSettings(
     credentials,
     target: target,
@@ -353,7 +517,53 @@ class DisplayPreferences {
     intervalMinutes: settings.intervalMinutes,
     callerDeviceId: callerDeviceId,
     mode: mode == null ? null : bloomModeToWire(mode),
+    // null = 用户没碰过来源 -> 请求里不带这个键 -> 服务器保持已存的值。
+    // 这与 mode 一字不差的同一规矩。
+    sources: sources == null ? null : bloomSourcesToWire(sources),
   );
+
+  /// 记下用户自己的轮播作息（切到推荐之前调用）。
+  ///
+  /// 只写本地，不碰服务器 —— 它记的正是"服务器马上要被覆盖掉的那份"。
+  /// [target] 必须传这台设备的记录名（`mobile` / `eink`）：两台设备各有各的
+  /// 作息，共用一组 key 会互相覆盖（见 key 定义处的说明）。
+  Future<void> rememberCarouselSchedule(
+    BloomDisplaySettings settings, {
+    required String target,
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(
+        carouselStashIntervalKey(target),
+        settings.intervalMinutes,
+      );
+      await prefs.setString(carouselStashStartKey(target), settings.activeStart);
+      await prefs.setString(carouselStashEndKey(target), settings.activeEnd);
+    } catch (_) {
+      // 记不住不该让切换模式失败：大不了切回来时还原不了。
+    }
+  }
+
+  /// 取回用户自己的轮播作息；从来没存过则返回 null。
+  Future<BloomDisplaySettings?> recallCarouselSchedule({
+    required String target,
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final interval = prefs.getInt(carouselStashIntervalKey(target));
+      final start = prefs.getString(carouselStashStartKey(target));
+      final end = prefs.getString(carouselStashEndKey(target));
+      if (interval == null || start == null || end == null) return null;
+      return BloomDisplaySettings(
+        mode: BloomDisplayMode.carousel,
+        intervalMinutes: interval,
+        activeStart: start,
+        activeEnd: end,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
 
   /// Reads the local mirror only (no network, no write). Used by [read] as
   /// fallback, by [readServer] for the phone's `mode` and by `main.dart`, which
@@ -422,7 +632,7 @@ class DisplayPreferences {
         mode:
             settings.mode == BloomDisplayMode.carousel
                 ? 'carousel'
-                : 'recommendation',
+                : 'recommend',
         intervalMinutes: settings.intervalMinutes,
         activeStart: settings.activeStart,
         activeEnd: settings.activeEnd,
@@ -434,7 +644,7 @@ class DisplayPreferences {
       modeKey,
       settings.mode == BloomDisplayMode.carousel
           ? 'carousel'
-          : 'recommendation',
+          : 'recommend',
     );
     await prefs.setInt(intervalKey, settings.intervalMinutes);
     await prefs.setString(startKey, settings.activeStart);
@@ -452,8 +662,8 @@ class DisplayPreferences {
   ///
   /// The current value is read back and written unchanged (the iOS bridge
   /// requires a `mode` argument). When the key was absent, the app-wide default
-  /// `recommendation` is written — the same value the Kotlin (`mode !=
-  /// "carousel"`) and Swift (`?? "recommendation"`) sides already fall back to
+  /// `recommend` is written — the same value the Kotlin (`mode != "carousel"`)
+  /// and Swift (`?? "recommend"`) sides already fall back to
   /// for a missing key, so nothing changes for them.
   Future<void> cacheLocalKeepingMode(BloomDisplaySettings settings) async {
     final mode = (await readLocal()).mode;

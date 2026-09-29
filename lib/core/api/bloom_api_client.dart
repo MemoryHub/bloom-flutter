@@ -229,9 +229,10 @@ class BloomApiClient {
           body: jsonEncode({'item_id': itemId}),
         )
         .timeout(_photoRequestTimeout);
-    if (response.statusCode != 200 && response.statusCode != 304) {
-      _throw(response);
-    }
+    // 走同一个 `_ensure`，照片下载才会和其它接口一样留下「路径 + 状态」这条
+    // 日志。它原来自己内联了状态判断，于是**唯独最需要计时的那条请求没有日志**
+    // —— 首图慢的时候无法判断是下载慢还是渲染慢。
+    _ensure(response, 200, 304);
     return response;
   }
 
@@ -311,6 +312,7 @@ class BloomApiClient {
     required int intervalMinutes,
     required String callerDeviceId,
     String? mode,
+    List<Map<String, Object?>>? sources,
   }) async {
     final response = await _client
         .post(
@@ -329,6 +331,8 @@ class BloomApiClient {
             'interval_minutes': intervalMinutes,
             'caller_device_id': callerDeviceId,
             if (mode != null) 'mode': mode,
+            // 不送 = 服务器保持已存的值（与 mode 同一规矩）。
+            if (sources != null) 'sources': sources,
           }),
         )
         .timeout(_requestTimeout);

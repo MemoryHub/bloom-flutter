@@ -270,6 +270,7 @@ class DeviceCarouselSettings {
     required this.activeEnd,
     required this.intervalMinutes,
     this.mode,
+    this.sources = const <String>[],
     this.dailySlotCount,
     this.settingsHash,
     this.updatedAt,
@@ -285,6 +286,10 @@ class DeviceCarouselSettings {
   static const modeCarousel = 'carousel';
   static const modeRecommend = 'recommend';
 
+  /// The retired spelling of [modeRecommend], used only by the local mirror on
+  /// installs that predate the rename. Read-only: never write this value again.
+  static const modeRecommendLegacy = 'recommendation';
+
 
   final String timezone;
   final String activeStart;
@@ -297,6 +302,14 @@ class DeviceCarouselSettings {
   /// allowed values: callers must fall back to a known value instead of
   /// guessing (the server rejects anything else with 422).
   final String? mode;
+
+  /// 这台设备的内容来源（协议名字，如 `personal` / `art`）。
+  ///
+  /// 与 [mode] 一样存协议字符串而不是枚举：这个模型是 wire 形状的镜像，
+  /// 不认识的名字（服务器加了新来源而 App 还没跟上）应当【原样保留】，
+  /// 而不是在这里被悄悄丢掉 —— 丢掉会让用户看到"我选的来源没了"。
+  /// 界面侧再用 BloomPhotoSource.fromWire 去认。
+  final List<String> sources;
 
   /// Photos the server scheduled for one day (`daily_slot_count`).
   ///
@@ -318,6 +331,16 @@ class DeviceCarouselSettings {
   /// `mode` is optional: it is `null` when absent and also when the server
   /// sends a value outside `carousel` / `recommend`, so a future server value
   /// can never be mistaken for one of the two the app knows how to render.
+  /// 从一个 sources 条目里取协议名字。
+  ///
+  /// 服务器两种形状都可能回：`{'name': 'art', 'weight': 2}` 与 `'art'`。
+  /// 认不出来返回 null，由调用方跳过 —— 不抛异常。
+  static String? _sourceNameOf(Object? entry) => switch (entry) {
+    final Map map => (map['name'] ?? map['id']) as String?,
+    final String name => name,
+    _ => null,
+  };
+
   factory DeviceCarouselSettings.fromJson(Map<String, dynamic> json) {
     final interval = (json['interval_minutes'] as num?)?.toInt();
     if (interval == null || interval <= 0) {
@@ -341,6 +364,16 @@ class DeviceCarouselSettings {
           rawMode == modeCarousel || rawMode == modeRecommend
               ? rawMode as String
               : null,
+      sources: switch (json['sources']) {
+        // 服务器回的是 [{name, weight}]，但也接受纯字符串 ——
+        // 与请求侧"两种写法都吃"保持一致。
+        final List<dynamic> raw => <String>[
+          for (final entry in raw)
+            if (_sourceNameOf(entry) case final String name when name.isNotEmpty)
+              name,
+        ],
+        _ => const <String>[],
+      },
       dailySlotCount: rawSlots != null && rawSlots > 0 ? rawSlots : null,
       settingsHash: json['settings_hash'] as String?,
       updatedAt: _parseDateTime(json['updated_at']),

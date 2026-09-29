@@ -157,7 +157,7 @@ private enum BloomWidgetRemoteLoader {
       return ([cachedEntry(family: family)], missingCredentialsNext)
     }
 
-    let mode = defaults.string(forKey: "bloom.display_mode") ?? "recommendation"
+    let mode = defaults.string(forKey: "bloom.display_mode") ?? "recommend"
     let appEntry = freshAppCompositeEntry(family: family, defaults: defaults)
     do {
       if mode == "carousel" {
@@ -312,7 +312,7 @@ private enum BloomWidgetRemoteLoader {
       capturedDateText: payload.capturedDateText,
           locationText: payload.locationText,
       defaults: defaults,
-      mode: "recommendation"
+      mode: "recommend"
     )
     return (
       [entry(content)],
@@ -635,7 +635,7 @@ private enum BloomWidgetRemoteLoader {
     locationText: String?,
     defaults: UserDefaults,
     persistAsCurrent: Bool = true,
-    mode: String = "recommendation"
+    mode: String = "recommend"
   ) throws -> BloomRemoteContent {
     guard let widgetImage = downsampleForWidget(photoData),
           let encoded = widgetImage.jpegData(compressionQuality: 0.88),

@@ -1,5 +1,7 @@
 package com.bloom.widget_bridge
 
+import android.app.Activity
+import android.app.AlertDialog
 import android.app.AlarmManager
 import android.content.ComponentName
 import android.content.Context
@@ -203,6 +205,16 @@ object BloomKeepAlive {
 
     private fun askedKey(id: String) = "keepAliveAsked_$id"
 
+    /** 当前 App 版本号，用来判断"这个版本问过没有"。 */
+    private fun appVersion(context: Context): String = try {
+        context.packageManager
+            .getPackageInfo(context.packageName, 0)
+            .versionName ?: "unknown"
+    } catch (error: Exception) {
+        Log.w(TAG, "read app version failed", error)
+        "unknown"
+    }
+
     /**
      * 缺精确闹钟权限时**主动申请一次**。返回 true 表示「现在有权限」。
      *
@@ -224,12 +236,62 @@ object BloomKeepAlive {
         if (manager.canScheduleExactAlarms()) return true
 
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        if (prefs.getBoolean(askedKey(ID_EXACT_ALARM), false)) return false
-        prefs.edit().putBoolean(askedKey(ID_EXACT_ALARM), true).apply()
+        // ⭐ "只弹一次"的标记要【带上版本号】。
+        //
+        // 原来存的是 true/false: 用户只要跑过任何一个旧版本，这个标记就永久
+        // 为 true —— 而且旧版本是【直接跳设置】的，也会把它写上。结果就是
+        // 后来加了这个确认框，用户升级上来永远看不到（实测就是这样）。
+        // 存版本号之后，每次升级会重新问一次，同一版本内仍然只问一次。
+        val askedVersion = try {
+            prefs.getString(askedKey(ID_EXACT_ALARM), null)
+        } catch (_: ClassCastException) {
+            null // 旧版存的是 boolean，取 string 会抛，当成"没问过"
+        }
+        if (askedVersion == appVersion(context)) return false
+        prefs.edit().putString(askedKey(ID_EXACT_ALARM), appVersion(context)).apply()
 
-        // 跳不过去也不要紧：自检卡片里还有「去开启」和文字步骤兜底。
-        open(context, ID_EXACT_ALARM)
+        // ⭐ 先问，再跳。
+        //
+        // 原来是直接 startActivity 跳到系统设置页 —— 用户第一次进 App 就被弹进
+        // 设置里，很容易以为 App 坏了。现在弹一个确认框: 点「去设置」才跳转，
+        // 点「取消」就什么都不做。取消不会让用户失去这个能力 —— 详情页的自检
+        // 卡片里还有「去开启」，那条路是用户主动点的，不该再拦一道确认。
+        askBeforeOpening(context)
         return false
+    }
+
+    /**
+     * 弹「去设置」确认框。
+     *
+     * 拿不到 Activity 时**保持原行为直接跳**：没有 Activity 就没有可靠的窗口
+     * token，`AlertDialog.show()` 会抛 BadTokenException。加确认框是为了体验，
+     * 不该让原本能用的路径变得不能用。
+     */
+    private fun askBeforeOpening(context: Context) {
+        val activity = context as? Activity
+        if (activity == null) {
+            open(context, ID_EXACT_ALARM)
+            return
+        }
+        activity.runOnUiThread {
+            try {
+                AlertDialog.Builder(activity)
+                    .setTitle("允许准时换图")
+                    .setMessage(
+                        "桌面小组件靠精确闹钟按时换照片，系统默认不允许。" +
+                            "要在设置里为本应用打开吗？",
+                    )
+                    .setPositiveButton("去设置") { _, _ ->
+                        open(activity, ID_EXACT_ALARM)
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            } catch (error: Exception) {
+                // 弹不出来就退回原来的行为，绝不因为一个确认框把功能弄没。
+                Log.w(TAG, "exact alarm dialog failed; opening settings directly", error)
+                open(activity, ID_EXACT_ALARM)
+            }
+        }
     }
 
     /** 跳到某一项的设置页。返回 false 表示**跳不过去**，界面应改展示 [Item.steps]。 */

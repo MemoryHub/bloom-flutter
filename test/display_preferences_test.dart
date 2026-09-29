@@ -9,6 +9,12 @@ import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
+  _carouselStashTests();
+
+  _sourceWireTests();
+
+  _sourcesTests();
+
   final credentials = DeviceCredentials(
     deviceId: 'bloom-mobile-test',
     deviceToken: 'a' * 64,
@@ -116,7 +122,7 @@ void main() {
 
   test('read falls back to the local mirror when the server fails', () async {
     SharedPreferences.setMockInitialValues(<String, Object>{
-      'bloom.display_mode': 'recommendation',
+      'bloom.display_mode': 'recommend',
       'bloom.carousel_interval_minutes': 30,
       'bloom.carousel_active_start': '08:00',
       'bloom.carousel_active_end': '20:00',
@@ -216,5 +222,223 @@ void main() {
     expect(parsed.intervalMinutes, 45);
     expect(parsed.timezone, DeviceCarouselSettings.defaultTimezone);
     expect(parsed.dailySlotCount, isNull);
+  });
+}
+
+// ── 照片来源（sources）：协议词表 ─────────────────────────────────────
+//
+// sources 与 mode 正交：sources 决定"从哪些池子里取候选"，mode 决定
+// "怎么给候选排序"。服务器对两者零特例，任意组合都合法。
+
+void _sourcesTests() {
+  group('BloomPhotoSource', () {
+    test('wire 值与服务器 SUPPORTED_SOURCES 逐个一致', () {
+      // 服务器那份名单是最权威的（frame-service/app/carousel.py）。
+      // 这里钉死：客户端多认一个或少认一个，这条测试就会红。
+      expect(
+        BloomPhotoSource.values.map((s) => s.wire).toList(),
+        bloomSourceWireValues,
+      );
+      expect(bloomSourceWireValues, ['personal', 'art', 'news', 'widget']);
+    });
+
+    test('四个值都在，且 personal 排第一（默认来源）', () {
+      expect(BloomPhotoSource.values, hasLength(4));
+      expect(BloomPhotoSource.values.first, BloomPhotoSource.personal);
+    });
+
+    test('fromWire 认协议值，认不出来返回 null 而不是猜', () {
+      expect(BloomPhotoSource.fromWire('personal'), BloomPhotoSource.personal);
+      expect(BloomPhotoSource.fromWire('art'), BloomPhotoSource.art);
+      expect(BloomPhotoSource.fromWire('news'), BloomPhotoSource.news);
+      expect(BloomPhotoSource.fromWire('widget'), BloomPhotoSource.widget);
+      // 大小写、空格都不猜；未知来源留给服务器去丢弃并记警告。
+      expect(BloomPhotoSource.fromWire('ART'), isNull);
+      expect(BloomPhotoSource.fromWire(' personal'), isNull);
+      expect(BloomPhotoSource.fromWire('hologram'), isNull);
+      expect(BloomPhotoSource.fromWire(null), isNull);
+    });
+
+    test('implemented 只含真正能取到片的来源', () {
+      // ⚠️ 服务器登记了四个，但只有 personal 能真正取出照片。
+      // UI 若把 art/news/widget 也放出去，用户设完相框毫无变化 ——
+      // 就是"设了没反应"。所以这里必须比 values 窄。
+      expect(BloomPhotoSource.implemented, [BloomPhotoSource.personal]);
+      expect(
+        BloomPhotoSource.implemented.length,
+        lessThan(BloomPhotoSource.values.length),
+        reason: '登记 ≠ 实现；等 art 真能取片了再把这条改掉',
+      );
+    });
+
+    test('label 与 wire 是两回事：label 可改，wire 不可改', () {
+      expect(BloomPhotoSource.personal.label, '我的照片');
+      expect(BloomPhotoSource.art.label, '名画');
+      // wire 是小写协议值，永远不要翻译。
+      for (final s in BloomPhotoSource.values) {
+        expect(s.wire, s.wire.toLowerCase());
+      }
+    });
+  });
+}
+
+void _sourceWireTests() {
+  group('来源的 wire 转换', () {
+    test('转出去一律是对象形状，权重先占住', () {
+      expect(bloomSourcesToWire([BloomPhotoSource.personal]), [
+        {'name': 'personal', 'weight': 1},
+      ]);
+      expect(bloomSourcesToWire([BloomPhotoSource.personal, BloomPhotoSource.art]), [
+        {'name': 'personal', 'weight': 1},
+        {'name': 'art', 'weight': 1},
+      ]);
+    });
+
+    test('空列表转出来是空 —— 调用方据此决定【不发送】', () {
+      // 空列表不能当成"发 []"：服务器的语义是"没送 = 别动已存的值"，
+      // 发 [] 会被 normalize_sources 当成什么都没说而回退 personal，
+      // 等于把用户的选择悄悄改掉。
+      expect(bloomSourcesToWire(const []), isEmpty);
+    });
+
+    test('解析服务器回显：对象、纯字符串、混合三种都认', () {
+      expect(bloomSourcesFromWire([
+        {'name': 'personal', 'weight': 1},
+      ]), [BloomPhotoSource.personal]);
+      expect(bloomSourcesFromWire(['art']), [BloomPhotoSource.art]);
+      expect(bloomSourcesFromWire([
+        'personal',
+        {'name': 'art', 'weight': 2},
+      ]), [BloomPhotoSource.personal, BloomPhotoSource.art]);
+      // id 是另一种叫法，服务器两种都可能回。
+      expect(bloomSourcesFromWire([
+        {'id': 'widget'},
+      ]), [BloomPhotoSource.widget]);
+    });
+
+    test('解析：认不出来的名字跳过，不崩、不清空', () {
+      // 服务器加了新来源而这个 App 版本还不认识时，不该因此崩掉。
+      expect(bloomSourcesFromWire(['hologram', 'personal']), [
+        BloomPhotoSource.personal,
+      ]);
+      expect(bloomSourcesFromWire(['hologram']), isEmpty);
+    });
+
+    test('解析：去重、保持首次出现的顺序', () {
+      expect(bloomSourcesFromWire(['art', 'personal', 'art']), [
+        BloomPhotoSource.art,
+        BloomPhotoSource.personal,
+      ]);
+    });
+
+    test('解析：非列表输入一律当空，不抛异常', () {
+      for (final bad in [null, 'personal', 42, {'name': 'personal'}]) {
+        expect(bloomSourcesFromWire(bad), isEmpty, reason: '$bad');
+      }
+    });
+
+    test('往返：转出去再解析回来恒等', () {
+      const original = [BloomPhotoSource.personal, BloomPhotoSource.art];
+      expect(bloomSourcesFromWire(bloomSourcesToWire(original)), original);
+    });
+  });
+}
+
+void _carouselStashTests() {
+  group('用户自己的轮播作息（切推荐前存的副本）', () {
+    test('存进去再取回来恒等', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final prefs = DisplayPreferences();
+      await prefs.rememberCarouselSchedule(
+        const BloomDisplaySettings(
+          mode: BloomDisplayMode.carousel,
+          intervalMinutes: 1440,
+          activeStart: '08:30',
+          activeEnd: '20:30',
+        ),
+        target: 'mobile',
+      );
+      final back = await prefs.recallCarouselSchedule(target: 'mobile');
+      expect(back, isNotNull);
+      expect(back!.intervalMinutes, 1440);
+      expect(back.activeStart, '08:30');
+      expect(back.activeEnd, '20:30');
+    });
+
+    test('从来没存过 -> null（调用方据此保持原样）', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      expect(
+        await DisplayPreferences().recallCarouselSchedule(target: 'mobile'),
+        isNull,
+      );
+    });
+
+    test('只存了一半 -> null，不会拼出一个半成品作息', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{
+        'bloom.carousel_stash_interval_mobile': 1440,
+        'bloom.carousel_stash_start_mobile': '08:30',
+        // 少了 end
+      });
+      expect(
+        await DisplayPreferences().recallCarouselSchedule(target: 'mobile'),
+        isNull,
+      );
+    });
+
+    test('反复存会覆盖（跟着用户最新的设置走）', () async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final prefs = DisplayPreferences();
+      await prefs.rememberCarouselSchedule(
+        const BloomDisplaySettings(
+          intervalMinutes: 1440,
+          activeStart: '08:30',
+          activeEnd: '20:30',
+        ),
+        target: 'mobile',
+      );
+      await prefs.rememberCarouselSchedule(
+        const BloomDisplaySettings(
+          intervalMinutes: 60,
+          activeStart: '07:00',
+          activeEnd: '19:00',
+        ),
+        target: 'mobile',
+      );
+      final back = await prefs.recallCarouselSchedule(target: 'mobile');
+      expect(back!.intervalMinutes, 60);
+      expect(back.activeStart, '07:00');
+      expect(back.activeEnd, '19:00');
+    });
+
+    test('⭐ 手机与相框各存各的：给相框切推荐不会污染手机的作息', () async {
+      // 手机的作息是 15 分钟、相框的是 12 小时。两个 target 共用一组 key 时，
+      // 后写的会把先写的盖掉 —— 于是"给相框切一次推荐、再给手机切回轮播"
+      // 会把相框的作息还原到手机上。
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final prefs = DisplayPreferences();
+      await prefs.rememberCarouselSchedule(
+        const BloomDisplaySettings(
+          intervalMinutes: 15,
+          activeStart: '07:30',
+          activeEnd: '21:30',
+        ),
+        target: 'mobile',
+      );
+      await prefs.rememberCarouselSchedule(
+        const BloomDisplaySettings(
+          intervalMinutes: 720,
+          activeStart: '06:00',
+          activeEnd: '22:00',
+        ),
+        target: 'eink',
+      );
+
+      final mobile = await prefs.recallCarouselSchedule(target: 'mobile');
+      final frame = await prefs.recallCarouselSchedule(target: 'eink');
+      expect(mobile!.intervalMinutes, 15);
+      expect(mobile.activeStart, '07:30');
+      expect(frame!.intervalMinutes, 720);
+      expect(frame.activeStart, '06:00');
+    });
   });
 }

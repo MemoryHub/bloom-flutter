@@ -94,6 +94,7 @@ void main() {
     required List<http.Request> requests,
     String mode = 'carousel',
     int intervalMinutes = 1440,
+    List<String>? sources,
     int failStatus = 0,
     Map<String, dynamic>? failBody,
     void Function(Map<String, dynamic> body)? onWrite,
@@ -119,6 +120,11 @@ void main() {
             'active_end': '22:00',
             'interval_minutes': intervalMinutes,
             'mode': mode,
+            // 服务器回的是 [{name, weight}]；不传就当作"没登记来源"。
+            if (sources != null)
+              'sources': [
+                for (final name in sources) {'name': name, 'weight': 1},
+              ],
             'daily_slot_count': 65,
             'settings_hash': 'test-hash',
             'updated_at': '2026-09-21T10:00:00+08:00',
@@ -317,7 +323,7 @@ void main() {
       // Deliberately *different* from the server record: if the frame's save
       // cached anything, the mirror would move off these values.
       SharedPreferences.setMockInitialValues(<String, Object>{
-        'bloom.display_mode': 'recommendation',
+        'bloom.display_mode': 'recommend',
         'bloom.carousel_interval_minutes': 30,
         'bloom.carousel_active_start': '08:00',
         'bloom.carousel_active_end': '20:00',
@@ -377,7 +383,7 @@ void main() {
       expect(prefs.getInt('bloom.carousel_interval_minutes'), 30);
       expect(prefs.getString('bloom.carousel_active_start'), '08:00');
       expect(prefs.getString('bloom.carousel_active_end'), '20:00');
-      expect(prefs.getString('bloom.display_mode'), 'recommendation');
+      expect(prefs.getString('bloom.display_mode'), 'recommend');
     });
 
     testWidgets('生效时间是一个字段：六个预设含「全天」，全天拆成 00:00–23:59 交给接口', (tester) async {
@@ -445,7 +451,7 @@ void main() {
       // The phone really is on 推荐; the server's row still holds the migration
       // default 轮播. Saving the cadence alone must not flatten that.
       SharedPreferences.setMockInitialValues(<String, Object>{
-        'bloom.display_mode': 'recommendation',
+        'bloom.display_mode': 'recommend',
         'bloom.carousel_interval_minutes': 1440,
         'bloom.carousel_active_start': '06:00',
         'bloom.carousel_active_end': '22:00',
@@ -489,7 +495,7 @@ void main() {
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getInt('bloom.carousel_interval_minutes'), 60);
       // ... and the phone's widget keeps its own mode.
-      expect(prefs.getString('bloom.display_mode'), 'recommendation');
+      expect(prefs.getString('bloom.display_mode'), 'recommend');
     });
 
     testWidgets('服务器 422 → 显示错误提示，且本地镜像没有被写入', (tester) async {
@@ -636,9 +642,202 @@ void main() {
     });
   });
 
-  group('设备详情页 · 显示模式', () {
-    testWidgets('相框的显示模式是只读的，没有可点的切换控件', (tester) async {
+  group('设备详情页 · 照片来源', () {
+    testWidgets('卡片只列出已实现的来源，未实现的不给能勾的框', (tester) async {
+      // 服务器登记了四个名字（personal / art / news / widget），但只有
+      // personal 真正取得出照片。给 art 一个能勾的框，用户设完相框毫无变化 ——
+      // 就是"设了没反应"。所以界面严格按 BloomPhotoSource.implemented 渲染。
       useTallWindow(tester);
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final requests = <http.Request>[];
+      final client = BloomApiClient(
+        client: settingsServer(requests: requests, mode: 'carousel'),
+      );
+
+      await tester.pumpWidget(
+        detail(
+          credentials: credentials,
+          preferences: DisplayPreferences(api: client),
+          settings: const BloomDisplaySettings(),
+        ),
+      );
+      await settle(tester);
+
+      expect(find.text('照片来源'), findsOneWidget);
+      expect(find.byKey(const ValueKey('bloom-source-personal')), findsOneWidget);
+      // 还没实现的三个名字一个都不该出现。
+      expect(find.byKey(const ValueKey('bloom-source-art')), findsNothing);
+      expect(find.byKey(const ValueKey('bloom-source-news')), findsNothing);
+      expect(find.byKey(const ValueKey('bloom-source-widget')), findsNothing);
+    });
+
+    testWidgets('点来源只改草稿、不立刻发请求；且最后一个不能被取消', (tester) async {
+      // 两条规矩：
+      //  ① 来源与「更换频率」「生效时间」一致，等页面底部统一的「保存」，
+      //     不像 mode 那样是开关式立刻提交。
+      //  ② 至少留一个 —— 全不选就没有来源了，相框会没有候选照片。
+      useTallWindow(tester);
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final requests = <http.Request>[];
+      final client = BloomApiClient(
+        client: settingsServer(requests: requests, mode: 'carousel'),
+      );
+
+      await tester.pumpWidget(
+        detail(
+          credentials: credentials,
+          preferences: DisplayPreferences(api: client),
+          settings: const BloomDisplaySettings(),
+        ),
+      );
+      await settle(tester);
+      final before = writes(requests).length;
+
+      await tester.tap(find.byKey(const ValueKey('bloom-source-personal')));
+      await settle(tester);
+
+      // ① 不立刻发请求。
+      expect(
+        writes(requests).length,
+        before,
+        reason: '点来源应当只改草稿，等「保存」',
+      );
+      // ② 唯一选中的那个取消不掉 —— 框还应当是勾着的。
+      expect(find.byKey(const ValueKey('bloom-source-personal')), findsOneWidget);
+    });
+
+    testWidgets('打开时没碰来源 -> 请求里【不含】sources 这个键', (tester) async {
+      // 与 mode 一字不差的同一规矩：没送 != 重置。
+      // 否则用户每次调刷新间隔，来源都会被悄悄改掉。
+      useTallWindow(tester);
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final requests = <http.Request>[];
+      final client = BloomApiClient(
+        client: settingsServer(requests: requests, mode: 'carousel'),
+      );
+
+      await tester.pumpWidget(
+        detail(
+          credentials: credentials,
+          preferences: DisplayPreferences(api: client),
+          settings: const BloomDisplaySettings(),
+        ),
+      );
+      await settle(tester);
+
+      // 改一下间隔（不碰来源）→ 必须保存，但请求里不能有 sources。
+      await tester.tap(find.byKey(const ValueKey('bloom-interval-dropdown')));
+      await settle(tester);
+      await tester.tap(find.text('每2小时').last);
+      await settle(tester);
+      await tester.tap(find.text('保存'), warnIfMissed: false);
+      await settle(tester);
+
+      final body = jsonDecode(writes(requests).last.body) as Map<String, dynamic>;
+      expect(body.containsKey('sources'), isFalse,
+          reason: '没碰来源就不该发送这个键');
+    });
+
+    testWidgets('⭐ 推荐模式下碰过来源 → 「保存」出现，并且真的把它送出去', (tester) async {
+      // 「保存」原来只在轮播模式出现（那时页面上唯一的表单就是作息）。
+      // 推荐模式没有作息表单 —— 但**有「照片来源」这张卡片**，它同样是表单。
+      // 于是推荐模式下来源只改草稿、根本没有提交它的按钮：点了没反应。
+      useTallWindow(tester);
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final requests = <http.Request>[];
+      final client = BloomApiClient(
+        client: settingsServer(
+          requests: requests,
+          mode: 'recommend',
+          // ⚠️ 服务器必须回两个来源，这一 tap 才真的改变草稿。
+          //    `implemented` 目前只有 personal，而"至少保留一个"的规则会让
+          //    「只选中 personal 时点它」变成 no-op（行的 onTap 直接置空）——
+          //    那样测的就不是保存按钮，而是那个 no-op。
+          sources: const ['personal', 'art'],
+        ),
+      );
+
+      await tester.pumpWidget(
+        detail(
+          credentials: credentials,
+          preferences: DisplayPreferences(api: client),
+          settings: const BloomDisplaySettings(
+            mode: BloomDisplayMode.recommendation,
+            intervalMinutes: 720,
+          ),
+        ),
+      );
+      await settle(tester);
+
+      // 推荐模式、什么都没碰：没有保存按钮。那才叫"一个什么都不做的按钮"。
+      expect(find.text('保存'), findsNothing);
+
+      await tester.tap(find.byKey(const ValueKey('bloom-source-personal')));
+      await settle(tester);
+
+      // 碰过之后必须出现，否则这次改动永远送不出去。
+      expect(
+        find.text('保存'),
+        findsOneWidget,
+        reason: '推荐模式下改了来源也必须有办法提交',
+      );
+      expect(writes(requests), isEmpty, reason: '来源是表单，点它不该立刻发请求');
+
+      await tester.tap(find.text('保存'), warnIfMissed: false);
+      await settle(tester);
+
+      expect(writes(requests), hasLength(1));
+      final body = jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
+      expect(body['mode'], isNull, reason: '没碰模式就不该带 mode');
+      expect(body['sources'], [
+        {'name': 'art', 'weight': 1},
+      ]);
+      expect(find.textContaining('设置已保存'), findsOneWidget);
+    });
+
+    testWidgets('⭐ 服务器回显的 sources 会显示在卡片上（不是永远回落到 personal）', (tester) async {
+      // `readServer()` 构造返回值时漏掉了 `sources:`，于是详情页永远读回默认的
+      // [personal] —— 服务器上真存了什么，用户根本看不到，看起来就像"设了没反应"。
+      useTallWindow(tester);
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final requests = <http.Request>[];
+      final client = BloomApiClient(
+        client: settingsServer(
+          requests: requests,
+          mode: 'carousel',
+          sources: const ['art'],
+        ),
+      );
+
+      await tester.pumpWidget(
+        detail(
+          credentials: credentials,
+          preferences: DisplayPreferences(api: client),
+          settings: const BloomDisplaySettings(),
+        ),
+      );
+      await settle(tester);
+
+      // 服务器说这台设备只有 art。界面只渲染 implemented（只有 personal），
+      // 但 personal 已经**不在选中集里**了 —— 勾是空的。
+      expect(find.text('照片来源'), findsOneWidget);
+      expect(
+        find.byIcon(Icons.check_box_outline_blank_rounded),
+        findsOneWidget,
+        reason: '服务器说来源是 art，personal 就不该显示成已选中',
+      );
+      expect(find.byIcon(Icons.check_box_rounded), findsNothing);
+    });
+  });
+
+  group('设备详情页 · 显示模式', () {
+    testWidgets('相框的显示模式可以切换，只发服务器、不写本机镜像', (tester) async {
+      // 相框的模式以前是只读的，理由是"its firmware cannot read the server's
+      // `mode` yet"。服务器现在按 frame_device_settings.mode 决定排序方式、
+      // 固件只是照做，所以这条理由不再成立：相框也能改模式，而且改完不需要
+      // 重烧固件。
+      useTallWindow(tester);
+      // 空镜像：本机没有 mode。相框保存若误写镜像，下面能立刻看出来。
       SharedPreferences.setMockInitialValues(<String, Object>{});
       final requests = <http.Request>[];
       // The frame's stored mode, read back from `eink`.
@@ -659,23 +858,125 @@ void main() {
       );
       await settle(tester);
 
-      // Read-only: plain text, and the note that explains why.
+      // 打开时显示服务器报的轮播，而不是本地兜底的推荐。
       expect(find.text('轮播'), findsOneWidget);
-      // The frame's pill is a read-out, not a control: it is on screen (the
-      // frame's mode comes from the server), and tapping the other segment must
-      // not write anything anywhere.
+
+      // 胶囊现在是【真控件】：点另一段必须发出一次写请求。
       expect(find.byKey(const ValueKey('bloom-mode-recommend')), findsOneWidget);
       await tester.tap(find.byKey(const ValueKey('bloom-mode-recommend')));
       await settle(tester);
-      // No *write*: the read on open is not this assertion's business.
-      expect(writes(requests), isEmpty);
-      expect(find.text('轮播'), findsWidgets);
 
-      await tester.tap(find.text('轮播'), warnIfMissed: false);
-      await settle(tester);
-      expect(writes(requests), isEmpty);
-      expect(find.text('轮播'), findsOneWidget);
+      final frameWrites = writes(requests);
+      expect(frameWrites, isNotEmpty, reason: '相框改模式必须发给服务器');
+      final writtenBody = frameWrites.last.body;
+      expect(writtenBody, contains('"mode":"recommend"'));
+      expect(writtenBody, contains('"target":"eink"'));
+
+      // 但【绝不写本机镜像】—— 镜像属于这台手机的小组件，相框的模式不是手机
+      // 的模式；写进去会悄悄改掉桌面小组件的节奏。
+      final prefsAfter = await SharedPreferences.getInstance();
+      expect(prefsAfter.getString('bloom.display_mode'), isNull);
+
+      // 服务器回显后不再多发请求。
+      expect(writes(requests).length, frameWrites.length);
     });
+
+    testWidgets('切到推荐 → 把 06:00 / 22:00 / 720 真的发出去，并隐藏作息控件', (tester) async {
+      // 服务器对四个参数零特例 —— 它不会"因为在推荐模式就忽略间隔"。
+      // 所以 App 必须自己把固定作息填进请求，否则推荐就在用一个不相干的
+      // 作息跑（例如用户上次设的 09:00–18:00 每天一次）。
+      useTallWindow(tester);
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final requests = <http.Request>[];
+      final client = BloomApiClient(
+        client: settingsServer(requests: requests, mode: 'carousel'),
+      );
+
+      await tester.pumpWidget(
+        detail(
+          credentials: credentials,
+          preferences: DisplayPreferences(api: client),
+          settings: const BloomDisplaySettings(
+            mode: BloomDisplayMode.carousel,
+            intervalMinutes: 1440,
+            activeStart: '09:00',
+            activeEnd: '18:00',
+          ),
+        ),
+      );
+      await settle(tester);
+
+      // 轮播模式下作息控件是在的。
+      expect(find.text('生效时间'), findsWidgets);
+
+      await tester.tap(find.byKey(const ValueKey('bloom-mode-recommend')));
+      await settle(tester);
+
+      final body =
+          jsonDecode(writes(requests).last.body) as Map<String, dynamic>;
+      expect(body['mode'], 'recommend');
+      expect(body['interval_minutes'], recommendIntervalMinutes);
+      expect(body['active_start'], recommendActiveStart);
+      expect(body['active_end'], recommendActiveEnd);
+
+      // 三组控件隐藏：推荐模式换成一张说明卡。
+      expect(find.text('生效时间'), findsNothing);
+      expect(find.text('刷新节奏'), findsNothing);
+    });
+
+    testWidgets('推荐 → 轮播：还原用户自己的作息，而不是留着推荐那份固定值', (tester) async {
+      // 服务器对 mode 与作息是【正交】的：四个字段只有一个存储位。切到推荐
+      // 必须把固定作息（06:00/22:00/12h）写进去，否则推荐会用一个不相干的
+      // 作息去跑。代价是【用户原来的轮播作息被覆盖】。
+      //
+      // 所以切过去之前先记一份，切回来原样还回去。否则用户只是去看了一眼
+      // 推荐，回来发现自己的设置被改成了「半天一次 / 6点到22点」——
+      // 那不是他的设置，是推荐那一套。
+      //
+      // 这里刻意用一个【跟推荐固定值完全不同】的作息（1440 / 08:30 / 20:30），
+      // 这样断言能真的区分"还回来了"和"留着推荐那份"。
+      useTallWindow(tester);
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final requests = <http.Request>[];
+      final client = BloomApiClient(
+        client: settingsServer(requests: requests, mode: 'carousel'),
+      );
+
+      await tester.pumpWidget(
+        detail(
+          credentials: credentials,
+          preferences: DisplayPreferences(api: client),
+          settings: const BloomDisplaySettings(
+            mode: BloomDisplayMode.carousel,
+            intervalMinutes: 1440,
+            activeStart: '08:30',
+            activeEnd: '20:30',
+          ),
+        ),
+      );
+      await settle(tester);
+
+      await tester.tap(find.byKey(const ValueKey('bloom-mode-recommend')));
+      await settle(tester);
+      await tester.tap(find.byKey(const ValueKey('bloom-mode-carousel')));
+      await settle(tester);
+
+      final body =
+          jsonDecode(writes(requests).last.body) as Map<String, dynamic>;
+      expect(body['mode'], 'carousel');
+      // ⭐ 核心断言：还回来的【不是】推荐那份固定值。
+      //
+      // 注意不能断言 start/end 等于上面传进去的 08:30/20:30 —— 服务器才是
+      // 权威，页面打开时会先用服务器回的值覆盖草稿，而这个 mock 服务器回的
+      // 窗口正好和推荐的固定窗口相同，两个值分不开。间隔能分开：它一定是
+      // 切到推荐之前页面上的那个值（来自服务器），绝不是 720。
+      expect(body['interval_minutes'], isNot(recommendIntervalMinutes));
+      expect(body['interval_minutes'], greaterThan(0));
+
+      // 控件回来了。
+      expect(find.text('生效时间'), findsWidgets);
+    });
+
 
     testWidgets('本机点「推荐模式」→ 立刻发请求（target=mobile、mode=recommend）并写本地镜像', (
       tester,
@@ -715,17 +1016,14 @@ void main() {
       );
       final body = jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
       expect(body['target'], 'mobile');
-      // The server's spelling of 推荐 is `recommend`; the interval travels in
-      // the same request.
+      // 服务器与本地镜像现在【同一个拼写】，两边都是 `recommend`。
+      // 间隔随同一个请求走 —— 而推荐模式的间隔是固定值（12 小时），
+      // 不是轮播那边原本用的档位。
       expect(body['mode'], 'recommend');
-      expect(body['interval_minutes'], 1440);
+      expect(body['interval_minutes'], recommendIntervalMinutes);
 
       final prefs = await SharedPreferences.getInstance();
-      // The mirror's non-carousel spelling stays `recommendation` — that is the
-      // value the native widgets have always read (`BloomWidgets.swift` falls
-      // back to "recommendation" and the iOS widget bridge writes that spelling
-      // back into this very key), so only the *server* side uses `recommend`.
-      expect(prefs.getString('bloom.display_mode'), 'recommendation');
+      expect(prefs.getString('bloom.display_mode'), 'recommend');
       expect(
         bloomModeFromWire(body['mode'] as String),
         BloomDisplayMode.recommendation,
@@ -769,7 +1067,7 @@ void main() {
 
       expect(events, ['cacheLocal', 'configureBackgroundSync']);
       final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getString('bloom.display_mode'), 'recommendation');
+      expect(prefs.getString('bloom.display_mode'), 'recommend');
     });
 
     testWidgets('档位改动留在草稿里；点模式则立即把两者一起提交（服务器不会拿到新模式的旧档位）', (
@@ -817,13 +1115,19 @@ void main() {
 
       expect(writes(requests), hasLength(1));
       final body = jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
-      expect(body['interval_minutes'], 120);
+      // 推荐模式带着自己的【固定作息】过来，所以这里不是刚才在界面上点的 120。
+      // 测试的原意仍然成立：服务器拿到的是"与新模式相配"的档位，而绝不是
+      // 新模式配旧档位。
+      expect(body['interval_minutes'], recommendIntervalMinutes);
       expect(body['mode'], 'recommend');
       expect(body['target'], 'mobile');
 
       final after = await SharedPreferences.getInstance();
-      expect(after.getInt('bloom.carousel_interval_minutes'), 120);
-      expect(after.getString('bloom.display_mode'), 'recommendation');
+      expect(
+        after.getInt('bloom.carousel_interval_minutes'),
+        recommendIntervalMinutes,
+      );
+      expect(after.getString('bloom.display_mode'), 'recommend');
     });
 
     testWidgets('读服务器失败 → 页面照常渲染兜底值，不崩、不弹错误', (tester) async {
@@ -915,14 +1219,23 @@ void main() {
       );
     });
 
-    test('mode 在服务器拼写 recommend 与本地镜像拼写 recommendation 之间转换', () {
+    test('mode 全线同一个拼写；旧安装里的 recommendation 仍能读出来', () {
+      // Wire and mirror now agree — there is no second spelling any more.
       expect(bloomModeToWire(BloomDisplayMode.carousel), 'carousel');
       expect(bloomModeToWire(BloomDisplayMode.recommendation), 'recommend');
       expect(bloomModeFromWire('carousel'), BloomDisplayMode.carousel);
       expect(bloomModeFromWire('recommend'), BloomDisplayMode.recommendation);
+
+      // An install that last wrote its mirror before the rename still parses,
+      // instead of silently flipping that user back to carousel.
+      expect(
+        bloomModeFromWire(DeviceCarouselSettings.modeRecommendLegacy),
+        BloomDisplayMode.recommendation,
+      );
+
       // Anything else is "unknown", never a silent default.
       expect(bloomModeFromWire(null), isNull);
-      expect(bloomModeFromWire('recommendation'), isNull);
+      expect(bloomModeFromWire('shuffle'), isNull);
     });
   });
 
@@ -1000,7 +1313,7 @@ void main() {
       SharedPreferences.setMockInitialValues(<String, Object>{
         'bloom.device_id': credentials.deviceId,
         'bloom.identity_version': 2,
-        'bloom.display_mode': 'recommendation', // stale
+        'bloom.display_mode': 'recommend', // stale
         'bloom.carousel_interval_minutes': 1440,
         'bloom.carousel_active_start': '06:00',
         'bloom.carousel_active_end': '22:00',
@@ -1055,6 +1368,72 @@ void main() {
       );
       // The home page now states what the device page states.
       expect(find.text('轮播模式'), findsWidgets);
+
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('⭐ 推荐模式冷启动也有「下次更新」（它不在计划戳里，按固定作息算）', (tester) async {
+      // `next_slot_at_ms` 是**轮播**的概念（引擎把计划落盘时写进 daily.json），
+      // 推荐路径从不写它。而首页原来只读那个字段 —— 于是推荐模式下这一行永远
+      // 是空的，只有"保存过一次设置"之后才出现（那条路会把固定作息算出来的值
+      // 塞进 `_nextSlotAt`）。冷启动和保存后必须走同一个来源。
+      //
+      // 这条用例刻意用 `has_assets: false`：那行文案讲的是**作息**，不是照片，
+      // 所以它必须在任何同步之前就算出来 —— 也让这条测试完全不碰下载与渲染。
+      SharedPreferences.setMockInitialValues(<String, Object>{
+        'bloom.device_id': credentials.deviceId,
+        'bloom.identity_version': 2,
+        'bloom.display_mode': 'recommend',
+        'bloom.carousel_interval_minutes': 720,
+        'bloom.carousel_active_start': '06:00',
+        'bloom.carousel_active_end': '22:00',
+      });
+
+      final requests = <http.Request>[];
+      final client = BloomApiClient(
+        client: MockClient((request) async {
+          requests.add(request);
+          if (request.url.path.endsWith('/status')) {
+            return http.Response(
+              jsonEncode({
+                'device_id': credentials.deviceId,
+                'device_type': 'mobile',
+                'mode': 'recommend',
+                'paired': true,
+                'has_assets': false,
+              }),
+              200,
+              headers: jsonHeaders,
+            );
+          }
+          return http.Response('{}', 200, headers: jsonHeaders);
+        }),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: BloomHomePage(
+            identity: DeviceIdentityRepository(
+              readToken: (_) async => credentials.deviceToken,
+              writeToken: (_, _) async {},
+              stableCredentials: () async => null,
+            ),
+            api: client,
+            displayPreferences: DisplayPreferences(api: client),
+          ),
+        ),
+      );
+      // `settle` 推进 720ms 假时钟，够 `_paintLocalContent` 那 600ms 有界等待超时
+      // （测试里没有平台通道，它必然超时；真机上它在毫秒级就返回）。
+      await settle(tester);
+
+      final label = find.byKey(const ValueKey('bloom-next-slot'));
+      expect(
+        label,
+        findsOneWidget,
+        reason: '推荐的节奏由固定作息唯一决定，冷启动就该有这一行',
+      );
+      expect(tester.widget<Text>(label).data ?? '', startsWith('下次更新 '));
 
       await tester.pumpWidget(const SizedBox());
     });

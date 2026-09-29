@@ -39,6 +39,7 @@ class CarouselTickOutcome {
     this.unavailable = 0,
     this.generationChanged = false,
     this.note,
+    this.plan,
   });
 
   /// 是否成功取回计划（false 表示没网或服务端不可达）。
@@ -63,6 +64,12 @@ class CarouselTickOutcome {
 
   final String? note;
 
+  /// 本次拉取到的全天计划（没网时为 null）。
+  ///
+  /// 它跟着结局一起返回，是为了让 [CarouselEngine.prefetchAhead] 能**接着用同一份
+  /// 计划**去备未来格子 —— 否则预取就得再拉一次全天计划，白白多一趟网络。
+  final FullPlan? plan;
+
   @override
   String toString() =>
       'CarouselTickOutcome(plan=$planFetched committed=$committed '
@@ -70,6 +77,16 @@ class CarouselTickOutcome {
       'source=${nextSlotSource.wire} prepared=$prepared '
       'unavailable=$unavailable generation=$generationChanged'
       '${note == null ? '' : ' note=$note'})';
+}
+
+/// 一轮备图的可变计数。
+///
+/// 关键路径（当前格）与预取（未来格）要各自统计，但 [CarouselEngine._prepareSlot]
+/// 是两边共用的纯函数式片段，不能直接改调用方的局部变量，所以把计数装进一个
+/// 可变对象传进去。
+class CarouselPrepareStats {
+  int prepared = 0;
+  int unavailable = 0;
 }
 
 class CarouselEngine {
@@ -101,7 +118,48 @@ class CarouselEngine {
   }
 
   /// 执行一次 tick。
+  ///
+  /// [prefetch] 为 true（默认）时保持历史行为：当前格**与**未来若干格全部备好
+  /// 才返回。
+  ///
+  /// ⚠️ **界面路径不要用默认值。** 一次完整 tick 实测要 60–70 秒（其中一格
+  /// 超时 27 秒、替补又 15 秒），而那段时间里用户要看的只有当前那一格。界面
+  /// 应该 [tickCurrent] + fire-and-forget [prefetchAhead]，两条腿分开跑。
+  /// 默认值留给「就是要一次做完」的调用方：后台任务与测试。
   Future<CarouselTickOutcome> tick({
+    required DeviceCredentials credentials,
+    required BloomDisplaySettings settings,
+    required String writer,
+    bool prefetch = true,
+  }) async {
+    final outcome = await tickCurrent(
+      credentials: credentials,
+      settings: settings,
+      writer: writer,
+    );
+    final plan = outcome.plan;
+    if (prefetch && plan != null) {
+      await prefetchAhead(
+        credentials: credentials,
+        settings: settings,
+        writer: writer,
+        plan: plan,
+      );
+    }
+    return outcome;
+  }
+
+  /// **关键路径：只保证「此刻该显示的那一张」就位。**
+  ///
+  /// 次序与完整 tick 的前半段一模一样 —— 对表 → 先落文案 → 备当前格 → 当前格
+  /// 取不到就替补 → 提交并通知原生 —— 只是**到此为止**。
+  ///
+  /// 未来格子的预取被剥到 [prefetchAhead] 里，于是界面上那一张不再被另外 4 张
+  /// 的下载、以及它们失败后的替补拖住。这一条是量出来的：15:07:03 启动，
+  /// `/plan` 15:07:06 就回来了，但整批做完是 15:08:12 —— 69 秒里，当前格
+  /// （6124）在 15:07:29 之前就已经能显示，剩下的 43 秒全花在未来格 6127 的
+  /// 超时与替补上。
+  Future<CarouselTickOutcome> tickCurrent({
     required DeviceCredentials credentials,
     required BloomDisplaySettings settings,
     required String writer,
@@ -165,59 +223,29 @@ class CarouselEngine {
       }
     }
 
-    // ---- ③ 备照片 ----
+    // ---- ③ 备照片：**只备此刻该显示的那一格** ----
+    //
+    // 未来格子由 [prefetchAhead] 单独一轮去备。原来它们在这里一条 `for` 循环里
+    // 被逐张 await，于是「界面上那一张」要排在 4 张之后 —— 其中任何一张超时
+    // （实测 27 秒）或触发替补（再 15 秒），首屏就一起被拖住。
     final photos = [...before.photos];
     final attempted = <int>{};
-    var prepared = 0;
-    var unavailable = 0;
-
-    Future<bool> prepareSlot(Slot slot) async {
-      if (photoFor(photos, slot.itemId) != null) return true;
-      if (!attempted.add(slot.itemId)) {
-        return photoFor(photos, slot.itemId) != null;
-      }
-      final content = plan?.contentFor(slot.itemId);
-      // 离线时拿不到内容描述符，本轮无法取图——这是 offline，不是 download_failed。
-      if (content == null) return false;
-      final result = await _photoStore.prepare(
-        dir: dir,
-        item: content,
-        credentials: credentials,
-        etag: photoFor(before.photos, slot.itemId)?.etag,
-      );
-      if (!result.isReady) {
-        unavailable++;
-        return false;
-      }
-      prepared++;
-      photos.removeWhere((photo) => photo.itemId == slot.itemId);
-      photos.add(result.photo!.toEntry(nowMs));
-      return true;
-    }
+    final stats = CarouselPrepareStats();
 
     // 当前格优先：它就是此刻应当显示的那张。
-    final currentReady = slotNow == null ? false : await prepareSlot(slotNow);
-
-    // **预取失败的格也必须替补，不能只补当前格。**
-    //
-    // 时间线只烘焙「照片已经在磁盘上」的条目。预取一旦失败，时间线上就留一个
-    // 洞；App 被系统杀掉之后，原生侧做的是纯查表（这是批准过的架构：原生不做
-    // 决策），它只能一路回退到洞前那一格——小组件会**卡死在同一张照片上**，
-    // 直到有人再次打开 App。
-    //
-    // 真机实测：item 4700 连续两次 `timeout`，18:00 那一格因此缺失，小组件停在
-    // 了 17:45；而自启动修好之后闹钟明明准时响了，画面却纹丝不动。
-    //
-    // 规则没有变，仍然是「失败只替换同一格、栅格永不动」，只是把时机从
-    //「等它变成当前格」提前到了预取阶段。计划里本来就没有内容的格不在此列——
-    // 那种空洞不是下载失败造成的，替补也补不出东西。
-    final failedPreloads = <Slot>[];
-    for (final slot in upcoming) {
-      final ready = await prepareSlot(slot);
-      if (!ready && plan?.contentFor(slot.itemId) != null) {
-        failedPreloads.add(slot);
-      }
-    }
+    final currentReady = slotNow == null
+        ? false
+        : await _prepareSlot(
+            dir: dir,
+            plan: plan,
+            slot: slotNow,
+            credentials: credentials,
+            photos: photos,
+            before: before.photos,
+            attempted: attempted,
+            stats: stats,
+            nowMs: nowMs,
+          );
 
     // 当前格取不到时，向服务端申请替补——只替换这一格，栅格不动。
     var substitutedContent = plan?.contentFor(slotNow?.itemId);
@@ -232,25 +260,13 @@ class CarouselEngine {
       );
       if (replacement != null) {
         substitutedContent = replacement;
-        prepared++;
-        if (unavailable > 0) unavailable--;
+        stats.prepared++;
+        if (stats.unavailable > 0) stats.unavailable--;
       }
     }
 
-    for (final slot in failedPreloads) {
-      final replacement = await _trySubstitute(
-        credentials: credentials,
-        planId: plan?.identity.planId ?? before.plan?.planId ?? 0,
-        dir: dir,
-        slot: slot,
-        nowMs: nowMs,
-        photos: photos,
-      );
-      if (replacement != null) {
-        prepared++;
-        if (unavailable > 0) unavailable--;
-      }
-    }
+    final prepared = stats.prepared;
+    final unavailable = stats.unavailable;
 
     // ---- 判定显示项与状态 ----
     final slotNowPhoto = slotNow == null ? null : photoFor(photos, slotNow.itemId);
@@ -376,7 +392,223 @@ class CarouselEngine {
       unavailable: unavailable,
       generationChanged: generationChanged,
       note: planError,
+      plan: plan,
     );
+  }
+
+  /// **未来格子的预取 —— 单独一轮，不挡界面。**
+  ///
+  /// 关键路径（[tickCurrent]）已经把当前格提交并通知原生；这里接着备未来若干格，
+  /// 备完再提交一次（时间线因此多出几个到点可直接上屏的条目）。
+  ///
+  /// 为什么这件事必须做，而不能"等它变成当前格再下"：
+  ///
+  /// 时间线只烘焙「照片已经在磁盘上」的条目。预取一旦失败，时间线上就留一个洞；
+  /// App 被系统杀掉之后，原生侧做的是纯查表（这是批准过的架构：原生不做决策），
+  /// 它只能一路回退到洞前那一格 —— 小组件会**卡死在同一张照片上**，直到有人
+  /// 再次打开 App。真机实测：item 4700 连续两次 `timeout`，18:00 那一格因此
+  /// 缺失，小组件停在了 17:45；自启动修好之后闹钟准时响了，画面却纹丝不动。
+  ///
+  /// 所以这里不只是"提前下载"，它同时是**失败替补的执行点**。规则没变：失败只
+  /// 替换同一格、栅格永不动。计划里本来就没有内容的格不在此列 —— 那种空洞不是
+  /// 下载失败造成的，替补也补不出东西。
+  ///
+  /// [plan] 直接沿用 [tickCurrent] 返回的那一份，不再多拉一次全天计划。
+  /// 本方法**自己吞掉所有异常**：调用方是 fire-and-forget，没人接的错误会变成
+  /// unhandled exception。
+  Future<void> prefetchAhead({
+    required DeviceCredentials credentials,
+    required BloomDisplaySettings settings,
+    required String writer,
+    required FullPlan plan,
+  }) async {
+    try {
+      final dir = await sharedDirectory();
+      final store = CarouselStateStore(directory: dir);
+      // ⭐ 必须重新读一次状态：上面那次提交刚写过它（当前格 + 时间线 + 清理），
+      //    拿旧快照继续会把已删的照片又算进来。
+      final before = await store.read();
+      final nowMs = _clock().millisecondsSinceEpoch;
+
+      final grid = plan.grid;
+      final slotNow = currentSlot(grid, nowMs);
+      final upcoming = upcomingSlots(grid, nowMs);
+      final resolution = resolveNextSlot(
+        gridMs: [for (final slot in grid) slot.slotAtMs],
+        nowMs: nowMs,
+        tomorrowFirstMs: plan.serverNextCheckMs ?? before.nextSlotAtMs,
+      );
+
+      final photos = [...before.photos];
+      final attempted = <int>{};
+      final stats = CarouselPrepareStats();
+
+      final failedPreloads = <Slot>[];
+      for (final slot in upcoming) {
+        final ready = await _prepareSlot(
+          dir: dir,
+          plan: plan,
+          slot: slot,
+          credentials: credentials,
+          photos: photos,
+          before: before.photos,
+          attempted: attempted,
+          stats: stats,
+          nowMs: nowMs,
+        );
+        if (!ready && plan.contentFor(slot.itemId) != null) {
+          failedPreloads.add(slot);
+        }
+      }
+
+      for (final slot in failedPreloads) {
+        final replacement = await _trySubstitute(
+          credentials: credentials,
+          planId: plan.identity.planId,
+          dir: dir,
+          slot: slot,
+          nowMs: nowMs,
+          photos: photos,
+        );
+        if (replacement != null) {
+          stats.prepared++;
+          if (stats.unavailable > 0) stats.unavailable--;
+        }
+      }
+
+      // 显示项判定与关键路径同一条规则：**宁可不切换，也不切到一张空图。**
+      // 时间在这期间可能已经跨到下一格，若那一格的照片没备好，就仍然停在
+      // `before.currentItemId`。
+      final slotNowPhoto = slotNow == null ? null : photoFor(photos, slotNow.itemId);
+      final displayedItemId = slotNowPhoto == null
+          ? before.currentItemId
+          : slotNow!.itemId;
+      final previousItemId = before.currentItemId != displayedItemId
+          ? before.currentItemId
+          : before.previousItemId;
+      final upcomingIds = [for (final slot in upcoming) slot.itemId];
+      final generationChanged = isNewGeneration(before.plan, plan.identity);
+
+      final timeline = <TimelineEntry>[
+        for (final slot in grid)
+          if (photoFor(photos, slot.itemId) != null &&
+              plan.contentFor(slot.itemId) != null)
+            _timelineEntry(
+              dir: dir,
+              slot: slot,
+              photo: photoFor(photos, slot.itemId)!,
+              content: plan.contentFor(slot.itemId)!,
+            ),
+      ]..sort((a, b) => a.dateMs.compareTo(b.dateMs));
+
+      final removed = <PhotoEntry>[];
+      CarouselState? committed;
+      try {
+        committed = await store.mutate(
+          writer: writer,
+          incomingPlan: plan.identity,
+          update: (current) {
+            final kept = retainPhotos(
+              mode: generationChanged
+                  ? RetentionMode.generation
+                  : RetentionMode.normal,
+              photos: photos,
+              currentItemId: displayedItemId,
+              previousItemId: previousItemId,
+              nextItemIds: upcomingIds,
+              newGrid: grid,
+            );
+            final keptPaths = {for (final photo in kept) photo.path};
+            removed
+              ..clear()
+              ..addAll(photos.where((photo) => !keptPaths.contains(photo.path)));
+
+            return current.copyWith(
+              grid: grid,
+              currentSlotAtMs: slotNow?.slotAtMs ?? before.currentSlotAtMs,
+              currentItemId: displayedItemId,
+              currentPhotoPath: slotNowPhoto?.path,
+              previousItemId: previousItemId,
+              previousPhotoPath: photoFor(kept, previousItemId)?.path,
+              nextSlotAtMs: resolution?.atMs,
+              nextSlotSource: NextSlotSource.plan,
+              photos: kept,
+              timelineEntries: timeline,
+              clearNextSlot: resolution == null,
+            );
+          },
+          onCommitted: (state) async {
+            // 时间可能已经跨到下一格，而那一格的照片刚好在预取里备好了 ——
+            // 那就顺手把「当前项」也推进过去，别等下一次 tick。
+            if (slotNowPhoto != null && displayedItemId != null) {
+              await _photoStore.publishCurrent(dir, displayedItemId);
+            }
+            await _writeProjection(
+              dir: dir,
+              state: state,
+              content: plan.contentFor(state.currentItemId),
+              planFetched: true,
+            );
+            await store.deletePhotos(removed);
+          },
+        );
+      } catch (error) {
+        debugPrint('[BloomCarousel] prefetch commit failed: $error');
+      }
+
+      if (committed != null) {
+        try {
+          await bridge.refresh();
+        } catch (error) {
+          debugPrint('[BloomCarousel] prefetch refresh failed: $error');
+        }
+      }
+      debugPrint(
+        '[BloomCarousel] prefetch done prepared=${stats.prepared} '
+        'unavailable=${stats.unavailable} entries=${timeline.length}',
+      );
+    } catch (error) {
+      // 预取是"尽力而为"：它失败不该影响任何人，更不该变成 unhandled error。
+      debugPrint('[BloomCarousel] prefetchAhead failed (ignored): $error');
+    }
+  }
+
+  /// 备一格的照片：已在池子里就跳过，缺就下载并渲染，失败只记账不抛。
+  ///
+  /// 抽出来是因为关键路径（当前格）与预取（未来格）用的是同一套判定 ——
+  /// 两边各写一份迟早会漂移。
+  Future<bool> _prepareSlot({
+    required Directory dir,
+    required FullPlan? plan,
+    required Slot slot,
+    required DeviceCredentials credentials,
+    required List<PhotoEntry> photos,
+    required List<PhotoEntry> before,
+    required Set<int> attempted,
+    required CarouselPrepareStats stats,
+    required int nowMs,
+  }) async {
+    if (photoFor(photos, slot.itemId) != null) return true;
+    if (!attempted.add(slot.itemId)) {
+      return photoFor(photos, slot.itemId) != null;
+    }
+    final content = plan?.contentFor(slot.itemId);
+    // 离线时拿不到内容描述符，本轮无法取图——这是 offline，不是 download_failed。
+    if (content == null) return false;
+    final result = await _photoStore.prepare(
+      dir: dir,
+      item: content,
+      credentials: credentials,
+      etag: photoFor(before, slot.itemId)?.etag,
+    );
+    if (!result.isReady) {
+      stats.unavailable++;
+      return false;
+    }
+    stats.prepared++;
+    photos.removeWhere((photo) => photo.itemId == slot.itemId);
+    photos.add(result.photo!.toEntry(nowMs));
+    return true;
   }
 
   /// 把一个已就绪的格子写成时间线条目。
