@@ -27,6 +27,10 @@ class BloomPortraitWidgetProvider : AppWidgetProvider() {
     }
 
     override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
+        // 先对齐到「此刻」再按 prefs 重绘：闹钟链重建、重启、包替换之后，当前
+        // 格往往已经过去了，只重绘会把画面留在旧照片上。详见
+        // `BloomCarouselSchedule.applyLatestDueEntryIfCarousel`。
+        BloomCarouselSchedule.applyLatestDueEntryIfCarousel(context)
         val prefs = context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
         val path = prefs.getString("mobileLocalPortraitPath", null)
             ?: File(context.filesDir, "widget-cache/mobile-local-portrait.png").absolutePath

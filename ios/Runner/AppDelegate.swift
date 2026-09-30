@@ -1,3 +1,4 @@
+import BackgroundTasks
 import Flutter
 import Security
 import UIKit
@@ -21,6 +22,26 @@ import workmanager
       application,
       didFinishLaunchingWithOptions: launchOptions
     )
+    // **插件注册必须显式发生，漏掉它等于关掉整个 iOS 后台补货。**
+    //
+    // Flutter 官方模板在 didFinishLaunching 里调用
+    // `GeneratedPluginRegistrant.register(with: self)`，本项目此前没有这一行
+    // ——全仓库唯一一次出现是在下面 `setPluginRegistrantCallback` 的闭包里，
+    // 那是后台 isolate 用的，跟主 App 无关。于是主 App 一个插件都没注册。
+    //
+    // 之所以一直没暴露：iOS 上的存储全部刻意绕开了插件，走本类手写的
+    // `com.bloom/widget` 通道（设备身份用 Keychain、显示偏好用 App Group、
+    // 缓存目录用 App Group），所以 4 个插件里有 3 个「没注册也照样能用」。
+    // 唯独 `workmanager` 没有替代通道，它安静地失败在 `_guardBackgroundSync`
+    // 的 catch 里：回调句柄没写进 `UserDefaults(suiteName:)`，
+    // `BGAppRefreshTaskRequest` 因此一次都没提交过。
+    //
+    // 后果与实测一致：iOS 侧没有任何后台补货，池子（当前格 + 未来 4 格）走完
+    // 之后小组件定格，只有手动打开 App 才会前进。「苹果只显示预存照片」就是它。
+    //
+    // 位置：官方模板放在 `super` 之前；本机 iOS 18 上那样会拿到 nil registrar
+    // 并在第一个 Swift 插件桥接时崩溃（见上面的说明），所以放在 `super` 之后。
+    GeneratedPluginRegistrant.register(with: self)
     // The storyboard FlutterViewController is attached after the launch
     // callback. Register only Bloom's own channel on the next main-loop turn;
     // no Flutter plugin registrar is involved here.
@@ -29,10 +50,71 @@ import workmanager
     // 留着它们只会让后来人误以为还存在第二份真相。
     Self.purgeLegacyCarouselKeys()
     Self.registerBackgroundSync()
+    // **把「系统手里到底有没有我们的后台请求」写成可读的证据。**
+    //
+    // 2026-09-30 实测：句柄已正确落盘（`initialize` 通了），但 iPhone 整夜
+    // 9 小时一次 `BGAppRefreshTask` 都没执行，而同一夜 WidgetKit 唤起了扩展
+    // 十几次。这两件事必须能区分开：
+    //   * 请求根本没提交 → 代码问题，能修
+    //   * 请求在队列里但系统不给跑 → 系统策略问题（后台 App 刷新被关、低电量
+    //     模式、或纯粹没轮到）
+    // 在此之前只能靠推断，代价是整夜的等待。`getPendingTaskRequests` 是系统
+    // 给出的唯一权威答案，写进 App Group 就能直接从电脑上读出来。
+    //
+    // 分两次读：第一次在 Dart 的 `registerPeriodicTask` 之前，第二次在其之后，
+    // 这样「提交前 / 后」的差别也看得出来。
+    for delay in [3.0, 20.0] {
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+        Self.recordPendingBackgroundTasks()
+      }
+    }
     DispatchQueue.main.async { [weak self] in
       self?.configureBloomWidgetChannelWhenReady()
     }
     return didFinish
+  }
+
+  /// 把 `BGTaskScheduler` 里待执行的请求写进 App Group，供离线诊断读取。
+  ///
+  /// 正常情况下应当能看到 `com.bloom.bloom.dailySync`；列表为空说明请求压根
+  /// 没提交成功（即 `registerPeriodicTask` 那一步失败了）。
+  private static func recordPendingBackgroundTasks() {
+    guard #available(iOS 13.0, *) else { return }
+    BGTaskScheduler.shared.getPendingTaskRequests { requests in
+      let summary = requests
+        .map { request -> String in
+          let begin = request.earliestBeginDate
+            .map { String(Int($0.timeIntervalSince1970)) } ?? "-"
+          return "\(request.identifier)@\(begin)"
+        }
+        .joined(separator: ",")
+      guard let defaults = UserDefaults(suiteName: bloomAppGroup) else { return }
+      defaults.set(summary, forKey: "bloom.pendingBgTasks")
+      defaults.set(
+        Int(Date().timeIntervalSince1970 * 1000),
+        forKey: "bloom.pendingBgTasksAt"
+      )
+      // **系统级的「后台 App 刷新」开关状态。**
+      //
+      // 2026-09-30 实测：这个总开关一旦关闭，iOS 对**任何** App 都不会执行
+      // `BGAppRefreshTask`。当时查了一整天代码（插件注册、handler 续排、提交
+      // 路径），每一条都是真的问题、也都修对了，但**没有一条能让小组件动起来**
+      // ——因为开关关着的时候，代码写得再对也一次都跑不起来。
+      //
+      // 症状是"iOS 只显示预存照片"，而它与任何代码缺陷的表现完全一样，从设备上
+      // 分不出来。所以把它记下来：以后"系统到底让不让后台刷新"是一读就知道的
+      // 事实，而不是要用户去翻设置才能确认的猜测。
+      let refresh = UIApplication.shared.backgroundRefreshStatus
+      let refreshText: String
+      switch refresh {
+      case .available: refreshText = "available"
+      case .denied: refreshText = "denied"
+      case .restricted: refreshText = "restricted"
+      @unknown default: refreshText = "unknown"
+      }
+      defaults.set(refreshText, forKey: "bloom.bgRefreshStatus")
+      defaults.synchronize()
+    }
   }
 
   /// 当前显示内容的指纹：`item_id@slot_at_ms`。**与安卓侧用同一个判据。**
@@ -69,16 +151,94 @@ import workmanager
   /// 它负责"不断备货"，准点仍由闹钟/WidgetKit 负责。
   private static func registerBackgroundSync() {
     if #available(iOS 13.0, *) {
-      // 标识符必须与 Info.plist 的 BGTaskSchedulerPermittedIdentifiers 一致。
-      WorkmanagerPlugin.registerPeriodicTask(
-        withIdentifier: "com.bloom.bloom.dailySync",
-        frequency: NSNumber(value: 15 * 60)
-      )
+      // **自己注册 handler，而不是交给 `WorkmanagerPlugin.registerPeriodicTask`。**
+      //
+      // 插件那个 handler（`handlePeriodicTask`）的第一件事是查回调句柄，查不到就
+      // **直接 `return`——连"续排下一次请求"都不做**（续排在它后面）。于是任务只要
+      // 跑过一次却在那里提前返回，请求就被消费掉了：队列清空、下一次永远不来、
+      // 而且没有任何痕迹。2026-09-30 实测到的正是"提交成功 + 队列为空 +
+      // 后台从没跑过 Dart"。
+      //
+      // 这里改成：**先无条件续排一次**，再委托插件去跑 Dart。任何后续失败都不会
+      // 再让链条断掉。执行时机仍由系统决定，但"下一次还排着"这件事由我们保证。
+      let registered = BGTaskScheduler.shared.register(
+        forTaskWithIdentifier: bgTaskIdentifier,
+        using: nil
+      ) { task in
+        guard let refresh = task as? BGAppRefreshTask else {
+          task.setTaskCompleted(success: false)
+          return
+        }
+        Self.noteBackgroundTaskRan()
+        Self.submitBackgroundRefresh(reason: "resubmit")
+        SwiftWorkmanagerPlugin.handlePeriodicTask(
+          identifier: Self.bgTaskIdentifier,
+          task: refresh,
+          earliestBeginInSeconds: 15 * 60
+        )
+      }
       // 后台 isolate 里也要能拿到插件，否则 Dart 侧的同步跑不起来。
       WorkmanagerPlugin.setPluginRegistrantCallback { registry in
         GeneratedPluginRegistrant.register(with: registry)
       }
+      // **第一次提交也必须由我们自己发。**
+      //
+      // 插件把首次提交留给 Dart 的 `registerPeriodicTask`，而它在 `submit` 失败时
+      // 只 `logInfo` 一句就把 `result(true)` 回给 Dart——失败在任何一端都看不见。
+      // 自己提交一次，失败能被抓住、写进 App Group、也就能被修。
+      //
+      // `register` 的返回值同样**必须记下来**：注册失败时 `submit` 仍可能不报错，
+      // 任务却永远唤不起来——那会表现成"提交成功、系统从不执行"，正是我们怀疑的
+      // 那个症状，而它和"系统不给机会"是两回事。
+      if let defaults = UserDefaults(suiteName: bloomAppGroup) {
+        defaults.set(registered, forKey: "bloom.bgRegisterOk")
+        defaults.synchronize()
+      }
+      submitBackgroundRefresh(reason: "launch")
     }
+  }
+
+  /// 后台任务真的被系统唤起过几次、最后一次是什么时候。
+  ///
+  /// 这是"系统到底有没有执行过我们"的唯一直接证据：Dart 侧只有真正跑到才会写
+  /// `writer=app-background`，而系统可能唤起了却在插件里提前返回。
+  private static func noteBackgroundTaskRan() {
+    guard let defaults = UserDefaults(suiteName: bloomAppGroup) else { return }
+    let count = defaults.integer(forKey: "bloom.bgTaskRuns") + 1
+    defaults.set(count, forKey: "bloom.bgTaskRuns")
+    defaults.set(
+      Int(Date().timeIntervalSince1970 * 1000),
+      forKey: "bloom.bgTaskLastAt"
+    )
+    defaults.synchronize()
+  }
+
+  /// 后台刷新任务的标识符。三处必须一致：本文件、`Info.plist` 的
+  /// `BGTaskSchedulerPermittedIdentifiers`、Dart 的 `bloomDailySyncTask`。
+  private static let bgTaskIdentifier = "com.bloom.bloom.dailySync"
+
+  /// 提交一次 `BGAppRefreshTaskRequest`，并把结果写进 App Group。
+  ///
+  /// `bloom.bgSubmitResult` 会记录 `submitted` 或 `failed: <错误描述>`——这正是
+  /// 之前完全不可见的那条信息。
+  private static func submitBackgroundRefresh(reason: String) {
+    guard #available(iOS 13.0, *) else { return }
+    let request = BGAppRefreshTaskRequest(identifier: bgTaskIdentifier)
+    request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
+    let outcome: String
+    do {
+      try BGTaskScheduler.shared.submit(request)
+      outcome = "submitted"
+    } catch {
+      outcome = "failed: \(error.localizedDescription)"
+    }
+    guard let defaults = UserDefaults(suiteName: bloomAppGroup) else { return }
+    defaults.set(
+      "\(reason) \(outcome) @\(Int(Date().timeIntervalSince1970))",
+      forKey: "bloom.bgSubmitResult"
+    )
+    defaults.synchronize()
+    NSLog("[Bloom] background refresh %@: %@", reason, outcome)
   }
 
   /// 删除轮播重写（2026-09）之前遗留的持久化键。

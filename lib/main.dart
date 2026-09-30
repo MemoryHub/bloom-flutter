@@ -39,9 +39,12 @@ Future<void> main() async {
       systemNavigationBarContrastEnforced: false,
     ),
   );
-  if (Platform.isAndroid) {
-    await initializeBackgroundSync();
-  }
+  // **两端都要初始化后台任务。** iOS 上这一步同时承担两件事：写进
+  // workmanager 的 Dart 回调句柄（没有它，系统就算唤醒了也跑不到我们的代码），
+  // 以及（配合 `configureBackgroundSync`）真正向 BGTaskScheduler **提交**一次
+  // 周期请求。历史上这里只对安卓调用，于是 iOS 侧"声明了标识符、注册了
+  // handler，却永远没有请求被提交"——小组件的补货因此只存在于 App 还活着的时候。
+  await initializeBackgroundSync();
   runApp(const BloomApp());
 }
 

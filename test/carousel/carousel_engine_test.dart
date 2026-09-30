@@ -712,18 +712,24 @@ void main() {
     expect(projection['next_slot_source'], state.nextSlotSource.wire);
     expect(projection['carousel_plan_id'], state.plan!.planId);
   });
-  test('预取稳态：首轮取当前加四格，之后每轮只新增一张，历史始终只有 2 张', () async {
-    // 这条回答「缓存上限为什么是 6 而不是 2」。
+  test('预取稳态：首轮把当前格加整个预取窗口一次取满，之后每轮只新增一张，历史始终只有 2 张', () async {
+    // 这条回答「缓存上限为什么是当前 + 未来一整个窗口、而不是 2」。
     //
     //   * 历史（上一张 + 当前）**始终严格是 2 张**——方案说的「缓存留最近 2 张」
     //     在历史这个维度上是被严格满足的；
-    //   * 另外 4 张是**未来**格子的预取，属于方案单独要求的「提前量」。
+    //   * 其余 `kTimelineBakeDepth` 张是**未来**格子的预取，属于方案单独要求的
+    //     「提前量」。
     //
     // 首轮没有上一张，必须把当前格与预取窗口一次取满；从第二轮起当前格早已在
     // 缓存里，每轮只新增最远的那一格。
+    //
+    // **断言一律跟着 `kTimelineBakeDepth` 走，不再写死 4。** 那个数字是策略，
+    // 不是不变量；写死过一次，把窗口从 4 调到 8 时这条测试就假报警了。
+    const window = kTimelineBakeDepth;
     final base = DateTime.parse('2026-09-28T11:15:00');
+    // 多备几格，好让三轮都处在真正的稳态里（最后一轮要用到 times[2 + window]）。
     final times = [
-      for (var i = 0; i < 10; i++) base.add(Duration(minutes: 15 * i)),
+      for (var i = 0; i < window + 4; i++) base.add(Duration(minutes: 15 * i)),
     ];
     String two(int value) => value.toString().padLeft(2, '0');
     String stamp(DateTime t) =>
@@ -771,17 +777,21 @@ void main() {
       );
     }
 
-    // ---- 第 1 轮：没有上一张，当前格 + 预取 4 格一次取满 ----
+    // ---- 第 1 轮：没有上一张，当前格 + 整个预取窗口一次取满 ----
     final first = await tick();
-    expect(first.downloads, 5, reason: '首轮 = 当前 1 张 + 预取 4 张');
-    expect(first.cached, 5);
+    expect(
+      first.downloads,
+      1 + window,
+      reason: '首轮 = 当前 1 张 + 预取 $window 张',
+    );
+    expect(first.cached, 1 + window);
     expect(first.previous, isNull);
 
     // ---- 第 2 轮：当前格是上轮预取到的，不重复下载 ----
     now = times[1];
     final second = await tick();
     expect(second.downloads, 1, reason: '只新增最远的那一格');
-    expect(second.cached, 6, reason: '上一张 + 当前 + 未来 4 格');
+    expect(second.cached, 2 + window, reason: '上一张 + 当前 + 未来 $window 格');
     expect(second.current, 4501);
     expect(second.previous, 4500);
 
@@ -789,14 +799,15 @@ void main() {
     now = times[2];
     final third = await tick();
     expect(third.downloads, 1, reason: '稳态下每轮仍然只新增一张');
-    expect(third.cached, 6, reason: '稳态缓存不随轮次增长');
+    expect(third.cached, 2 + window, reason: '稳态缓存不随轮次增长');
 
     // ---- 历史严格只有 2 张 ----
     final ids = (await stateStore.read()).photos
         .map((photo) => photo.itemId)
         .toList()
       ..sort();
-    expect(ids, [4501, 4502, 4503, 4504, 4505, 4506]);
+    // 稳态池 = 上一张(4501) + 当前(4502) + 未来 window 格，即 4501..(4500+2+window)。
+    expect(ids, [for (var i = 1; i <= 2 + window; i++) 4500 + i]);
     expect(
       ids,
       isNot(contains(4500)),

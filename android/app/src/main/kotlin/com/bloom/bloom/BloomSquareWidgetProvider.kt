@@ -24,6 +24,9 @@ class BloomSquareWidgetProvider : AppWidgetProvider() {
     }
 
     override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
+        // 先对齐到「此刻」再按 prefs 重绘。详见
+        // `BloomCarouselSchedule.applyLatestDueEntryIfCarousel`。
+        BloomCarouselSchedule.applyLatestDueEntryIfCarousel(context)
         val path = context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
             .getString("mobileLocalSquarePath", null)
             ?: File(context.filesDir, "widget-cache/mobile-local-square.png").absolutePath

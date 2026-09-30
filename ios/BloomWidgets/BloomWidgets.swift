@@ -199,16 +199,24 @@ private enum BloomWidgetRemoteLoader {
           if let last = local.0.last, last.date > Date(), gridHasRunway {
             return local
           }
-          logTimelineChoice("local timeline has no unseen future entry: fetching instead")
+          // **本地池用尽：这里不会、也不能去联网。**
+          //
+          // 轮播模式下的扩展是纯离线的查表器（见 `localCarouselTimeline` 上方的说明），
+          // 所以画面会停在当前这一张，一直等到宿主 App——或它的
+          // `BGAppRefreshTask`——把新格子补进来。把这件事明确写进日志，是因为
+          // "小组件卡住"必须能从设备上被认出来，而不是靠猜：历史上这段代码写的是
+          // "fetching instead / source=online"，但被调用的函数只是把同一份本地数据
+          // 再返回一次，于是日志一直在报告一件没发生的事。
+          logTimelineChoice(
+            "family=\(family) source=local-spent future=0 "
+              + "gridHasRunway=\(gridHasRunway) action=hold-wait-for-host-refill"
+          )
+          return local
         }
-        logTimelineChoice("family=\(family) source=online (no usable local plan)")
-        return try await carouselTimeline(
-          family: family,
-          deviceID: deviceID,
-          token: token,
-          defaults: defaults,
-          currentOverride: appEntry
-        )
+        logTimelineChoice("family=\(family) source=local-empty (no usable local plan)")
+        // 共享状态还没有内容（App 从未打开过）时**宁可什么都不排**：WidgetKit 会
+        // 继续显示上一份时间线，也好过扩展凭空猜一张用户没看过的照片。
+        return ([], Date().addingTimeInterval(15 * 60))
       }
       // In recommendation mode there are no future 15-minute entries to
       // preload. Preserve the host app's exact composite briefly so a native
@@ -487,33 +495,23 @@ private enum BloomWidgetRemoteLoader {
     return (entries, nextCarouselCheck(proposed: refillAt, defaults: defaults))
   }
 
-  /// 扩展的轮播时间线：**只读共享状态，不联网、不做决策。**
-  ///
-  /// 这里原本是一整套扩展自建的在线补货：自己拉 `/api/frame/devices/.../carousel/plan`、
-  /// 自己挑分页游标、自己下载照片、自己合并进 `iosCarouselPlan`。那是**重写之前
-  /// 遗留的第二写者**（最早见于 2026-08-17 的初始提交），也正是「照片和文案来自
-  /// 两个不同来源」的源头——照片走共享状态、文案走它自己那张表，实测停在不同的
-  /// 条目上（照片 4376、共享状态已到 4409）。
-  ///
-  /// 方案把「选哪一格」明确列为 Swift 侧不得实现的决策。现在整个扩展与小组件主体、
-  /// 宿主 App、安卓原生读**同一份共享状态**，规则只有一条：`date_ms <= now` 的最后
-  /// 一条。**Dart 是唯一的写者。**
-  ///
-  /// 参数 `deviceID` / `token` 保留是为了不动调用点；这条路径已经不再联网。
-  private static func carouselTimeline(
-    family: String,
-    deviceID: String,
-    token: String,
-    defaults: UserDefaults,
-    currentOverride: BloomEntry? = nil
-  ) async throws -> ([BloomEntry], Date) {
-    if let local = localCarouselTimeline(family: family, defaults: defaults) {
-      return local
-    }
-    // 共享状态还没有内容（App 从未打开过）时**宁可什么都不排**：WidgetKit 会
-    // 继续显示上一份时间线，也好过扩展凭空猜一张用户没看过的照片。
-    return ([], Date().addingTimeInterval(15 * 60))
-  }
+  // 这里原本还有一个 `carouselTimeline(family:deviceID:token:defaults:currentOverride:)`。
+  //
+  // 它的文档说自己是"只读共享状态、不联网"，函数体确实是纯本地查询；但调用点
+  // 把它当成"联网补货"来用（前一行日志写着 `fetching instead`），而且
+  // `deviceID` / `token` / `currentOverride` 三个参数从头到尾没有被读过。那套
+  // 扩展自建的在线补货——自己拉 `/carousel/plan`、自己挑分页游标、自己下载照片、
+  // 自己合并进 `iosCarouselPlan`——是**重写之前遗留的第二写者**（最早见于
+  // 2026-08-17 的初始提交），也正是「照片和文案来自两个不同来源」的源头：照片走
+  // 共享状态、文案走它自己那张表，实测停在不同的条目上（照片 4376、共享状态已到
+  // 4409）。方案把「选哪一格」明确列为 Swift 侧不得实现的决策。
+  //
+  // 现在整个扩展与小组件主体、宿主 App、安卓原生读**同一份共享状态**，规则只有
+  // 一条：`date_ms <= now` 的最后一条。**Dart 是唯一的写者。**
+  //
+  // 那层空转已经被删掉了，调用点直接走本地查表 + 明确的"露底"日志。补货是宿主
+  // App 的职责：前台靠 `_armNextSlotWake`，后台靠 `BGAppRefreshTask`；扩展不做
+  // 也不该做网络。
 
   private static func localDay(_ date: Date = Date()) -> String {
     let formatter = DateFormatter()

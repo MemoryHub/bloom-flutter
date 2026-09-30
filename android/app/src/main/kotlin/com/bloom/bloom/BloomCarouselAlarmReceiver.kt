@@ -108,6 +108,18 @@ object BloomCarouselSchedule {
         }
 
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        // 幂等：同一格会被多条路径重复应用（receiver 一次、provider 的 onUpdate
+        // 一次、补货闹钟一次）。没有这个判断，每格都要写两遍盘、打两行 "applied"，
+        // 取证时反而看不清真正发生切换的那一点。
+        //
+        // 比的是 itemId **加** 人像路径：换图（substitute）时 itemId 不变而路径会变，
+        // 所以不能只比 itemId。
+        if (prefs.getInt("recommendationId", -1) == itemId &&
+            prefs.getString("mobileLocalPortraitPath", null) == portrait
+        ) {
+            return true
+        }
+
         val editor = prefs.edit()
             .putString("mobileLocalPortraitPath", portrait)
             .putString("mobileLocalSquarePath", entry.nullableString("square_path"))
@@ -132,6 +144,32 @@ object BloomCarouselSchedule {
                 "action=${intent?.action}",
         )
         return true
+    }
+
+    /**
+     * 轮播模式下把画面重新对齐到「此刻该显示的那一条」。
+     *
+     * 格子闹钟只排**未来**的格子。可闹钟链是会断的（重启中 launcher 还没恢复
+     * 小组件、被系统清后台、排程失败），等它重建时「当前格」通常已经过去了；
+     * 此时若只按 prefs 重绘，画面会一直停在旧照片上，直到下一个格子闹钟——实测
+     * 这一次是 12 分钟（18:00 该显示的图，18:12 才上屏，用户看到的就是「不点开
+     * App 就不更新」）。
+     *
+     * 所以让**任何一次 provider 刷新**都先问一次权威状态。决策依然只有 Dart 那
+     * 一条规则（`date_ms <= now` 的最后一条），这里只是把它重新问一遍。
+     *
+     * 只在轮播模式下调：推荐模式下 `carousel-state.json` 可能还留着上一次的陈旧
+     * 内容，照搬会覆盖用户刚选的照片。
+     */
+    fun applyLatestDueEntryIfCarousel(context: Context): Boolean {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        when (prefs.getString("mode", null)) {
+            "recommend" -> return false
+            "carousel" -> Unit
+            // 还没有 mode（装完还没放小组件）：只有权威状态确实存在时才认它。
+            else -> if (BloomCarouselState.read(context) == null) return false
+        }
+        return applyLatestDueEntry(context, null)
     }
 
     private fun org.json.JSONObject.nullableString(key: String): String? {
