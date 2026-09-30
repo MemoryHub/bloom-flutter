@@ -9,6 +9,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
+import 'support/fake_account.dart';
+
 /// F4 UI tests for the restored three-tab navigation and the home page.
 ///
 /// Every test drives real taps on the nav bar. The page itself is
@@ -372,5 +374,6 @@ class _HarnessState extends State<_Harness> {
     onRefreshPairingCode: () {},
     onCopyDeviceId: () {},
     onCopyPairingCode: () {},
+    account: fakeAccount(),
   );
 }

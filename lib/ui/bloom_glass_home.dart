@@ -9,6 +9,8 @@ import '../core/models/auth_models.dart';
 import '../core/models/device_models.dart';
 import '../core/storage/display_preferences.dart';
 import 'bloom_device_pages.dart';
+import 'bloom_profile_page.dart';
+import 'bloom_sign_in_prompt.dart';
 
 Widget _buildDeviceNavGlyph(BuildContext context, LiquidGlassGlyph glyph) {
   if (!glyph.selected) {
@@ -598,7 +600,12 @@ class BloomGlassHome extends StatelessWidget {
     final width = MediaQuery.sizeOf(context).width;
     final navWidth = (width - 36).clamp(280.0, 330.0);
     // Tab order is the nav's order: 首页 (the photo the widget is showing) →
-    // 照片 (the future photo library, an empty placeholder today) → 设备.
+    // 照片 (the future photo library, an empty placeholder today) → 设备 →
+    // 我的 (账号)。
+    //
+    // 四个页面在未登录时都换成各自措辞的登录提示；把关卡放在**页面内部**
+    // 而不是套在整个 scaffold 上，是为了让底部导航始终可见 —— 套在外面的话
+    // 未登录时连 tab 都没了，用户连"我在哪一页"都看不出来。
     final pages = [
       _PhotoPage(
         // The switch being off freezes this phone's card, so a "下次更新" under it
@@ -618,8 +625,10 @@ class BloomGlassHome extends StatelessWidget {
         devices: devices,
         selectedDeviceId: selectedDeviceId,
         onDeviceChanged: onDeviceChanged,
+        account: account,
+        onSignIn: onAccountTap,
       ),
-      const _PhotoLibraryPlaceholderPage(),
+      _PhotoLibraryPlaceholderPage(account: account, onSignIn: onAccountTap),
       BloomDeviceListPage(
         devices: devices,
         widgetEnabled: widgetEnabled,
@@ -628,8 +637,13 @@ class BloomGlassHome extends StatelessWidget {
         onAddDevice: onAddDevice,
         account: account,
         onAccountTap: onAccountTap,
-        onSignOut: onSignOut,
         accountBusy: accountBusy,
+      ),
+      BloomProfilePage(
+        account: account,
+        onSignIn: onAccountTap,
+        onSignOut: onSignOut,
+        busy: accountBusy,
       ),
     ];
 
@@ -681,6 +695,13 @@ class BloomGlassHome extends StatelessWidget {
             LiquidGlassTabBarItem.custom(
               iconBuilder: _buildDeviceNavGlyph,
               label: '设备',
+            ),
+            // 四个 tab 时每个都变窄，字号和间距跟着收一点，否则中文标签会
+            // 贴到相邻项上。宽度由 navWidth 统一管，这里只管文字。
+            LiquidGlassTabBarItem(
+              icon: Icons.person_outline_rounded,
+              selectedIcon: Icons.person_rounded,
+              label: '我的',
             ),
           ],
           selectedIndex: selectedTab,
@@ -1137,6 +1158,8 @@ class _PhotoPage extends StatelessWidget {
     required this.devices,
     required this.selectedDeviceId,
     required this.onDeviceChanged,
+    required this.account,
+    required this.onSignIn,
   });
 
   final String? nextSlotText;
@@ -1148,6 +1171,10 @@ class _PhotoPage extends StatelessWidget {
   final List<BloomDevice> devices;
   final String? selectedDeviceId;
   final ValueChanged<String> onDeviceChanged;
+
+  /// 当前账号。null = 未登录，此时整页只显示登录提示。
+  final AccountInfo? account;
+  final VoidCallback? onSignIn;
 
   /// The device whose photos this page shows. Falls back to this phone when
   /// nothing (or something unknown) is selected.
@@ -1228,6 +1255,40 @@ class _PhotoPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // 未登录时整页换成登录提示 —— 连"下一张"和设备切换器一起收起来。
+    //
+    // ⚠️ 注意这只挡**【App 里这一页】**，不影响桌面上那个小组件：小组件走的是
+    // 设备令牌（native 侧自己跑），与账号无关，所以未登录时小组件照样换图。
+    // 换句话说，这里挡掉的是"在 App 里看那张图"，不是换图本身。
+    if (account == null) {
+      return SafeArea(
+        minimum: const EdgeInsets.fromLTRB(
+          BloomSurface.pageInset,
+          BloomSurface.pageInset,
+          BloomSurface.pageInset,
+          0,
+        ),
+        child: Padding(
+          padding: const EdgeInsets.only(bottom: 96),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const BloomPageTitle(title: '首页'),
+              const SizedBox(height: BloomGlassHome.headerGap),
+              Expanded(
+                child: BloomSignInPrompt(
+                  key: const ValueKey('bloom-home-signed-out'),
+                  title: '登录后查看相框内容',
+                  message: '你的相框和手机小组件都绑在账号下，登录后这里会显示它们正在展示的照片。',
+                  onSignIn: onSignIn,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     final selected = _selected;
     // This app only holds its own device token, so it cannot load the frame's
     // photos (`/carousel/plan` needs a token belonging to that device). Show
@@ -1511,7 +1572,16 @@ class _ModeTag extends StatelessWidget {
 /// page, and a glass panel with an icon in it reads as a placeholder for
 /// something that failed to load.
 class _PhotoLibraryPlaceholderPage extends StatelessWidget {
-  const _PhotoLibraryPlaceholderPage();
+  const _PhotoLibraryPlaceholderPage({
+    required this.account,
+    required this.onSignIn,
+  });
+
+  /// 当前账号。null = 未登录：此时**保留**原来的插画与文案，只在下面加一个
+  /// 登录按钮 —— 用户的原话是"中间是个图标、下面字不变，就再下面加一个登录
+  /// 按钮"。上传照片必须登录，没有账号就无从谈起。
+  final AccountInfo? account;
+  final VoidCallback? onSignIn;
 
   @override
   Widget build(BuildContext context) => SafeArea(
@@ -1532,58 +1602,74 @@ class _PhotoLibraryPlaceholderPage extends StatelessWidget {
         Expanded(
           child: Padding(
             padding: const EdgeInsets.only(bottom: 96),
-            child: Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  // A sheet of paper inside a frame: the same object the home
-                  // card is, drawn empty. Two hairlines instead of an icon in a
-                  // box is the whole "illustration".
-                  Container(
-                    width: 96,
-                    height: 118,
-                    padding: const EdgeInsets.all(9),
-                    decoration: BoxDecoration(
-                      color: BloomInk.panel,
-                      borderRadius: BorderRadius.circular(
-                        BloomSurface.innerRadius,
-                      ),
-                      // The one place a line is right: this is a drawing of a
-                      // picture frame, not a card.
-                      border: Border.all(
-                        color: BloomInk.textMuted.withValues(alpha: .5),
-                        width: 1.5,
-                      ),
-                      boxShadow: BloomInk.lift,
-                    ),
-                    child: DecoratedBox(
-                      decoration: BoxDecoration(
-                        color: BloomInk.recess,
-                        borderRadius: BorderRadius.circular(
-                          BloomSurface.innerRadius,
-                        ),
-                      ),
-                      child: const Center(
-                        child: Icon(
-                          Icons.photo_outlined,
-                          size: 26,
-                          color: BloomInk.textFaint,
-                        ),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 22),
-                  const Text('照片库即将上线', style: BloomType.rowTitle),
-                  const SizedBox(height: 8),
-                  const Text(
-                    '以后可以在这里回看每天推荐过的照片。',
-                    textAlign: TextAlign.center,
-                    style: BloomType.body,
-                  ),
-                ],
-              ),
-            ),
+            child: account == null
+                ? BloomSignInPrompt(
+                    key: const ValueKey('bloom-photos-signed-out'),
+                    illustration: const _EmptyFrameIllustration(),
+                    title: '照片库即将上线',
+                    message: '以后可以在这里回看每天推荐过的照片。',
+                    onSignIn: onSignIn,
+                  )
+                : const _PhotoLibraryComingSoon(),
           ),
+        ),
+      ],
+    ),
+  );
+}
+
+/// 「一张空相框」——照片页的插画。纸在框里，两行细线就是全部。
+///
+/// 单独抽出来是为了让**未登录与已登录两种状态共用同一张图**：登录前后只差
+/// 一个按钮，图不该跟着变。
+class _EmptyFrameIllustration extends StatelessWidget {
+  const _EmptyFrameIllustration();
+
+  @override
+  Widget build(BuildContext context) => Container(
+    width: 96,
+    height: 118,
+    padding: const EdgeInsets.all(9),
+    decoration: BoxDecoration(
+      color: BloomInk.panel,
+      borderRadius: BorderRadius.circular(BloomSurface.innerRadius),
+      // The one place a line is right: this is a drawing of a picture frame,
+      // not a card.
+      border: Border.all(
+        color: BloomInk.textMuted.withValues(alpha: .5),
+        width: 1.5,
+      ),
+      boxShadow: BloomInk.lift,
+    ),
+    child: DecoratedBox(
+      decoration: BoxDecoration(
+        color: BloomInk.recess,
+        borderRadius: BorderRadius.circular(BloomSurface.innerRadius),
+      ),
+      child: const Center(
+        child: Icon(Icons.photo_outlined, size: 26, color: BloomInk.textFaint),
+      ),
+    ),
+  );
+}
+
+/// 已登录时的照片页。功能还没做，所以仍然是"即将上线"。
+class _PhotoLibraryComingSoon extends StatelessWidget {
+  const _PhotoLibraryComingSoon();
+
+  @override
+  Widget build(BuildContext context) => const Center(
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _EmptyFrameIllustration(),
+        SizedBox(height: 22),
+        Text('照片库即将上线', style: BloomType.rowTitle),
+        SizedBox(height: 8),
+        Text(
+          '以后可以在这里回看每天推荐过的照片。',
+          textAlign: TextAlign.center,
+          style: BloomType.body,
         ),
       ],
     ),

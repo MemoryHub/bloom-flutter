@@ -12,6 +12,7 @@ import '../core/models/device_models.dart';
 import '../core/storage/display_preferences.dart';
 import 'bloom_glass_home.dart';
 import 'bloom_keep_alive_card.dart';
+import 'bloom_sign_in_prompt.dart';
 
 /// One row of the F3 device list.
 ///
@@ -182,7 +183,6 @@ class BloomDeviceListPage extends StatelessWidget {
     this.onWidgetEnabledChanged,
     this.account,
     this.onAccountTap,
-    this.onSignOut,
     this.accountBusy = false,
   });
 
@@ -201,15 +201,51 @@ class BloomDeviceListPage extends StatelessWidget {
   /// 打开登录页。未登录时的入口。
   final VoidCallback? onAccountTap;
 
-  /// 退出登录。已登录时的入口。
-  final VoidCallback? onSignOut;
-
   /// 登录态正在变化（例如正在取设备列表），期间禁用账号操作，避免重复点击。
   final bool accountBusy;
 
 
   @override
-  Widget build(BuildContext context) => SafeArea(
+  Widget build(BuildContext context) {
+    // 未登录：整页换成登录提示。
+    //
+    // 设备列表**本来就是账号数据** —— 服务端按账号返回绑定关系
+    // （`list_user_devices` 走 immich_user_id），没有账号就无从列起。
+    // 之前用硬编码兜底假装有设备，那才是错的：它会显示一台你并没有的设备。
+    //
+    // ⚠️ 代价：本机小组件的详情页（里面有"小组件开关"和刷新节奏）也进不去了。
+    // 那些设置其实只要设备令牌、不需要账号。如果希望未登录时仍能改本机小组件，
+    // 就把本机那一张 tile 留在提示上方。
+    if (account == null) {
+      return SafeArea(
+        minimum: const EdgeInsets.fromLTRB(
+          BloomSurface.pageInset,
+          BloomSurface.pageInset,
+          BloomSurface.pageInset,
+          0,
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            const BloomPageTitle(title: '设备', subtitle: '管理相框和手机小组件'),
+            const SizedBox(height: BloomPageTitle.contentGap),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: 96),
+                child: BloomSignInPrompt(
+                  key: const ValueKey('bloom-devices-signed-out'),
+                  title: '登录后管理你的设备',
+                  message: '相框和手机小组件都绑在账号下，登录后这里会列出它们。',
+                  onSignIn: onAccountTap,
+                  busy: accountBusy,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    return SafeArea(
     minimum: const EdgeInsets.fromLTRB(
       BloomSurface.pageInset,
       BloomSurface.pageInset,
@@ -288,95 +324,8 @@ class BloomDeviceListPage extends StatelessWidget {
               onTap: () => onOpenDevice(devices[index]),
             ),
           ],
-        const SizedBox(height: 28),
-        _accountSection(),
       ],
     ),
-  );
-
-  /// 账号区（F1）。
-  ///
-  /// 刻意**放在设备列表下方而不是做成独立的第四个 tab**：账号的存在意义就是
-  /// "这些设备属于谁"，把它和它管的设备放在同一页，用户不需要在两处之间来回。
-  ///
-  /// 未登录时只有一个安静入口，不是弹窗、不是门禁 —— App 的主体功能
-  /// （小组件换图）靠设备令牌运行，与登录无关，不该被登录拦住。
-  Widget _accountSection() {
-    final current = account;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Padding(
-          padding: const EdgeInsets.only(left: 4, bottom: 10),
-          child: Text('账号', style: BloomType.sectionTitle),
-        ),
-        BloomPanel(
-          lifted: true,
-          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
-          child: current == null
-              ? Row(
-                  children: [
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('登录 Bloom', style: BloomType.rowTitle),
-                          const SizedBox(height: 4),
-                          Text(
-                            '登录后可同步管理相框与照片',
-                            style: BloomType.meta,
-                          ),
-                        ],
-                      ),
-                    ),
-                    SizedBox(
-                      width: 96,
-                      child: BloomPrimaryButton(
-                        key: const ValueKey('bloom-sign-in'),
-                        label: '登录',
-                        loading: accountBusy,
-                        onPressed: onAccountTap,
-                      ),
-                    ),
-                  ],
-                )
-              : Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            current.displayName,
-                            style: BloomType.rowTitle,
-                          ),
-                        ),
-                        TextButton(
-                          key: const ValueKey('bloom-sign-out'),
-                          onPressed: accountBusy ? null : onSignOut,
-                          child: const Text('退出登录'),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 4),
-                    Text(current.maskedPhone, style: BloomType.meta),
-                    if (current.isProvisioning) ...[
-                      const SizedBox(height: 10),
-                      Text(
-                        '正在准备你的相册，稍后就能看到照片了',
-                        style: BloomType.meta,
-                      ),
-                    ] else if (current.provisionFailed) ...[
-                      const SizedBox(height: 10),
-                      Text(
-                        '相册准备失败，请联系我们',
-                        style: BloomType.meta.copyWith(color: BloomInk.accent),
-                      ),
-                    ],
-                  ],
-                ),
-        ),
-      ],
     );
   }
 }

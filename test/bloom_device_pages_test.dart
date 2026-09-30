@@ -13,6 +13,8 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'support/fake_account.dart';
+
 /// The `settings/set` writes among [requests]. The detail page also reads
 /// `settings/get` once on open, so every assertion about a save has to say
 /// which of the two it means instead of counting every request.
@@ -313,6 +315,7 @@ void main() {
             builder:
                 (context) => BloomDeviceListPage(
                   devices: devices,
+                  account: fakeAccount(),
                   onOpenDevice:
                       (device) => BloomDeviceDetailPage.open(
                         context,
@@ -368,6 +371,7 @@ void main() {
       await tester.pumpWidget(
         MaterialApp(
           home: BloomDeviceListPage(
+            account: fakeAccount(),
             devices: bloomDevices(credentials: credentials, localOnline: true),
             onOpenDevice: (_) {},
             onAddDevice: () {},
@@ -397,6 +401,7 @@ void main() {
       await tester.pumpWidget(
         MaterialApp(
           home: BloomDeviceListPage(
+            account: fakeAccount(),
             devices: bloomDevices(credentials: credentials, localOnline: true),
             onOpenDevice: (_) {},
             onAddDevice: () => taps++,
@@ -1379,6 +1384,9 @@ void main() {
             ),
             api: client,
             displayPreferences: DisplayPreferences(api: client),
+            // 已登录：四个页面都有未登录分支，不喂会话就会停在登录提示上，
+            // 这些验内容的用例会假失败。
+            auth: signedInAuthRepository(),
           ),
         ),
       );
@@ -1451,6 +1459,9 @@ void main() {
             ),
             api: client,
             displayPreferences: DisplayPreferences(api: client),
+            // 已登录：四个页面都有未登录分支，不喂会话就会停在登录提示上，
+            // 这些验内容的用例会假失败。
+            auth: signedInAuthRepository(),
           ),
         ),
       );
@@ -1522,6 +1533,9 @@ void main() {
             ),
             api: client,
             displayPreferences: DisplayPreferences(api: client),
+            // 已登录：四个页面都有未登录分支，不喂会话就会停在登录提示上，
+            // 这些验内容的用例会假失败。
+            auth: signedInAuthRepository(),
           ),
         ),
       );
@@ -1578,6 +1592,8 @@ void main() {
                   onRefreshPairingCode: () {},
                   onCopyDeviceId: () {},
                   onCopyPairingCode: () {},
+                  // 首页现在也要登录才显示内容，这个用例验的是内容本身。
+                  account: fakeAccount(),
                 ),
           ),
         ),

@@ -33,8 +33,15 @@ class AccountInfo {
   bool get provisionFailed => provisionStatus == 'failed';
 
   /// 打码后的手机号，界面上永远用它，不打完整号码。
+  ///
+  /// ⚠️ 服务端存的是 E.164（`+8618611137800`），直接取前 3 位会得到
+  /// `861****7800` —— 那是把**国码当成号码开头**显示给用户看。先剥掉 `+86`
+  /// 再打码，才是 `186****7800` 这种一眼能认出来的形式。
   String get maskedPhone {
-    final digits = phone.startsWith('+') ? phone.substring(1) : phone;
+    var digits = phone.startsWith('+') ? phone.substring(1) : phone;
+    if (digits.length == 13 && digits.startsWith('86')) {
+      digits = digits.substring(2);
+    }
     if (digits.length < 7) return digits;
     return '${digits.substring(0, 3)}****${digits.substring(digits.length - 4)}';
   }
