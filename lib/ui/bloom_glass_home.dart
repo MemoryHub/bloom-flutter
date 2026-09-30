@@ -211,8 +211,6 @@ class BloomGlassHome extends StatelessWidget {
   const BloomGlassHome({
     super.key,
     required this.loading,
-    required this.paired,
-    required this.pairingRefreshing,
     required this.nextLoading,
     required this.selectedTab,
     required this.settings,
@@ -225,15 +223,12 @@ class BloomGlassHome extends StatelessWidget {
     required this.onDeviceChanged,
     required this.onOpenDevice,
     required this.onAddDevice,
-    required this.onRefreshPairingCode,
     required this.onCopyDeviceId,
-    required this.onCopyPairingCode,
     this.account,
     this.onAccountTap,
     this.onSignOut,
     this.accountBusy = false,
     this.credentials,
-    this.pairing,
     this.portrait,
     this.originalPhotoPath,
     this.content,
@@ -245,12 +240,9 @@ class BloomGlassHome extends StatelessWidget {
 
   final bool loading;
 
-  final bool paired;
-  final bool pairingRefreshing;
   final bool nextLoading;
   final int selectedTab;
   final DeviceCredentials? credentials;
-  final PairingInfo? pairing;
   final CachedWidgetImage? portrait;
   final String? originalPhotoPath;
   final DailyContent? content;
@@ -340,9 +332,7 @@ class BloomGlassHome extends StatelessWidget {
   final ValueChanged<String> onDeviceChanged;
   final ValueChanged<BloomDevice> onOpenDevice;
   final VoidCallback onAddDevice;
-  final VoidCallback onRefreshPairingCode;
   final VoidCallback onCopyDeviceId;
-  final VoidCallback onCopyPairingCode;
 
   /// The flat colour behind everything: the top stop of [backgroundGradient], so
   /// a transparent app bar never shows a seam where the gradient starts.
@@ -578,21 +568,19 @@ class BloomGlassHome extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (!paired && loading) {
-      return const _BindingCheckExperience();
-    }
-    if (!paired) {
-      return _PairingExperience(
-        loading: loading,
-        pairingRefreshing: pairingRefreshing,
-        credentials: credentials,
-        pairing: pairing,
-        message: message,
-        onRefreshPairingCode: onRefreshPairingCode,
-        onCopyDeviceId: onCopyDeviceId,
-        onCopyPairingCode: onCopyPairingCode,
-      );
-    }
+    // **配对页已经没有了。**
+    //
+    // 这里原来是 `if (!paired) return _PairingExperience(...)` —— 一页"设备 ID
+    // + 激活码"，要用户把两样东西抄进 Immich 后台。那是账号出现之前的机制：
+    // 设备归属靠一次性激活码证明。
+    //
+    // 现在归属由**登录**证明（登录时上报设备 ID，服务端 `claim_device` 把它挂到
+    // 账号下），所以这一页既没有存在的理由，也是那个 iOS bug 的落点 ——
+    // 全新安装首次启动时平台通道没装上、设备身份拿不到，用户就被扔到这里。
+    //
+    // 现在无论有没有设备身份都渲染正常界面；**内容由登录状态决定**，每个页面
+    // 自己挡住（见各页的未登录分支）。
+    if (loading) return const _BindingCheckExperience();
     return _buildBound(context);
   }
 
@@ -2072,7 +2060,10 @@ class _BindingCheckExperience extends StatelessWidget {
                           children: [
                             Text('正在连接 Bloom', style: BloomType.rowTitle),
                             SizedBox(height: 7),
-                            Text('正在确认设备绑定状态…', style: BloomType.meta),
+                            // 原来写的是"正在确认设备绑定状态…"。绑定已经不在
+                            // 启动路径上了（它发生在登录时），这句话只会让人
+                            // 以为 App 又在检查什么配对状态。
+                            Text('正在同步你的相框…', style: BloomType.meta),
                           ],
                         ),
                       ),
@@ -2088,155 +2079,6 @@ class _BindingCheckExperience extends StatelessWidget {
   );
 }
 
-class _PairingExperience extends StatelessWidget {
-  const _PairingExperience({
-    required this.loading,
-    required this.pairingRefreshing,
-    required this.credentials,
-    required this.pairing,
-    required this.message,
-    required this.onRefreshPairingCode,
-    required this.onCopyDeviceId,
-    required this.onCopyPairingCode,
-  });
-
-  final bool loading;
-  final bool pairingRefreshing;
-  final DeviceCredentials? credentials;
-  final PairingInfo? pairing;
-  final String? message;
-  final VoidCallback onRefreshPairingCode;
-  final VoidCallback onCopyDeviceId;
-  final VoidCallback onCopyPairingCode;
-
-  @override
-  Widget build(BuildContext context) => Material(
-    color: Colors.transparent,
-    child: BloomAtmosphere(
-      child: SafeArea(
-        minimum: const EdgeInsets.all(20),
-        child: Center(
-          child: SingleChildScrollView(
-            physics: const BouncingScrollPhysics(),
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 520),
-              child: Column(
-                children: [
-                  const Text(
-                    'Bloom',
-                    style: TextStyle(
-                      color: BloomInk.text,
-                      fontSize: 34,
-                      height: 1.15,
-                      fontWeight: FontWeight.w600,
-                      fontFamily: BloomType.serifFamily,
-                      fontFamilyFallback: BloomType.serifFallback,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text('把记忆留在每天看得见的地方', style: BloomType.body),
-                  const SizedBox(height: 28),
-                  BloomPanel(
-                    lifted: true,
-                    padding: const EdgeInsets.fromLTRB(20, 22, 20, 20),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        const Text('连接 Bloom', style: BloomType.rowTitle),
-                        const SizedBox(height: 8),
-                        const Text(
-                          '打开 bloom.jihu.top，在“设备管理”中输入设备 ID 和绑定码。',
-                          style: TextStyle(
-                            color: BloomInk.textMuted,
-                            fontSize: 14,
-                            height: 1.5,
-                          ),
-                        ),
-                        const SizedBox(height: 22),
-                        _PairingValue(
-                          label: '设备 ID',
-                          value:
-                              credentials?.deviceId ??
-                              (loading ? '正在准备设备标识…' : '暂时不可用'),
-                          onCopy: credentials == null ? null : onCopyDeviceId,
-                        ),
-                        const SizedBox(height: 18),
-                        _PairingValue(
-                          label: '绑定码',
-                          value:
-                              pairing?.code ?? (loading ? '正在获取…' : '点击下方重新生成'),
-                          emphasized: pairing != null,
-                          onCopy: pairing == null ? null : onCopyPairingCode,
-                        ),
-                        const SizedBox(height: 20),
-                        // The only action on this screen, so it carries the
-                        // app's single accent.
-                        BloomPrimaryButton(
-                          label: '重新生成绑定码',
-                          icon: Icons.refresh_rounded,
-                          loadingLabel: '正在生成绑定码…',
-                          loading: pairingRefreshing,
-                          onPressed:
-                              pairingRefreshing ? null : onRefreshPairingCode,
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (message != null) ...[
-                    const SizedBox(height: 14),
-                    BloomMessage(message: message!),
-                  ],
-                ],
-              ),
-            ),
-          ),
-        ),
-      ),
-    ),
-  );
-}
-
-class _PairingValue extends StatelessWidget {
-  const _PairingValue({
-    required this.label,
-    required this.value,
-    this.emphasized = false,
-    this.onCopy,
-  });
-
-  final String label;
-  final String value;
-  final bool emphasized;
-  final VoidCallback? onCopy;
-
-  @override
-  Widget build(BuildContext context) => Column(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      Text(label, style: BloomType.meta),
-      const SizedBox(height: 7),
-      Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            child: SelectableText(
-              value,
-              style: TextStyle(
-                color: BloomInk.text,
-                fontSize: emphasized ? 30 : 14,
-                letterSpacing: emphasized ? 5 : 0,
-                fontWeight: emphasized ? FontWeight.w700 : FontWeight.w500,
-                height: 1.35,
-              ),
-            ),
-          ),
-          if (onCopy != null)
-            _PlainIconButton(icon: Icons.copy_rounded, onTap: onCopy),
-        ],
-      ),
-    ],
-  );
-}
 
 /// The app's ink: warm white type on a warm-black wall.
 ///
@@ -3093,29 +2935,6 @@ class BloomPageTitle extends StatelessWidget {
   }
 }
 
-/// The copy button next to a pairing value: a recess in the panel, not a
-/// floating button — it belongs to the value it copies.
-class _PlainIconButton extends StatelessWidget {
-  const _PlainIconButton({required this.icon, required this.onTap});
-
-  final IconData icon;
-  final VoidCallback? onTap;
-
-  @override
-  Widget build(BuildContext context) => IconButton(
-    onPressed: onTap,
-    color: BloomInk.text,
-    iconSize: 18,
-    style: IconButton.styleFrom(
-      backgroundColor: BloomInk.recess,
-      disabledBackgroundColor: const Color(0x0FEDF2EF),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(BloomSurface.controlRadius),
-      ),
-    ),
-    icon: Icon(icon),
-  );
-}
 
 /// The app's one transient message: the glass slip that floats over a page.
 ///

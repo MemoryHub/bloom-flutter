@@ -23,15 +23,22 @@ class BloomAuthPage extends StatefulWidget {
     this.onSignedIn,
     this.onCancel,
     this.initialRegisterMode = false,
+    this.device,
   });
 
   final AuthRepository auth;
-  final ValueChanged<AccountInfo>? onSignedIn;
+
+  /// 登录/注册成功。回传整个 [AuthResult] 而不只是账号 —— 里面可能带着服务端
+  /// 刚下发的设备令牌，调用方要把它存进设备身份仓库。
+  final ValueChanged<AuthResult>? onSignedIn;
 
   /// 有值时会显示一个返回入口。作为开屏门禁时传 null。
   final VoidCallback? onCancel;
 
   final bool initialRegisterMode;
+
+  /// 本机设备信息，随登录一起上报，服务端据此认领这台手机。
+  final DeviceClaim? device;
 
   @override
   State<BloomAuthPage> createState() => _BloomAuthPageState();
@@ -129,15 +136,20 @@ class _BloomAuthPageState extends State<BloomAuthPage> {
       _error = null;
     });
     try {
-      final account = _registerMode
+      final result = _registerMode
           ? await widget.auth.register(
               phone: _digits,
               code: _code.text,
               nickname: _nickname.text,
+              device: widget.device,
             )
-          : await widget.auth.login(phone: _digits, code: _code.text);
+          : await widget.auth.login(
+              phone: _digits,
+              code: _code.text,
+              device: widget.device,
+            );
       if (!mounted) return;
-      widget.onSignedIn?.call(account);
+      widget.onSignedIn?.call(result);
     } on BloomApiException catch (error) {
       if (!mounted) return;
       setState(() {

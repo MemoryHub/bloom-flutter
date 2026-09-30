@@ -1,8 +1,12 @@
-/// F1 账号体系的模型。
+/// 账号体系的模型。
 ///
 /// 与设备令牌（`DeviceCredentials`）刻意分开：那是"这台手机的小组件"的身份，
-/// 这是"这个人"的身份。两者并存，谁也不顶掉谁 —— 小组件的后台刷新仍然只用
-/// 设备令牌，登录与否都不影响它继续换图。
+/// 这是"这个人"的身份。
+///
+/// ⚠️ 两者的关系在"登录即绑定"之后变了：设备令牌**由服务端在登录/认领设备时
+/// 下发**，所以未登录时本机根本没有可用的设备令牌，小组件也就取不到新图
+/// （这正是"登出即冻结"的实现方式）。设备 ID 仍是本机生成的，它只是被**上报**
+/// 给服务端，用来把这条设备记录挂到账号下。
 library;
 
 class AccountInfo {
@@ -61,17 +65,77 @@ class AccountInfo {
   );
 }
 
+/// 登录/注册时上报的"这台手机是谁"。
+///
+/// [deviceId] 必须是 `bloom-mobile-` 开头：服务端拿它当安全边界（正则 + 再查
+/// 一次 device_type），挡住"报一个墨水屏相框的 ID 把它抢过来"。
+class DeviceClaim {
+  const DeviceClaim({
+    required this.deviceId,
+    this.name,
+    this.timezone = 'Asia/Shanghai',
+    this.language = 'zh-CN',
+    this.screenProfile = 'default',
+  });
+
+  final String deviceId;
+
+  /// 设备名。**只在服务端首次插入时生效** —— 之后在库里改过的名字不会被
+  /// 重新登录覆盖（以前会，于是四台设备全叫"Bloom 手机"）。
+  final String? name;
+
+  final String timezone;
+  final String language;
+  final String screenProfile;
+
+  Map<String, Object?> toJson() => {
+    'device_id': deviceId,
+    if (name != null && name!.trim().isNotEmpty) 'name': name!.trim(),
+    'timezone': timezone,
+    'language': language,
+    'screen_profile': screenProfile,
+  };
+}
+
+/// 服务端认领设备后下发的信息。
+///
+/// [deviceToken] **只在响应里出现这一次**（服务端只存 sha256），客户端必须自己
+/// 存好；丢了就再调一次认领接口换一枚新的。
+class ClaimedDevice {
+  const ClaimedDevice({required this.deviceId, required this.deviceToken});
+
+  final String deviceId;
+  final String deviceToken;
+
+  static ClaimedDevice? fromJson(Object? json) {
+    if (json is! Map) return null;
+    final map = json.cast<String, dynamic>();
+    final id = map['device_id'] as String?;
+    final token = map['device_token'] as String?;
+    if (id == null || token == null || token.length < 32) return null;
+    return ClaimedDevice(deviceId: id, deviceToken: token);
+  }
+}
+
 /// 注册或登录成功后的结果。
 class AuthResult {
   const AuthResult({
     required this.token,
     required this.expiresAt,
     required this.account,
+    this.device,
   });
 
   final String token;
   final DateTime expiresAt;
   final AccountInfo account;
+
+  /// 服务端在这次登录里认领成功的设备。
+  ///
+  /// **为 null 是常态**：注册的那一刻服务端还在异步建 Immich 用户，没有
+  /// `immich_user_id` 就绑不了设备。客户端据此判断"稍后再调一次认领接口"，
+  /// 而不是把登录当成失败。
+  final ClaimedDevice? device;
 
   factory AuthResult.fromJson(Map<String, dynamic> json) => AuthResult(
     token: json['token'] as String,
@@ -79,6 +143,7 @@ class AuthResult {
     account: AccountInfo.fromJson(
       (json['account'] as Map).cast<String, dynamic>(),
     ),
+    device: ClaimedDevice.fromJson(json['device']),
   );
 }
 

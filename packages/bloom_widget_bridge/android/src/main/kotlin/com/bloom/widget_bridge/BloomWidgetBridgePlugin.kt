@@ -121,6 +121,16 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     "deviceToken" to token,
                 ))
             }
+            // 设备身份镜像到"小组件读得到"的地方。
+            //
+            // Android 上是**空操作**：小组件换图跑在同一个进程的 Flutter 后台
+            // isolate 里（workmanager 的 Dart 回调），它直接读 SharedPreferences，
+            // 不存在第二个进程需要被通知的问题。
+            //
+            // iOS 上则必须做 —— 那边的 WidgetKit 扩展是独立进程、自己去拉
+            // `/carousel/plan`，只认 App Group 里的令牌。这里保留同名方法是为了
+            // 让 Dart 侧不必按平台分支。
+            "writeDeviceCredentials" -> result.success(null)
             // 后台保活自检：哪些开关还没开，以及怎么去开。列表本身由原生按机型
             // 与系统版本推导，Dart 侧只负责渲染，不认识任何版本号。
             "keepAliveStatus" -> {

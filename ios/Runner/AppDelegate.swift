@@ -265,12 +265,51 @@ import workmanager
     defaults.synchronize()
   }
 
-  private func configureBloomWidgetChannelWhenReady(attempt: Int = 0) {
+  /// 找到承载 Flutter 引擎的那个 view controller。
+  ///
+  /// 不只看 `window`：`FlutterAppDelegate.window` 在启动回调返回之后仍可能
+  /// 是 nil（storyboard 的 rootViewController 是**随后**挂上去的），而且
+  /// iOS 13 起如果哪天切到 UIScene 生命周期，`window` 会一直为 nil。多一条
+  /// 从 connectedScenes 里找的路，能少一整类"通道装不上"的问题。
+  private func bloomFlutterViewController() -> FlutterViewController? {
     if let controller = window?.rootViewController as? FlutterViewController {
+      return controller
+    }
+    for scene in UIApplication.shared.connectedScenes {
+      guard let windowScene = scene as? UIWindowScene else { continue }
+      for window in windowScene.windows {
+        if let controller = window.rootViewController as? FlutterViewController {
+          return controller
+        }
+      }
+    }
+    return nil
+  }
+
+  /// 把 `com.bloom/widget` 通道装上**真正的**实现。
+  ///
+  /// ⚠️ 这个循环原来有一条 `guard attempt < 40 else { return }` —— 2 秒硬上限，
+  /// 而且到点**静默放弃**。后果是实测到的那个 bug：全新安装后首次启动较慢，
+  /// 2 秒内拿不到 view controller 就放弃，通道上留下 `BloomWidgetBridgePlugin`
+  /// 里那个返回 nil 的空壳，于是 `stableDeviceCredentials` 拿不到设备身份，
+  /// App 停在"设备 ID + 激活码"页；杀掉重开（启动更快）就好了。
+  ///
+  /// 所以这里改成：**不静默放弃**。超时只是慢，不等于可以没有 —— 放弃了就意味着
+  /// 显示偏好、缓存目录、小组件状态这些全都拿不到。2 秒时打一条 warning 便于
+  /// 定位，60 秒仍装不上才认输并留下 error 日志。
+  private func configureBloomWidgetChannelWhenReady(attempt: Int = 0) {
+    if let controller = bloomFlutterViewController() {
       configureBloomWidgetChannel(controller)
+      NSLog("[Bloom] com.bloom/widget 通道已挂载（第 \(attempt) 次尝试）")
       return
     }
-    guard attempt < 40 else { return }
+    if attempt == 40 {
+      NSLog("[Bloom][WARN] 2 秒内没找到 FlutterViewController，继续等待 —— 通道没装上会让设备身份与显示偏好全部失效")
+    }
+    guard attempt < 1200 else {
+      NSLog("[Bloom][ERROR] 60 秒仍未找到 FlutterViewController，com.bloom/widget 通道未挂载")
+      return
+    }
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
       self?.configureBloomWidgetChannelWhenReady(attempt: attempt + 1)
     }
@@ -396,6 +435,35 @@ import workmanager
           defaults.set(credentials["deviceToken"], forKey: "bloom.device_token")
         }
         result(credentials)
+      case "writeDeviceCredentials":
+        // 把 Dart 侧保存的设备身份镜像进 App Group —— 小组件扩展是独立进程，
+        // 它只认这里的 `bloom.device_id` / `bloom.device_token`。
+        //
+        // 令牌以前是上面那个分支顺手写的，现在令牌由服务端在登录时下发、
+        // 由 Dart 保存，所以必须显式镜像；漏掉的话小组件会静静地停止更新，
+        // 而 App 里看不出任何异常。
+        guard let arguments = call.arguments as? [String: Any],
+              let deviceId = arguments["deviceId"] as? String,
+              let deviceToken = arguments["deviceToken"] as? String,
+              let defaults = UserDefaults(suiteName: Self.bloomAppGroup) else {
+          result(FlutterError(
+            code: "bad_arguments",
+            message: "writeDeviceCredentials 需要 deviceId 与 deviceToken",
+            details: nil
+          ))
+          return
+        }
+        if deviceToken.isEmpty {
+          // 登出：把令牌抹掉，小组件因此取不到新图（"登出即冻结"）。
+          // 设备 ID 留着无所谓，没有令牌它就什么都拉不到。
+          defaults.removeObject(forKey: "bloom.device_token")
+        } else {
+          defaults.set(deviceId, forKey: "bloom.device_id")
+          defaults.set(deviceToken, forKey: "bloom.device_token")
+        }
+        defaults.synchronize()
+        WidgetCenter.shared.reloadAllTimelines()
+        result(nil)
       case "readDisplayPreferences":
         let defaults = UserDefaults(suiteName: Self.bloomAppGroup)
         result([

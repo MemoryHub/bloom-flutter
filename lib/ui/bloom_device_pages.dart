@@ -547,14 +547,11 @@ class BloomDeviceDetailPage extends StatefulWidget {
     required this.settings,
     this.credentials,
     this.callerDeviceId,
-    this.pairing,
     this.onModeChanged,
     this.onSaved,
     this.onMirrored,
     this.photoPath,
     this.onWidgetEnabledChanged,
-    this.onRefreshPairingCode,
-    this.onCopyPairingCode,
   });
 
   final BloomDevice device;
@@ -573,7 +570,6 @@ class BloomDeviceDetailPage extends StatefulWidget {
 
   /// The app's own device id, sent as `caller_device_id`.
   final String? callerDeviceId;
-  final PairingInfo? pairing;
 
   /// Fired after a save that changed the display mode, so the home page can
   /// refresh the photo it shows.
@@ -598,8 +594,6 @@ class BloomDeviceDetailPage extends StatefulWidget {
   /// The photo the home page is currently showing, painted under this page for
   /// the same reason it is painted under the tabs.
   final String? photoPath;
-  final VoidCallback? onRefreshPairingCode;
-  final VoidCallback? onCopyPairingCode;
 
   /// Pushes the detail page. Kept in one place so the production route and the
   /// widget tests exercise the same navigation.
@@ -610,14 +604,11 @@ class BloomDeviceDetailPage extends StatefulWidget {
     required BloomDisplaySettings settings,
     DeviceCredentials? credentials,
     String? callerDeviceId,
-    PairingInfo? pairing,
     ValueChanged<BloomDisplaySettings>? onModeChanged,
     ValueChanged<BloomDisplaySettings>? onSaved,
     Future<void> Function(BloomDisplaySettings settings)? onMirrored,
     String? photoPath,
     ValueChanged<bool>? onWidgetEnabledChanged,
-    VoidCallback? onRefreshPairingCode,
-    VoidCallback? onCopyPairingCode,
   }) => Navigator.of(context).push<void>(
     MaterialPageRoute(
       builder:
@@ -627,14 +618,11 @@ class BloomDeviceDetailPage extends StatefulWidget {
             settings: settings,
             credentials: credentials,
             callerDeviceId: callerDeviceId,
-            pairing: pairing,
             onModeChanged: onModeChanged,
             onSaved: onSaved,
             onMirrored: onMirrored,
             photoPath: photoPath,
           onWidgetEnabledChanged: onWidgetEnabledChanged,
-            onRefreshPairingCode: onRefreshPairingCode,
-            onCopyPairingCode: onCopyPairingCode,
           ),
     ),
   );
@@ -1588,17 +1576,14 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
               value: widget.device.deviceId,
               onCopy: () => _copy(widget.device.deviceId, '设备号已复制。'),
             ),
-            const BloomRowDivider(indent: 0),
-            _InfoRow(
-              label: '配对码',
-              value: widget.pairing?.code ?? '尚未生成',
-              onCopy:
-                  widget.pairing == null
-                      ? null
-                      : () => widget.onCopyPairingCode?.call(),
-              onRefresh:
-                  widget.device.isLocal ? widget.onRefreshPairingCode : null,
-            ),
+            // 「配对码」这一行已经删掉了。
+            //
+            // 它是激活码机制的产物：用户要把六位码抄进 Immich 后台来证明"这台
+            // 设备归我"。现在归属由登录证明（登录时上报设备号，服务端把它挂到
+            // 账号下），所以这一行既没有东西可显示，留着还会让人以为仍然需要
+            // 去后台配对。
+            //
+            // 「设备号」保留：它仍然有用 —— 服务端的设备记录、报障时对号都用它。
           ],
         ),
       ),
@@ -2052,7 +2037,6 @@ class _InfoRow extends StatelessWidget {
     required this.label,
     required this.value,
     this.onCopy,
-    this.onRefresh,
   });
 
   final String label;
@@ -2060,9 +2044,6 @@ class _InfoRow extends StatelessWidget {
 
   /// Copy the value. A bare glyph, no border and no square box.
   final VoidCallback? onCopy;
-
-  /// Regenerate the value — only the pairing code has one.
-  final VoidCallback? onRefresh;
 
   @override
   Widget build(BuildContext context) => Padding(
@@ -2092,14 +2073,6 @@ class _InfoRow extends StatelessWidget {
                 icon: Icons.content_copy_rounded,
                 semanticLabel: '复制$label',
                 onTap: onCopy,
-              ),
-            ],
-            if (onRefresh != null) ...[
-              const SizedBox(width: 2),
-              _BareGlyph(
-                icon: Icons.refresh_rounded,
-                semanticLabel: '重新生成$label',
-                onTap: onRefresh,
               ),
             ],
           ],

@@ -70,9 +70,25 @@ public final class BloomWidgetBridgePlugin: NSObject, FlutterPlugin {
         "updatedAtMillis": Int(defaults.double(forKey: "updatedAtMillis")),
       ])
     case "stableDeviceCredentials":
-      // iOS Keychain normally survives uninstall. Avoid identifierForVendor,
-      // which can change after all apps from the vendor are removed.
-      result(nil)
+      // 【已废】这个方法在 iOS 上由 AppDelegate 实现（Keychain + App Group）。
+      //
+      // 这里原来也实现过一次，后果是**同一个通道名 com.bloom/widget 被注册
+      // 两遍**，而 FlutterMethodChannel 是同名覆盖：谁后 setMethodCallHandler
+      // 谁生效。本插件由 GeneratedPluginRegistrant 先注册，AppDelegate 之后
+      // 靠一个"等 rootViewController 出现"的循环抢回来 —— 那个循环有 2 秒硬
+      // 上限且**静默放弃**。首次安装启动慢，抢不回来，通道上留下的就是这个
+      // 返回 nil 的空壳：设备身份拿不到，App 卡在配对页；杀掉重开就好了。
+      //
+      // 现在设备身份改为**本地随机生成 + 登录时由服务端绑定**，不再需要跨重装
+      // 稳定，方法本身已无人调用；保留 case 只为让老客户端拿到一个明确的错误
+      // 而不是 FlutterMethodNotImplemented。
+      result(
+        FlutterError(
+          code: "moved_to_app_delegate",
+          message: "设备身份现在由 AppDelegate 提供",
+          details: nil
+        )
+      )
     default:
       result(FlutterMethodNotImplemented)
     }

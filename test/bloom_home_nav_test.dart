@@ -81,12 +81,13 @@ void main() {
     await settle(tester);
   }
 
-  testWidgets('底部导航是三个 tab：首页 / 照片 / 设备', (tester) async {
+  testWidgets('底部导航是四个 tab：首页 / 照片 / 设备 / 我的', (tester) async {
     await tester.pumpWidget(home());
     await settle(tester);
 
     expect(nav, findsOneWidget);
-    for (final label in ['首页', '照片', '设备']) {
+    // 「我的」是后加的第四个：账号原先挂在设备页底部的一个角落，那是个临时位置。
+    for (final label in ['首页', '照片', '设备', '我的']) {
       expect(
         find.descendant(of: nav, matching: find.text(label)),
         findsNWidgets(2),
@@ -336,8 +337,6 @@ class _HarnessState extends State<_Harness> {
   Widget build(BuildContext context) => BloomGlassHome(
     message: widget.message,
     loading: false,
-    paired: true,
-    pairingRefreshing: false,
     nextLoading: false,
     selectedTab: _tab,
     credentials: widget.credentials,
@@ -371,9 +370,7 @@ class _HarnessState extends State<_Harness> {
     onDeviceChanged: (_) {},
     onOpenDevice: (_) {},
     onAddDevice: () {},
-    onRefreshPairingCode: () {},
     onCopyDeviceId: () {},
-    onCopyPairingCode: () {},
     account: fakeAccount(),
   );
 }

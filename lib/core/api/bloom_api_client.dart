@@ -43,6 +43,12 @@ class BloomApiClient {
     if (etag != null) 'If-None-Match': etag,
   };
 
+  /// ⚠️ **App 里已经没有调用者了**，保留是为了对齐服务端仍然存在的接口
+  /// （相框固件的注册/配对走的就是它）。
+  ///
+  /// App 不再走这条路：它靠激活码授权，建出来的是一台"未配对"设备，然后要
+  /// 用户把设备号和六位码抄进 Immich 后台。现在归属由**登录**证明 ——
+  /// 见 [claimDevice] 与 `AuthRepository.register`。
   Future<PairingInfo> register(
     DeviceCredentials credentials, {
     required String name,
@@ -71,6 +77,8 @@ class BloomApiClient {
     return PairingInfo.fromJson(_json(response));
   }
 
+  /// ⚠️ 同 [register]：App 里已经没有调用者了。它服务的"重新生成激活码"按钮
+  /// 随配对页一起删掉了。
   Future<PairingInfo> refreshPairingCode(DeviceCredentials credentials) async {
     final response = await _client
         .post(
@@ -399,6 +407,7 @@ class BloomApiClient {
     required String phone,
     required String code,
     String? nickname,
+    DeviceClaim? device,
   }) async {
     final response = await _client
         .post(
@@ -412,6 +421,7 @@ class BloomApiClient {
             'code': code,
             if (nickname != null && nickname.trim().isNotEmpty)
               'nickname': nickname.trim(),
+            if (device != null) 'device': device.toJson(),
           }),
         )
         .timeout(_requestTimeout);
@@ -422,6 +432,7 @@ class BloomApiClient {
   Future<AuthResult> loginAccount({
     required String phone,
     required String code,
+    DeviceClaim? device,
   }) async {
     final response = await _client
         .post(
@@ -430,11 +441,41 @@ class BloomApiClient {
             'Content-Type': 'application/json',
             'Accept': 'application/json',
           },
-          body: jsonEncode({'phone': phone, 'code': code}),
+          body: jsonEncode({
+            'phone': phone,
+            'code': code,
+            if (device != null) 'device': device.toJson(),
+          }),
         )
         .timeout(_requestTimeout);
     _ensure(response, 200);
     return AuthResult.fromJson(_json(response));
+  }
+
+  /// 把本机认领到当前账号下，取回服务端下发的设备令牌。
+  ///
+  /// 登录接口里已经尝试过一次；[AuthResult.device] 为 null 时（注册后
+  /// provisioning 还没跑完）用它重试，通常几秒后就成功。
+  Future<ClaimedDevice> claimDevice({
+    required String userToken,
+    required DeviceClaim claim,
+  }) async {
+    final response = await _client
+        .post(
+          _uri('/api/frame/users/me/devices/claim'),
+          headers: {
+            ..._userHeaders(userToken),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode(claim.toJson()),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    final claimed = ClaimedDevice.fromJson(_json(response));
+    if (claimed == null) {
+      throw BloomApiException(500, 'device_claim_malformed', '服务端没有返回可用的设备令牌');
+    }
+    return claimed;
   }
 
   /// 服务端只吊销这一个会话；其他设备上的登录不受影响。

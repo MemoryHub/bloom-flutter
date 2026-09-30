@@ -246,8 +246,6 @@ class _GateHarnessState extends State<_GateHarness> {
   @override
   Widget build(BuildContext context) => BloomGlassHome(
     loading: false,
-    paired: true,
-    pairingRefreshing: false,
     nextLoading: false,
     selectedTab: _tab,
     credentials: widget.credentials,
@@ -269,9 +267,7 @@ class _GateHarnessState extends State<_GateHarness> {
     onDeviceChanged: (_) {},
     onOpenDevice: (_) {},
     onAddDevice: () {},
-    onRefreshPairingCode: () {},
     onCopyDeviceId: () {},
-    onCopyPairingCode: () {},
     account: widget.account,
     onAccountTap: widget.onSignIn,
   );

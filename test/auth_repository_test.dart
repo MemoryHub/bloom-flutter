@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:bloom/core/api/bloom_api_client.dart';
 import 'package:bloom/core/auth/auth_repository.dart';
+import 'package:bloom/core/models/auth_models.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -148,8 +149,10 @@ void main() {
       },
     );
 
-    final account = await auth.login(phone: '13800138000', code: '123456');
-    expect(account.immichReady, isTrue);
+    // login 现在回传整个 AuthResult（里面可能带服务端下发的设备令牌），
+    // 账号档案在 .account 上。
+    final result = await auth.login(phone: '13800138000', code: '123456');
+    expect(result.account.immichReady, isTrue);
     expect(auth.token, 'fresh-token');
     expect(store.values[AuthRepository.tokenKey], 'fresh-token');
     // 账号档案也要落盘，下次冷启动才有东西可显示。
@@ -236,6 +239,108 @@ void main() {
     await auth.signOut();
     expect(auth.isSignedIn, isFalse);
     expect(store.values, isEmpty);
+  });
+
+  group('登录即认领设备', () {
+    test('登录时上报的设备信息会进 JSON 体', () async {
+      final store = _MemoryStore();
+      Map<String, dynamic>? sent;
+      final auth = _repo(
+        store,
+        handler: (request) async {
+          sent = jsonDecode(request.body) as Map<String, dynamic>;
+          return http.Response(
+            jsonEncode({
+              'token': 't1',
+              'expires_at': '2030-01-01T00:00:00Z',
+              'account': _accountJson(ready: true),
+              'device': {
+                'device_id': 'bloom-mobile-abc',
+                'device_token': 'd' * 64,
+              },
+            }),
+            200,
+          );
+        },
+      );
+
+      final result = await auth.login(
+        phone: '13800138000',
+        code: '123456',
+        device: const DeviceClaim(deviceId: 'bloom-mobile-abc'),
+      );
+
+      expect(sent!['device']['device_id'], 'bloom-mobile-abc');
+      // 令牌只在响应里出现一次，必须原样带回来交给上层去存。
+      expect(result.device!.deviceToken, 'd' * 64);
+    });
+
+    test('服务端认领失败时 device 为 null，但登录照样成功', () async {
+      // 注册那一刻服务端还在异步建 Immich 用户，必然绑不上设备 —— 这是常态。
+      // 把它当成登录失败，就会得到"注册成功却当场登录不上"。
+      final store = _MemoryStore();
+      final auth = _repo(
+        store,
+        handler: (_) async => http.Response(
+          jsonEncode({
+            'token': 't1',
+            'expires_at': '2030-01-01T00:00:00Z',
+            'account': _accountJson(),
+            'device': null,
+          }),
+          201,
+        ),
+      );
+
+      final result = await auth.register(
+        phone: '13800138000',
+        code: '123456',
+        device: const DeviceClaim(deviceId: 'bloom-mobile-abc'),
+      );
+
+      expect(result.device, isNull);
+      expect(auth.isSignedIn, isTrue, reason: '认领失败不该影响登录');
+      expect(store.values[AuthRepository.tokenKey], 't1');
+    });
+
+    test('未登录时调认领接口直接报错，不发请求', () async {
+      var called = false;
+      final auth = _repo(
+        _MemoryStore(),
+        handler: (_) async {
+          called = true;
+          return http.Response('{}', 200);
+        },
+      );
+      await expectLater(
+        auth.claimDevice(const DeviceClaim(deviceId: 'bloom-mobile-abc')),
+        throwsA(isA<BloomApiException>()),
+      );
+      expect(called, isFalse);
+    });
+
+    test('认领接口回传畸形数据时报错，而不是静默返回空令牌', () async {
+      // 空令牌一旦被存进设备身份仓库，小组件会拿着它去打 /carousel/plan，
+      // 得到 401 之后表现为"小组件不换图"，而没有一条线索指向这里。
+      final store = _MemoryStore()
+        ..values[AuthRepository.tokenKey] = 'tok'
+        ..values[AuthRepository.accountKey] = jsonEncode(_accountJson(ready: true));
+      await _repo(store, handler: (_) async => http.Response('{}', 500)).load();
+
+      final auth = _repo(
+        store,
+        handler: (_) async => http.Response(
+          jsonEncode({'device_id': 'bloom-mobile-abc'}),
+          200,
+        ),
+      );
+      await auth.load();
+
+      await expectLater(
+        auth.claimDevice(const DeviceClaim(deviceId: 'bloom-mobile-abc')),
+        throwsA(isA<BloomApiException>()),
+      );
+    });
   });
 }
 

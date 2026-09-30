@@ -1,43 +1,60 @@
 import 'dart:math';
-import 'dart:io';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/device_models.dart';
 import 'package:bloom_widget_bridge/bloom_widget_bridge.dart';
 
+/// 本机设备身份（设备 ID + 设备令牌）。
+///
+/// ⚠️ **这里曾经要求身份跨重装"稳定"**：iOS 走 Keychain、Android 走
+/// ANDROID_ID，为此还需要一个必须在启动后 **2 秒内**装上的平台通道
+/// （`com.bloom/widget`）。那个竞态就是"全新安装首次启动卡在设备 ID +
+/// 激活码页、杀掉重开就好"的成因 —— 首次启动慢，通道没装上，设备身份拿不到。
+///
+/// 设备归属改由**登录**决定之后，稳定性就不再是需求了：重装后换一个新的设备
+/// ID，登录一次就重新绑到同一个账号（服务端 `claim_device_for_account`）。
+/// 所以这里回到最朴素的做法：**本机随机生成、本机保存**。
+///
+/// 那条平台通道仍然存在，但它现在只服务于显示偏好、缓存目录和小组件状态，
+/// 不再决定"这台机器是谁"。
 class DeviceIdentityRepository {
   DeviceIdentityRepository({
     SharedPreferences? preferences,
     FlutterSecureStorage? secureStorage,
     Future<String?> Function(String key)? readToken,
     Future<void> Function(String key, String value)? writeToken,
-    Future<Map<String, String>?> Function()? stableCredentials,
+    Future<void> Function(String deviceId, String deviceToken)? mirrorToWidget,
   }) : _preferences = preferences,
        _secureStorage = secureStorage ?? const FlutterSecureStorage(),
        _readToken = readToken,
        _writeToken = writeToken,
-       _stableCredentials = stableCredentials;
+       _mirrorToWidget =
+           mirrorToWidget ??
+           // 包一层：桥接方法用的是命名参数，签名对不上位置参数的字段类型。
+           ((deviceId, deviceToken) =>
+               BloomWidgetBridgePlatform.writeDeviceCredentials(
+                 deviceId: deviceId,
+                 deviceToken: deviceToken,
+               ));
 
   static const _deviceIdKey = 'bloom.device_id';
   static const _deviceTokenKey = 'bloom.device_token';
   static const _identityVersionKey = 'bloom.identity_version';
+  static const _serverTokenKey = 'bloom.device_token_issued';
   SharedPreferences? _preferences;
   final FlutterSecureStorage _secureStorage;
   final Future<String?> Function(String key)? _readToken;
   final Future<void> Function(String key, String value)? _writeToken;
-  final Future<Map<String, String>?> Function()? _stableCredentials;
+
+  /// 把身份镜像到原生侧（iOS 的 App Group）。见 [save] 的说明。
+  final Future<void> Function(String deviceId, String deviceToken)
+  _mirrorToWidget;
 
   Future<SharedPreferences> get _prefs async =>
       _preferences ??= await SharedPreferences.getInstance();
 
+  /// 读本机已保存的身份。没有（或残缺）返回 null，**不生成**。
   Future<DeviceCredentials?> read() async {
-    if (Platform.isIOS) {
-      final stable = await _iosStableCredentials();
-      final id = stable?['deviceId'];
-      final token = stable?['deviceToken'];
-      if (id == null || token == null || token.length < 32) return null;
-      return DeviceCredentials(deviceId: id, deviceToken: token);
-    }
     final id = (await _prefs).getString(_deviceIdKey);
     final token =
         await (_readToken?.call(_deviceTokenKey) ??
@@ -46,52 +63,87 @@ class DeviceIdentityRepository {
     return DeviceCredentials(deviceId: id, deviceToken: token);
   }
 
+  /// 取回本机身份，没有就当场生成一个并持久化。
+  ///
+  /// **本方法不再抛异常，也不再碰原生通道。** 它以前在 iOS 上会因为
+  /// `stableDeviceCredentials` 拿不到值而抛 `StateError`，而调用方只能把这个
+  /// 异常当成"服务器连不上"来处理 —— 一个本地身份问题伪装成网络问题，
+  /// 正是那个 bug 难查的原因。
   Future<DeviceCredentials> initialize() async {
-    if (Platform.isIOS) {
-      final stable = await _iosStableCredentials();
-      final id = stable?['deviceId'];
-      final token = stable?['deviceToken'];
-      if (id == null || token == null || token.length < 32) {
-        throw StateError('无法创建稳定设备身份');
-      }
-      return DeviceCredentials(deviceId: id, deviceToken: token);
-    }
-    final prefs = await _prefs;
     final existing = await read();
-    if (existing != null && prefs.getInt(_identityVersionKey) == 2) {
-      return existing;
-    }
-    Map<String, String>? stable;
-    try {
-      stable =
-          await (_stableCredentials?.call() ??
-              BloomWidgetBridgePlatform.stableDeviceCredentials());
-    } catch (_) {}
-    // Once a credential has been registered, keep it. Changing an existing
-    // device ID would orphan its server-side binding. Stable credentials are
-    // used only for a fresh install with no prior local identity.
-    final id =
-        existing?.deviceId ??
-        stable?['deviceId'] ??
-        'bloom-mobile-${_uuidV4()}';
-    final token =
-        existing?.deviceToken ?? stable?['deviceToken'] ?? _randomHex(32);
-    await (await _prefs).setString(_deviceIdKey, id);
-    await (await _prefs).setInt(_identityVersionKey, 2);
-    await (_writeToken?.call(_deviceTokenKey, token) ??
-        _secureStorage.write(key: _deviceTokenKey, value: token));
-    return DeviceCredentials(deviceId: id, deviceToken: token);
+    if (existing != null) return existing;
+    final credentials = DeviceCredentials(
+      deviceId: 'bloom-mobile-${_uuidV4()}',
+      deviceToken: _randomHex(32),
+    );
+    await save(credentials);
+    return credentials;
   }
 
-  Future<Map<String, String>?> _iosStableCredentials() async {
-    for (var attempt = 0; attempt < 40; attempt++) {
-      try {
-        final value = await BloomWidgetBridgePlatform.stableDeviceCredentials();
-        if (value != null) return value;
-      } catch (_) {}
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+  /// 保存本机身份。
+  ///
+  /// 设备令牌由**服务端**在认领设备时下发（`claim_device`），所以登录之后要
+  /// 用返回值覆盖掉本地那个占位令牌 —— 否则客户端拿着自己编的令牌去打
+  /// `/carousel/plan`，服务端只会回 401。
+  Future<void> save(DeviceCredentials credentials) async {
+    await (await _prefs).setString(_deviceIdKey, credentials.deviceId);
+    await (await _prefs).setInt(_identityVersionKey, 2);
+    await (_writeToken?.call(_deviceTokenKey, credentials.deviceToken) ??
+        _secureStorage.write(
+          key: _deviceTokenKey,
+          value: credentials.deviceToken,
+        ));
+    // ⚠️ 这里**刻意不镜像**给原生侧。本机自己编的那个令牌服务端不认（它比对
+    // 的是下发时记下的 sha256），镜像过去只会让小组件拿着一个必然 401 的令牌
+    // 反复请求。镜像只发生在服务端真的下发过令牌之后 —— 见 [saveIssued]。
+  }
+
+  /// 镜像进原生侧的共享存储。失败**不能**让保存失败 —— 身份已经落在 Dart 侧
+  /// 了，原生那份只是给小组件读的副本。
+  Future<void> _mirror(String deviceId, String deviceToken) async {
+    try {
+      await _mirrorToWidget(deviceId, deviceToken);
+    } catch (_) {
+      // 平台通道不可用（widget 测试、或原生还没挂上）。
     }
-    return null;
+  }
+
+  /// 服务端是否为这台设备下发过令牌。
+  ///
+  /// 用来回答"要不要再调一次认领接口"：注册那一刻服务端还在异步建 Immich
+  /// 用户，登录响应里必然没有设备令牌，所以那一次必须补。没有这个标记的话，
+  /// 客户端只能盲目地每次刷新都去认领一遍，而每次认领都会换一枚新令牌。
+  Future<bool> hasServerToken() async =>
+      (await _prefs).getBool(_serverTokenKey) ?? false;
+
+  /// 保存服务端下发的设备令牌，并镜像给原生侧。
+  ///
+  /// **镜像只在这里发生**（以及 [clear] 里的抹除）。见 [save] 的说明。
+  Future<void> saveIssued({
+    required String deviceId,
+    required String deviceToken,
+  }) async {
+    await save(
+      DeviceCredentials(deviceId: deviceId, deviceToken: deviceToken),
+    );
+    await (await _prefs).setBool(_serverTokenKey, true);
+    // 小组件（iOS 上是独立进程）只认原生共享存储里的令牌，不读 Dart 的
+    // SharedPreferences —— 漏掉这一步，App 里一切正常而小组件静静地不再更新。
+    await _mirror(deviceId, deviceToken);
+  }
+
+  /// 忘掉本机身份。登出时用 —— 设备令牌一起丢掉，小组件因此取不到新图
+  /// （"登出即冻结"就是这么实现的，不需要改原生）。
+  Future<void> clear() async {
+    await (await _prefs).remove(_deviceIdKey);
+    await (await _prefs).remove(_identityVersionKey);
+    await (await _prefs).remove(_serverTokenKey);
+    await (_writeToken == null
+        ? _secureStorage.delete(key: _deviceTokenKey)
+        : _writeToken(_deviceTokenKey, ''));
+    // 原生侧那份也必须抹掉：iOS 的小组件扩展不读 Dart 的存储，只认 App Group
+    // 里的令牌。不抹的话"登出即冻结"在 iOS 上根本不生效。
+    await _mirror('', '');
   }
 
   String _randomHex(int bytes) {

@@ -5,11 +5,14 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../api/bloom_api_client.dart';
 import '../models/auth_models.dart';
 
-/// 账号会话的本地存放与读写（F1）。
+/// 账号会话的本地存放与读写。
 ///
 /// 与设备身份仓库（`DeviceIdentityRepository`）刻意分成两个仓库：那个存的是
-/// "这台手机的小组件"的设备令牌，这个存的是"这个人"的账号会话。两者生命周期
-/// 完全不同 —— 换人登录不该动设备令牌，重装 App 也不该让小组件换一台设备。
+/// "这台手机的小组件"的身份，这个存的是"这个人"的账号会话。
+///
+/// ⚠️ 两者的生命周期**在"登录即绑定"之后不再独立**：设备令牌由服务端在登录/
+/// 认领设备时下发，而登出会把它一起清掉（小组件因此冻结在最后一张）。这个
+/// 顺序由调用方（main.dart）协调 —— 本仓库只管会话，不碰设备身份。
 ///
 /// 一条贯穿全文件的原则：**只有服务端明确说 401 才清除本地会话。**
 /// 断网、超时、服务端 5xx 都不能把用户登出 —— 那会让"地铁里打开 App 就被
@@ -111,27 +114,50 @@ class AuthRepository {
     purpose: forRegister ? 'register' : 'login',
   );
 
-  Future<AccountInfo> register({
+  /// 注册并登录。[device] 非空时顺带上报本机，服务端会在这一步认领它。
+  ///
+  /// 返回整个 [AuthResult] 而不只是账号 —— 里面可能带着服务端下发的设备令牌，
+  /// 调用方需要把它存进设备身份仓库。
+  Future<AuthResult> register({
     required String phone,
     required String code,
     String? nickname,
+    DeviceClaim? device,
   }) async {
     final result = await _api.registerAccount(
       phone: phone,
       code: code,
       nickname: nickname,
+      device: device,
     );
     await _adopt(result);
-    return result.account;
+    return result;
   }
 
-  Future<AccountInfo> login({
+  Future<AuthResult> login({
     required String phone,
     required String code,
+    DeviceClaim? device,
   }) async {
-    final result = await _api.loginAccount(phone: phone, code: code);
+    final result = await _api.loginAccount(
+      phone: phone,
+      code: code,
+      device: device,
+    );
     await _adopt(result);
-    return result.account;
+    return result;
+  }
+
+  /// 重试认领本机设备。
+  ///
+  /// 注册的那一刻服务端还在异步建 Immich 用户，所以登录响应里的 `device`
+  /// 必然是 null。等 `/users/me/account` 报 `immich_ready` 之后调这里。
+  Future<ClaimedDevice> claimDevice(DeviceClaim claim) async {
+    final token = _token;
+    if (token == null) {
+      throw BloomApiException(401, 'not_signed_in', '还没有登录');
+    }
+    return _api.claimDevice(userToken: token, claim: claim);
   }
 
   /// 登出。

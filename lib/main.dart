@@ -123,7 +123,6 @@ class _BloomHomePageState extends State<BloomHomePage>
       widget.displayPreferences ?? DisplayPreferences();
   late final AuthRepository _auth = widget.auth ?? AuthRepository();
 
-  Timer? _pairingPoll;
   Timer? _messageTimer;
   /// Turns the page when its slot arrives while the app is open.
   Timer? _slotWatch;
@@ -131,7 +130,6 @@ class _BloomHomePageState extends State<BloomHomePage>
   Timer? _slotWake;
   Timer? _followNative;
   DeviceCredentials? _credentials;
-  PairingInfo? _pairing;
   CachedWidgetImage? _portrait;
   DailyContent? _content;
   String? _originalPhotoPath;
@@ -147,7 +145,6 @@ class _BloomHomePageState extends State<BloomHomePage>
   bool _widgetEnabled = true;
   bool _paired = false;
   bool _loading = true;
-  bool _pairingRefreshing = false;
   bool _nextLoading = false;
   int _selectedTab = 0;
 
@@ -200,10 +197,13 @@ class _BloomHomePageState extends State<BloomHomePage>
       });
     });
     WidgetsBinding.instance.addObserver(this);
-    _load();
     _startSlotWatch();
-    // 账号恢复与 `_load()` 并行：它不阻塞首屏，也不影响小组件换图。
-    _restoreAuth();
+    // **先恢复登录态，再跑 `_load`（在 `_restoreAuth` 里）。**
+    //
+    // `_load()` 现在的第一步是"未登录就什么都不做"，所以顺序反过来的话，它会
+    // 在一份还没恢复出会话的状态下跑完，登录用户的首屏就永远停在骨架屏上。
+    // 恢复会话只是一次本地读，代价可以忽略。
+    unawaited(_restoreAuth());
   }
 
   /// **The page turns itself, like the widget does.**
@@ -310,7 +310,6 @@ class _BloomHomePageState extends State<BloomHomePage>
     WidgetsBinding.instance.removeObserver(this);
     _slotWake?.cancel();
     _slotWatch?.cancel();
-    _pairingPoll?.cancel();
     _messageTimer?.cancel();
     super.dispose();
   }
@@ -418,7 +417,28 @@ class _BloomHomePageState extends State<BloomHomePage>
     _loadStartedAt = DateTime.now();
     if (showSpinner && mounted) setState(() => _loading = true);
     try {
-      final credentials = await _identity.initialize();
+      // **未登录：不 initialize、不请求、不落任何东西。**
+      //
+      // 设备令牌现在由服务端在登录/认领设备时下发，所以未登录时本机根本没有
+      // 能取图的凭证 —— 继续往下走只会拿到 401，然后在页面上显示成"服务器
+      // 请求失败"。而正确的结果是"请先登录"，四个页面自己已经挡住了。
+      //
+      // 这也是"登出即冻结"的另一半：本地令牌已被清掉，这里再把照片从内存里
+      // 撤走，首页那张图与背景图都不会留在屏幕上。
+      if (!_auth.isSignedIn) {
+        if (!mounted) return;
+        setState(() {
+          _loading = false;
+          _message = null;
+          _content = null;
+          _portrait = null;
+          _originalPhotoPath = null;
+          _date = null;
+        });
+        return;
+      }
+      // 可重新赋值：服务端认领设备后会下发新令牌，401 分支要用新令牌重试。
+      var credentials = await _identity.initialize();
       // Device identity is local state and must remain visible even when the
       // following server/status/photo request fails.
       if (mounted) {
@@ -488,26 +508,24 @@ class _BloomHomePageState extends State<BloomHomePage>
         onTimeout: () => debugPrint('[BloomUI] local-first paint timed out'),
       );
       DeviceStatus? status;
-      PairingInfo? pairing;
-      // **Always probe the server first, regardless of local cache state.**
-      // `storedCredentials == null` used to gate straight to `register()`,
-      // treating "no local cache" as "server has never seen this device".
-      // That is only true on iOS. On Android, `initialize()` re-derives a
-      // deterministic id from `ANDROID_ID` when the local cache is missing
-      // (a fresh install, or the app's data being cleared), so the server
-      // may already recognize this exact device — calling `register()`
-      // unconditionally in that case can reset an already-paired device back
-      // to unpaired, which is exactly the "stuck on the pairing screen even
-      // though the device is bound server-side" symptom. `status()` is the
-      // only call that can tell the two cases apart; `register()` must stay
-      // reserved for the case the server actually says it doesn't know this
-      // device (401 device_authentication_required).
+      // **不再走 `register()`。** 那是账号出现之前的机制：它靠激活码授权，
+      // 建出来的是一台"未配对"设备，于是 App 又把用户送回"设备 ID + 激活码"
+      // 那一页 —— 那正是要拆掉的东西。
+      //
+      // 现在的路径是：登录时/登录后由 `_ensureDeviceClaimed()` 让服务端把本机
+      // 认领到账号下，服务端同时下发设备令牌。所以 401 只意味着"认领还没完成"，
+      // 补一次再用新令牌重试即可。
       try {
         status = await _api.status(credentials);
       } on BloomApiException catch (error) {
         if (error.statusCode == 401 &&
             error.code == 'device_authentication_required') {
-          pairing = await _api.register(credentials, name: 'Bloom 手机');
+          await _ensureDeviceClaimed();
+          final refreshed = await _identity.read();
+          if (refreshed == null) rethrow;
+          credentials = refreshed;
+          if (mounted) setState(() => _credentials = refreshed);
+          status = await _api.status(refreshed);
         } else {
           rethrow;
         }
@@ -535,7 +553,7 @@ class _BloomHomePageState extends State<BloomHomePage>
       // same mirror, so the server, the app and the widget end up telling one
       // story. For the device whose token we hold this is always our own
       // `mobile` record, so there is no way to pull a frame's schedule in here.
-      final serverMode = bloomModeFromWire(status?.mode);
+      final serverMode = bloomModeFromWire(status.mode);
       if (serverMode != null && serverMode != displaySettings.mode) {
         displaySettings = displaySettings.copyWith(mode: serverMode);
         try {
@@ -546,15 +564,14 @@ class _BloomHomePageState extends State<BloomHomePage>
           // next launch will try again.
         }
       }
-      if (status?.paired == true) {
-        _pairingPoll?.cancel();
+      if (status.paired == true) {
         // Pairing is a server-authentication state, not an image-refresh
         // state. Enter the photo experience immediately and never fall back
         // to the pairing screen merely because a download/render fails.
         if (mounted && !_paired) {
           setState(() => _paired = true);
         }
-        if (status?.hasAssets == true) {
+        if (status.hasAssets == true) {
           final repository = DailyContentRepository(api: _api);
           // Show the last complete local render immediately. A carousel
           // refresh may download and render up to four originals before it
@@ -787,20 +804,25 @@ class _BloomHomePageState extends State<BloomHomePage>
           message = '已经绑定，照片准备好后会自动显示。';
         }
       } else {
-        _startPairingPoll();
+        // 设备还没挂到账号的 Immich 用户名下 —— 注册之后 provisioning 还没跑完
+        // 是最常见的原因。
+        //
+        // **不再启动配对轮询**：归属现在由登录决定，没有需要用户参与的"配对"
+        // 这回事了。每 5 秒问一次服务器只是白耗电；下一次 `_load`（回到前台、
+        // 或用户下拉刷新）自然会重试。
+        message = '正在准备你的相册，稍后就能看到照片。';
       }
 
       if (!mounted) return;
       await _evictPreviewImages([portrait]);
       if (!mounted) return;
-      final pairedNow = status?.paired ?? false;
-      final pairingJustCompleted =
-          !_paired && pairedNow && _credentials != null;
       await _precacheIncoming(originalPhotoPath);
+      // 提到闭包外面：`status` 在 try/catch 里会被重新赋值，所以在闭包里读它
+      // 拿不到流分析的类型收窄（会报"接收者可能是 null"）。
+      final isPaired = status.paired;
       setState(() {
         _credentials = credentials;
-        _pairing = pairing ?? _pairing;
-        _paired = pairedNow;
+        _paired = isPaired;
         _portrait = portrait ?? _portrait;
         _content = content ?? _content;
         _originalPhotoPath = originalPhotoPath ?? _originalPhotoPath;
@@ -810,10 +832,7 @@ class _BloomHomePageState extends State<BloomHomePage>
         _displaySettings = displaySettings;
         _loading = false;
       });
-      if (pairingJustCompleted) {
-        await HapticFeedback.mediumImpact();
-        _notify('设备配对成功。');
-      } else if (message != null) {
+      if (message != null) {
         _scheduleMessageClear();
       }
     } catch (error) {
@@ -854,39 +873,6 @@ class _BloomHomePageState extends State<BloomHomePage>
     unawaited(_load(showSpinner: false));
   }
 
-  void _startPairingPoll() {
-    _pairingPoll ??= Timer.periodic(
-      const Duration(seconds: 5),
-      (_) => _pollPairing(),
-    );
-  }
-
-  Future<void> _pollPairing() async {
-    final credentials = _credentials;
-    if (credentials == null) return;
-    try {
-      final status = await _api.status(credentials);
-      if (status.paired) await _load(showSpinner: false);
-    } catch (_) {}
-  }
-
-  Future<void> _newPairingCode() async {
-    final credentials = _credentials;
-    if (credentials == null || _pairingRefreshing) return;
-    await HapticFeedback.lightImpact();
-    if (mounted) setState(() => _pairingRefreshing = true);
-    try {
-      final pairing = await _api.refreshPairingCode(credentials);
-      if (!mounted) return;
-      setState(() => _pairing = pairing);
-      _notify('新的激活码已生成。');
-    } catch (_) {
-      _notify('绑定码获取失败，请稍后重试。');
-    } finally {
-      if (mounted) setState(() => _pairingRefreshing = false);
-    }
-  }
-
   /// Devices the photo page switcher and the "设备" tab list.
   ///
   /// 登录后优先用服务端的真实绑定关系（`GET /users/me/devices`，F1 之后
@@ -921,6 +907,8 @@ class _BloomHomePageState extends State<BloomHomePage>
     await _auth.load();
     if (!mounted) return;
     setState(() => _account = _auth.account);
+    // 会话是本地读出来的、很快；拿到之后 `_load` 才知道该不该联网。
+    unawaited(_load(showSpinner: false));
     if (_auth.isSignedIn) {
       await _refreshAccount();
     }
@@ -930,8 +918,59 @@ class _BloomHomePageState extends State<BloomHomePage>
     final account = await _auth.refresh();
     if (!mounted) return;
     setState(() => _account = account);
-    if (account != null && account.immichReady) {
+    if (account == null) return;
+    if (account.immichReady) {
+      // 先把"这台手机属于这个账号"落实，再列设备 —— 顺序反了的话，列表里
+      // 会短暂缺掉本机那一台。
+      await _ensureDeviceClaimed();
       await _loadRemoteDevices();
+    }
+  }
+
+  /// 本机上报给服务端的设备描述。
+  ///
+  /// 名字用**平台**而不是机型：拿机型要加依赖或写原生代码，而服务端的
+  /// `claim_device_for_account` 只在**首次插入**时采用这个名字（之后在库里
+  /// 改过的名字不会被重新登录覆盖），所以它的作用仅仅是让新设备不至于无名。
+  DeviceClaim _claimFor(DeviceCredentials credentials) => DeviceClaim(
+    deviceId: credentials.deviceId,
+    name: Platform.isIOS ? 'iPhone' : 'Android 手机',
+  );
+
+  /// 确保这台设备已经在服务端认领过，并保存服务端下发的设备令牌。
+  ///
+  /// 登录响应里通常已经带着设备令牌，但**注册那一刻必然没有** —— 服务端还在
+  /// 异步建 Immich 用户（没有 immich_user_id 就绑不了设备）。所以这里要能
+  /// 反复调：账号一变成 ready 就补一次。
+  ///
+  /// 认领失败一律不阻断登录：相册还在准备中是 409，属于"等一会儿再来"，
+  /// 不是错误。
+  Future<void> _ensureDeviceClaimed() async {
+    if (!_auth.isSignedIn) return;
+    // ⚠️ 不能直接用 `_credentials`：**登出会把它一起清掉**，所以"登出→再登录"
+    //    这条路上它一定是 null，而那样这个函数会在第一行就返回，设备永远认领
+    //    不上（表现为登录成功但设备列表里没有本机）。
+    //    本机身份是谁并不重要 —— 随机生成一个新的也行，认领的是"这台机器"。
+    final credentials = _credentials ?? await _identity.initialize();
+    if (!mounted) return;
+    if (_credentials == null) {
+      setState(() => _credentials = credentials);
+    }
+    if (await _identity.hasServerToken()) return;
+    try {
+      final claimed = await _auth.claimDevice(_claimFor(credentials));
+      await _identity.saveIssued(
+        deviceId: claimed.deviceId,
+        deviceToken: claimed.deviceToken,
+      );
+      final updated = await _identity.read();
+      if (updated != null && mounted) {
+        setState(() => _credentials = updated);
+      }
+    } on BloomApiException catch (error) {
+      debugPrint('[BloomAuth] 设备认领未完成：${error.code ?? error.statusCode}');
+    } catch (error) {
+      debugPrint('[BloomAuth] 设备认领异常：$error');
     }
   }
 
@@ -956,17 +995,33 @@ class _BloomHomePageState extends State<BloomHomePage>
   }
 
   Future<void> _openAuth() async {
-    final account = await Navigator.of(context).push<AccountInfo>(
+    final credentials = _credentials;
+    final result = await Navigator.of(context).push<AuthResult>(
       MaterialPageRoute(
         builder: (_) => BloomAuthPage(
           auth: _auth,
+          // 登录时顺带上报本机，服务端据此把这台手机认领到账号下 ——
+          // 这就是"激活码"那套机制的替代品。
+          device: credentials == null ? null : _claimFor(credentials),
           onCancel: () => Navigator.of(context).pop(),
           onSignedIn: (value) => Navigator.of(context).pop(value),
         ),
       ),
     );
-    if (!mounted || account == null) return;
-    setState(() => _account = account);
+    if (!mounted || result == null) return;
+    setState(() => _account = result.account);
+    // 登录响应里可能已经带着服务端下发的设备令牌（相册已就绪的账号）。
+    final claimed = result.device;
+    if (claimed != null) {
+      await _identity.saveIssued(
+        deviceId: claimed.deviceId,
+        deviceToken: claimed.deviceToken,
+      );
+      final updated = await _identity.read();
+      if (updated != null && mounted) {
+        setState(() => _credentials = updated);
+      }
+    }
     _notify('登录成功');
     await _refreshAccount();
   }
@@ -974,13 +1029,19 @@ class _BloomHomePageState extends State<BloomHomePage>
   Future<void> _signOut() async {
     setState(() => _accountBusy = true);
     await _auth.signOut();
+    // **设备令牌一起丢掉。** 这是"登出即冻结"的全部实现：本机再也没有能取图
+    // 的凭证，小组件停在最后一张；不需要改任何原生代码。
+    await _identity.clear();
     if (!mounted) return;
     setState(() {
       _account = null;
+      _credentials = null;
       _remoteDevices = const [];
       _accountBusy = false;
     });
     _notify('已退出登录');
+    // 重开一轮：未登录状态下不该继续显示上一轮的设备与照片。
+    unawaited(_load(showSpinner: false));
   }
 
   /// The device whose photos the photo page shows; falls back to this phone.
@@ -1023,7 +1084,6 @@ class _BloomHomePageState extends State<BloomHomePage>
       // The page paints the same photo the home page does, so its glass has
       // something to refract.
       photoPath: _originalPhotoPath,
-      pairing: _pairing,
       onModeChanged: (settings) => _applyModeChange(device, settings),
       onSaved: (settings) => _applySavedSettings(device, settings),
       // **The link that was missing.** The detail page has always called this
@@ -1031,8 +1091,6 @@ class _BloomHomePageState extends State<BloomHomePage>
       // was opened without it.
       onWidgetEnabledChanged:
           (enabled) => setState(() => _widgetEnabled = enabled),
-      onRefreshPairingCode: _newPairingCode,
-      onCopyPairingCode: _copyPairingCode,
     );
   }
 
@@ -1234,14 +1292,6 @@ class _BloomHomePageState extends State<BloomHomePage>
     _notify('设备 ID 已复制。');
   }
 
-  Future<void> _copyPairingCode() async {
-    final value = _pairing?.code;
-    if (value == null) return;
-    await Clipboard.setData(ClipboardData(text: value));
-    await HapticFeedback.lightImpact();
-    _notify('激活码已复制。');
-  }
-
   void _notify(String value) {
     if (!mounted) return;
     _messageTimer?.cancel();
@@ -1276,12 +1326,9 @@ class _BloomHomePageState extends State<BloomHomePage>
   @override
   Widget build(BuildContext context) => BloomGlassHome(
     loading: _loading,
-    paired: _paired,
-    pairingRefreshing: _pairingRefreshing,
     nextLoading: _nextLoading,
     selectedTab: _selectedTab,
     credentials: _credentials,
-    pairing: _pairing,
     portrait: _portrait,
     originalPhotoPath: _originalPhotoPath,
     content: _content,
@@ -1299,9 +1346,7 @@ class _BloomHomePageState extends State<BloomHomePage>
     onDeviceChanged: _changePhotoDevice,
     onOpenDevice: _openDeviceDetail,
     onAddDevice: _showAddDeviceNotice,
-    onRefreshPairingCode: _newPairingCode,
     onCopyDeviceId: _copyDeviceId,
-    onCopyPairingCode: _copyPairingCode,
     account: _account,
     onAccountTap: _openAuth,
     onSignOut: _signOut,

@@ -176,7 +176,6 @@ void main() {
     BloomDisplaySettings settings = const BloomDisplaySettings(
       mode: BloomDisplayMode.carousel,
     ),
-    PairingInfo? pairing,
     ValueChanged<BloomDisplaySettings>? onModeChanged,
     ValueChanged<BloomDisplaySettings>? onSaved,
     Future<void> Function(BloomDisplaySettings settings)? onMirrored,
@@ -187,7 +186,6 @@ void main() {
       settings: settings,
       credentials: credentials,
       callerDeviceId: credentials?.deviceId,
-      pairing: pairing,
       onModeChanged: onModeChanged,
       onSaved: onSaved,
       onMirrored: onMirrored,
@@ -1380,7 +1378,6 @@ void main() {
             identity: DeviceIdentityRepository(
               readToken: (_) async => credentials.deviceToken,
               writeToken: (_, _) async {},
-              stableCredentials: () async => null,
             ),
             api: client,
             displayPreferences: DisplayPreferences(api: client),
@@ -1455,7 +1452,6 @@ void main() {
             identity: DeviceIdentityRepository(
               readToken: (_) async => credentials.deviceToken,
               writeToken: (_, _) async {},
-              stableCredentials: () async => null,
             ),
             api: client,
             displayPreferences: DisplayPreferences(api: client),
@@ -1529,7 +1525,6 @@ void main() {
             identity: DeviceIdentityRepository(
               readToken: (_) async => credentials.deviceToken,
               writeToken: (_, _) async {},
-              stableCredentials: () async => null,
             ),
             api: client,
             displayPreferences: DisplayPreferences(api: client),
@@ -1571,8 +1566,6 @@ void main() {
             builder:
                 (context, setState) => BloomGlassHome(
                   loading: false,
-                  paired: true,
-                  pairingRefreshing: false,
                   nextLoading: false,
                   selectedTab: 0,
                   credentials: credentials,
@@ -1589,9 +1582,7 @@ void main() {
                       (deviceId) => setState(() => selectedId = deviceId),
                   onOpenDevice: (_) {},
                   onAddDevice: () {},
-                  onRefreshPairingCode: () {},
                   onCopyDeviceId: () {},
-                  onCopyPairingCode: () {},
                   // 首页现在也要登录才显示内容，这个用例验的是内容本身。
                   account: fakeAccount(),
                 ),

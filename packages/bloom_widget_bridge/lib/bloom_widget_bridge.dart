@@ -58,6 +58,28 @@ class BloomWidgetBridgePlatform {
     return value;
   }
 
+  /// 把设备身份写进原生侧与小组件共享的那块存储。
+  ///
+  /// **iOS 上这不是可选的。** 小组件扩展是独立进程，它自己去拉
+  /// `/carousel/plan`，令牌从 App Group 的 `bloom.device_id` /
+  /// `bloom.device_token` 读（见 `BloomWidgets.swift` 的 `timeline`）；读不到就
+  /// 退回缓存并等 30 分钟再试。
+  ///
+  /// 设备令牌以前是由 AppDelegate 顺手写进 App Group 的（在那个
+  /// `stableDeviceCredentials` 分支里）。现在令牌改由服务端在登录时下发、
+  /// 由 Dart 保存，所以必须显式镜像过去 —— 否则 iOS 小组件会静静地停止更新，
+  /// 而 App 里一切正常，这是最难查的一类故障。
+  ///
+  /// Android 侧是同进程，Flutter 后台 isolate 直接读 SharedPreferences，
+  /// 那里的实现是空操作。
+  static Future<void> writeDeviceCredentials({
+    required String deviceId,
+    required String deviceToken,
+  }) => _channel.invokeMethod<void>('writeDeviceCredentials', {
+    'deviceId': deviceId,
+    'deviceToken': deviceToken,
+  });
+
   static Future<Map<Object?, Object?>?> readDisplayPreferences() =>
       _channel.invokeMapMethod<Object?, Object?>('readDisplayPreferences');
 
