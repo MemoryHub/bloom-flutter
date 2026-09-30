@@ -242,10 +242,69 @@ void main() {
     );
   });
 
-  test('listMyDevices is not implemented without a user session', () async {
+  test('listMyDevices sends the account session, not the device token', () async {
+    // F1 之前这里断言的是"恒抛 UnsupportedError"。现在它真的发请求了，
+    // 所以断言换成更有价值的一条：**用的是 Bearer 用户会话，而不是设备令牌**。
+    // 两者互换会让接口 401，而症状看起来像"登录了却读不到设备"。
+    late http.Request captured;
     final client = BloomApiClient(
-      client: MockClient((_) async => http.Response('{}', 200)),
+      client: MockClient((request) async {
+        captured = request;
+        return http.Response(
+          jsonEncode({
+            'devices': [
+              {
+                'device_id': 'bloom-eink-68ee8f606594',
+                'name': 'E-Ink',
+                'device_type': 'eink',
+                'enabled': true,
+                'last_seen_at': '2026-09-30T10:00:00+08:00',
+                'bound_at': '2026-09-29T10:00:00+08:00',
+                'bound_user_count': 1,
+                'settings': {
+                  'interval_minutes': 15,
+                  'active_start': '06:00',
+                  'active_end': '22:00',
+                  'updated_at': '2026-09-30T09:00:00+08:00',
+                },
+              },
+            ],
+          }),
+          200,
+        );
+      }),
     );
-    await expectLater(client.listMyDevices(), throwsA(isA<UnsupportedError>()));
+
+    final devices = await client.listMyDevices('account-session-token');
+
+    expect(captured.url.path, '/api/frame/users/me/devices');
+    expect(captured.headers['Authorization'], 'Bearer account-session-token');
+    expect(captured.headers.containsKey('X-Frame-Token'), isFalse);
+
+    expect(devices, hasLength(1));
+    expect(devices.single.deviceId, 'bloom-eink-68ee8f606594');
+    expect(devices.single.isFrame, isTrue);
+    expect(devices.single.settings?.intervalMinutes, 15);
+    expect(devices.single.boundUserCount, 1);
+    expect(devices.single.lastSeenAt, isNotNull);
+  });
+
+  test('listMyDevices tolerates a missing settings object', () async {
+    // 服务端在设备还没有设置行时整个 settings 都不给，不是给一个空对象。
+    final client = BloomApiClient(
+      client: MockClient(
+        (_) async => http.Response(
+          jsonEncode({
+            'devices': [
+              {'device_id': 'd1', 'device_type': 'mobile', 'enabled': true},
+            ],
+          }),
+          200,
+        ),
+      ),
+    );
+    final devices = await client.listMyDevices('t');
+    expect(devices.single.settings, isNull);
+    expect(devices.single.lastSeenAt, isNull);
   });
 }

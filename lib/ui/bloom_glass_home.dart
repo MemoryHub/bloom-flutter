@@ -5,6 +5,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
+import '../core/models/auth_models.dart';
 import '../core/models/device_models.dart';
 import '../core/storage/display_preferences.dart';
 import 'bloom_device_pages.dart';
@@ -225,6 +226,10 @@ class BloomGlassHome extends StatelessWidget {
     required this.onRefreshPairingCode,
     required this.onCopyDeviceId,
     required this.onCopyPairingCode,
+    this.account,
+    this.onAccountTap,
+    this.onSignOut,
+    this.accountBusy = false,
     this.credentials,
     this.pairing,
     this.portrait,
@@ -300,6 +305,12 @@ class BloomGlassHome extends StatelessWidget {
   /// Devices the switcher and the "设备" tab list. Hardcoded for now (F3):
   /// this phone plus the frame. See `bloom_device_pages.dart`.
   final List<BloomDevice> devices;
+
+  /// 当前登录的账号（F1）。null = 未登录，设备页显示登录入口。
+  final AccountInfo? account;
+  final VoidCallback? onAccountTap;
+  final VoidCallback? onSignOut;
+  final bool accountBusy;
 
   /// The master switch, for the same reason as the device page's own switch:
   /// one fact, one owner.
@@ -615,6 +626,10 @@ class BloomGlassHome extends StatelessWidget {
         onWidgetEnabledChanged: onWidgetEnabledChanged,
         onOpenDevice: onOpenDevice,
         onAddDevice: onAddDevice,
+        account: account,
+        onAccountTap: onAccountTap,
+        onSignOut: onSignOut,
+        accountBusy: accountBusy,
       ),
     ];
 
@@ -1575,8 +1590,16 @@ class _PhotoLibraryPlaceholderPage extends StatelessWidget {
   );
 }
 
-/// Shown when the switcher points at the frame: the app has no frame token, so
-/// its photos need a user session (F1) that does not exist yet.
+/// 切换器指向相框时显示的卡片。
+///
+/// ⚠️ 这里【不是】"登录后就能看"：相框的照片由 `/carousel/plan` 提供，而那个
+/// 接口认的是**相框自己的设备令牌**，本 App 只持有本机令牌。用户会话解不开它 ——
+/// 那需要服务端新增一个用户会话取图的接口，而 F1 刻意没有加（本轮范围只做登录）。
+///
+/// 原来的文案是"登录后可查看此设备的照片（后续版本支持）"。F1 落地后这句话
+/// 依然兑现不了，所以改成实话：**能管理**（设置读写已由服务端的
+/// `devices_share_user` 授权，同一账号下的设备可互操作），**看不到照片**。
+/// 留着一句永远兑现不了的承诺，比不写更糟。
 class _RemoteDeviceCard extends StatelessWidget {
   const _RemoteDeviceCard({required this.deviceName});
 
@@ -1591,20 +1614,20 @@ class _RemoteDeviceCard extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           const Icon(
-            Icons.lock_outline_rounded,
+            Icons.devices_rounded,
             size: 28,
             color: BloomInk.textMuted,
           ),
           const SizedBox(height: 12),
           const Text(
-            '登录后可查看此设备的照片',
+            '照片只显示在相框自己的屏幕上',
             textAlign: TextAlign.center,
             style: BloomType.rowTitle,
           ),
           const SizedBox(height: 8),
           Text(
-            '“$deviceName”拍下的照片需要账号登录后才能查看（后续版本支持）。'
-            '手机小组件仍会按照当前节奏正常更新。',
+            '“$deviceName”是一台独立设备，它的照片不会同步到手机。'
+            '你可以在设备设置里调整它的刷新节奏与内容来源。',
             textAlign: TextAlign.center,
             style: BloomType.body,
           ),

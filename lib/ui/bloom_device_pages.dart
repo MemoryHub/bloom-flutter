@@ -7,6 +7,7 @@ import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
 import '../background_sync.dart';
 import '../core/api/bloom_api_client.dart';
+import '../core/models/auth_models.dart';
 import '../core/models/device_models.dart';
 import '../core/storage/display_preferences.dart';
 import 'bloom_glass_home.dart';
@@ -68,8 +69,18 @@ class BloomDevice {
 
 /// The frame this build ships with. Hardcoded until F1/F4 can list the
 /// signed-in user's devices.
+/// 未登录时的兜底相框（F3 之前）。
+///
+/// ⚠️ 这个 ID **必须跟着现役相框走**。2026-09-30 旧开发板
+/// `bloom-eink-68ee8f606594` 已从服务端彻底删除，此处若仍指向它，
+/// 未登录的用户会看到一台不存在的相框，点进去必然报错 —— 而这看起来
+/// 像是"登录功能坏了"。
+///
+/// 之所以还留着硬编码：[bloomDevices] 是登录态拿不到服务端设备列表时的
+/// 兜底，而这份兜底里唯一有用的信息就是"当前这台相框"。真正的解法是
+/// 让设备列表全部来自服务端（F1 已经做到），并给未登录态一个空状态。
 const bloomBundledFrame = BloomDevice(
-  deviceId: 'bloom-eink-68ee8f606594',
+  deviceId: 'bloom-eink-94a990f4e394-b',
   name: 'E-Ink',
   type: BloomApiClient.settingsTargetEink,
 );
@@ -81,6 +92,9 @@ const bloomBundledFrame = BloomDevice(
 /// can list a signed-in user's devices, but that call needs a user session (F1)
 /// which the app does not have yet — so this list is a constant, and the
 /// presence of the frame is `null` (rendered `—`, never guessed).
+///
+/// F1 之后它退居为**未登录时的兜底**：登录了就改用
+/// [bloomDevicesFromRemote] 返回的真实绑定关系。
 List<BloomDevice> bloomDevices({
   required DeviceCredentials? credentials,
   bool? localOnline,
@@ -95,6 +109,54 @@ List<BloomDevice> bloomDevices({
     ),
   bloomBundledFrame,
 ];
+
+/// 把服务端的设备记录转成界面用的 [BloomDevice]。
+///
+/// [localDeviceId] 是这台手机自己的设备 ID（来自设备令牌）。只有与它相等的
+/// 那一行是 `isLocal` —— 因为只有那台设备的照片这个 App 取得到，
+/// 别的设备（含相框）都只能用用户会话读设置，读不到照片。
+List<BloomDevice> bloomDevicesFromRemote(
+  List<UserDevice> remote, {
+  String? localDeviceId,
+  bool? localOnline,
+}) => [
+  for (final device in remote)
+    () {
+      final isLocal =
+          localDeviceId != null && device.deviceId == localDeviceId;
+      return BloomDevice(
+        deviceId: device.deviceId,
+        name: (device.name?.trim().isNotEmpty ?? false)
+            ? device.name!.trim()
+            : (device.isFrame ? 'E-Ink' : '手机小组件'),
+        type: device.deviceType,
+        isLocal: isLocal,
+        // 本机小组件的开关状态只对本机有效。家庭里另一台手机也是
+        // device_type=mobile，套用本机的开关会把它显示成错误的离线。
+        isOnline: isLocal && localOnline != null
+            ? localOnline
+            : _onlineFrom(device),
+      );
+    }(),
+];
+
+/// 由 `last_seen_at` 推断在线状态。
+///
+/// 窗口取该设备自己刷新间隔的两倍（下限 30 分钟）：相框大部分时间在深度睡眠，
+/// 用固定窗口会把一台完全正常的相框常年显示成"离线"，而这个提示一旦长期
+/// 不准，用户就再也不看它了。间隔本身来自服务端内联的 settings，
+/// 所以不需要额外请求。
+///
+/// 服务端从未上报过 `last_seen_at` 时返回 null —— 界面渲染成"离线"，
+/// 而不是编一个状态出来。
+bool? _onlineFrom(UserDevice device) {
+  final seen = device.lastSeenAt;
+  if (seen == null) return null;
+  final interval = device.settings?.intervalMinutes ?? 60;
+  // clamp 返回 num，Duration 要 int。
+  final windowMinutes = (interval * 2).clamp(30, 24 * 60).toInt();
+  return DateTime.now().difference(seen) < Duration(minutes: windowMinutes);
+}
 
 /// The F3 "设备" tab.
 ///
@@ -118,6 +180,10 @@ class BloomDeviceListPage extends StatelessWidget {
     required this.onAddDevice,
     this.widgetEnabled = true,
     this.onWidgetEnabledChanged,
+    this.account,
+    this.onAccountTap,
+    this.onSignOut,
+    this.accountBusy = false,
   });
 
   final List<BloomDevice> devices;
@@ -128,6 +194,18 @@ class BloomDeviceListPage extends StatelessWidget {
   /// though the server still remembers it as reachable.
   final bool widgetEnabled;
   final ValueChanged<bool>? onWidgetEnabledChanged;
+
+  /// 当前登录的账号。null 表示未登录 —— 页面底部据此显示登录入口。
+  final AccountInfo? account;
+
+  /// 打开登录页。未登录时的入口。
+  final VoidCallback? onAccountTap;
+
+  /// 退出登录。已登录时的入口。
+  final VoidCallback? onSignOut;
+
+  /// 登录态正在变化（例如正在取设备列表），期间禁用账号操作，避免重复点击。
+  final bool accountBusy;
 
 
   @override
@@ -210,9 +288,97 @@ class BloomDeviceListPage extends StatelessWidget {
               onTap: () => onOpenDevice(devices[index]),
             ),
           ],
+        const SizedBox(height: 28),
+        _accountSection(),
       ],
     ),
   );
+
+  /// 账号区（F1）。
+  ///
+  /// 刻意**放在设备列表下方而不是做成独立的第四个 tab**：账号的存在意义就是
+  /// "这些设备属于谁"，把它和它管的设备放在同一页，用户不需要在两处之间来回。
+  ///
+  /// 未登录时只有一个安静入口，不是弹窗、不是门禁 —— App 的主体功能
+  /// （小组件换图）靠设备令牌运行，与登录无关，不该被登录拦住。
+  Widget _accountSection() {
+    final current = account;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(left: 4, bottom: 10),
+          child: Text('账号', style: BloomType.sectionTitle),
+        ),
+        BloomPanel(
+          lifted: true,
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
+          child: current == null
+              ? Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('登录 Bloom', style: BloomType.rowTitle),
+                          const SizedBox(height: 4),
+                          Text(
+                            '登录后可同步管理相框与照片',
+                            style: BloomType.meta,
+                          ),
+                        ],
+                      ),
+                    ),
+                    SizedBox(
+                      width: 96,
+                      child: BloomPrimaryButton(
+                        key: const ValueKey('bloom-sign-in'),
+                        label: '登录',
+                        loading: accountBusy,
+                        onPressed: onAccountTap,
+                      ),
+                    ),
+                  ],
+                )
+              : Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            current.displayName,
+                            style: BloomType.rowTitle,
+                          ),
+                        ),
+                        TextButton(
+                          key: const ValueKey('bloom-sign-out'),
+                          onPressed: accountBusy ? null : onSignOut,
+                          child: const Text('退出登录'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(current.maskedPhone, style: BloomType.meta),
+                    if (current.isProvisioning) ...[
+                      const SizedBox(height: 10),
+                      Text(
+                        '正在准备你的相册，稍后就能看到照片了',
+                        style: BloomType.meta,
+                      ),
+                    ] else if (current.provisionFailed) ...[
+                      const SizedBox(height: 10),
+                      Text(
+                        '相册准备失败，请联系我们',
+                        style: BloomType.meta.copyWith(color: BloomInk.accent),
+                      ),
+                    ],
+                  ],
+                ),
+        ),
+      ],
+    );
+  }
 }
 
 /// One device, as a **black card** — the reference's own material.

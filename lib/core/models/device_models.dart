@@ -481,3 +481,83 @@ class CachedWidgetImage {
   final String? date;
   final int? recommendationId;
 }
+
+/// 内联在某台设备上的当前作息，来自服务端的 `serialize_user_device`。
+///
+/// 服务端在设备列表里就把作息一起返回了（`list_user_devices` 里那次
+/// LEFT JOIN），所以设备列表不需要为每一行再发一次请求。字段全部可空：
+/// 设置行缺失时服务端整个 `settings` 对象都不给。
+class UserDeviceSettings {
+  const UserDeviceSettings({
+    required this.intervalMinutes,
+    this.activeStart,
+    this.activeEnd,
+    this.updatedAt,
+  });
+
+  final int intervalMinutes;
+  final String? activeStart;
+  final String? activeEnd;
+  final DateTime? updatedAt;
+
+  factory UserDeviceSettings.fromJson(Map<String, dynamic> json) =>
+      UserDeviceSettings(
+        intervalMinutes: (json['interval_minutes'] as num?)?.toInt() ?? 0,
+        activeStart: json['active_start'] as String?,
+        activeEnd: json['active_end'] as String?,
+        updatedAt: _parseDateTime(json['updated_at']),
+      );
+}
+
+/// 一个绑在当前账号下的设备，来自 `GET /users/me/devices`。
+///
+/// F1 之前这里是一个恒抛 [UnsupportedError] 的占位：那个接口要"用户会话"，
+/// 而 App 只有设备令牌。现在账号体系落地，它是真的了。
+class UserDevice {
+  const UserDevice({
+    required this.deviceId,
+    this.name,
+    required this.deviceType,
+    required this.enabled,
+    this.lastSeenAt,
+    this.boundAt,
+    this.boundUserCount = 1,
+    this.settings,
+  });
+
+  final String deviceId;
+  final String? name;
+
+  /// `eink`（相框）/ `mobile`（这台手机的小组件）/ `web`。
+  final String deviceType;
+
+  /// 服务端侧是否启用。注意这与用户的"小组件开关"不是一回事：
+  /// 那个开关只控制本机是否联网，服务器并不知情。
+  final bool enabled;
+
+  final DateTime? lastSeenAt;
+  final DateTime? boundAt;
+
+  /// 有几条绑定关系指向这台设备 —— 大于 1 说明是家庭共用。
+  final int boundUserCount;
+
+  final UserDeviceSettings? settings;
+
+  bool get isFrame => deviceType == 'eink';
+
+  factory UserDevice.fromJson(Map<String, dynamic> json) {
+    final settings = json['settings'];
+    return UserDevice(
+      deviceId: json['device_id'] as String,
+      name: json['name'] as String?,
+      deviceType: (json['device_type'] as String?) ?? 'eink',
+      enabled: json['enabled'] as bool? ?? true,
+      lastSeenAt: _parseDateTime(json['last_seen_at']),
+      boundAt: _parseDateTime(json['bound_at']),
+      boundUserCount: (json['bound_user_count'] as num?)?.toInt() ?? 1,
+      settings: settings is Map<String, dynamic>
+          ? UserDeviceSettings.fromJson(settings)
+          : null,
+    );
+  }
+}

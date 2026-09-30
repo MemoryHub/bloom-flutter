@@ -197,6 +197,103 @@ void main() {
     localOnline: true,
   ).firstWhere((device) => device.isLocal);
 
+  group('登录后的设备列表（F1）', () {
+    UserDevice remote({
+      String id = 'bloom-eink-68ee8f606594',
+      String type = 'eink',
+      DateTime? lastSeen,
+      int? intervalMinutes,
+    }) => UserDevice(
+      deviceId: id,
+      deviceType: type,
+      enabled: true,
+      lastSeenAt: lastSeen,
+      settings: intervalMinutes == null
+          ? null
+          : UserDeviceSettings(intervalMinutes: intervalMinutes),
+    );
+
+    test('只把本机那一行标成 isLocal', () {
+      // 只有持有设备令牌的那一台，其照片这个 App 才取得到。家庭里另一台手机
+      // 同样是 device_type=mobile，误标成 isLocal 会让界面承诺一个取不到的
+      // 照片流。
+      final devices = bloomDevicesFromRemote(
+        [
+          remote(id: credentials.deviceId, type: 'mobile'),
+          remote(id: 'bloom-eink-68ee8f606594'),
+        ],
+        localDeviceId: credentials.deviceId,
+        localOnline: true,
+      );
+
+      expect(devices, hasLength(2));
+      expect(devices[0].isLocal, isTrue);
+      expect(devices[1].isLocal, isFalse);
+      expect(devices[1].isFrame, isTrue);
+    });
+
+    test('本机小组件的开关状态只影响本机那一行', () {
+      // 关掉本机小组件不该把家庭里另一台手机也显示成离线。
+      final devices = bloomDevicesFromRemote(
+        [
+          remote(id: credentials.deviceId, type: 'mobile'),
+          remote(
+            id: 'other-phone',
+            type: 'mobile',
+            lastSeen: DateTime.now(),
+          ),
+        ],
+        localDeviceId: credentials.deviceId,
+        localOnline: false,
+      );
+
+      expect(devices[0].isOnline, isFalse);
+      expect(devices[1].isOnline, isTrue);
+    });
+
+    test('相框的在线窗口跟着它自己的刷新间隔走', () {
+      // 相框大部分时间在深度睡眠。用固定窗口会把一台完全正常的相框常年显示
+      // 成"离线"，而这个提示长期不准之后用户就再也不看它了。
+      final justNow = DateTime.now();
+
+      final freshWithLongInterval = bloomDevicesFromRemote(
+        [
+          remote(
+            lastSeen: justNow.subtract(const Duration(minutes: 40)),
+            intervalMinutes: 60,
+          ),
+        ],
+      );
+      expect(freshWithLongInterval.single.isOnline, isTrue);
+
+      final stale = bloomDevicesFromRemote(
+        [
+          remote(
+            lastSeen: justNow.subtract(const Duration(hours: 5)),
+            intervalMinutes: 60,
+          ),
+        ],
+      );
+      expect(stale.single.isOnline, isFalse);
+    });
+
+    test('从没上报过 last_seen 时不猜在线状态', () {
+      final devices = bloomDevicesFromRemote([remote()]);
+      expect(devices.single.isOnline, isNull);
+      // 界面把它渲染成"离线"，而不是编一个状态。
+      expect(devices.single.presenceLabel, '离线');
+    });
+
+    test('缺名字时按类型给一个可读的名字', () {
+      final devices = bloomDevicesFromRemote([
+        remote(id: 'frame-x'),
+        remote(id: 'phone-y', type: 'mobile'),
+      ]);
+      expect(devices[0].name, 'E-Ink');
+      expect(devices[1].name, '手机小组件');
+    });
+  });
+
   group('设备列表', () {
     testWidgets('渲染写死的相框，点击后进入详情页', (tester) async {
       SharedPreferences.setMockInitialValues(<String, Object>{});
@@ -240,7 +337,12 @@ void main() {
       expect(find.text('E-Ink'), findsOneWidget);
       // type == name now, so the meta line is just the absent live state
       expect(find.text('离线'), findsOneWidget);
-      expect(devices.any((d) => d.deviceId == 'bloom-eink-68ee8f606594'), isTrue);
+      // 引用常量而不是字面量：这个断言的意图是「兜底相框出现在列表里」，
+      // 不是「它的 ID 恰好是某个字符串」。写死字面量会在换板子时假失败。
+      expect(
+        devices.any((d) => d.deviceId == bloomBundledFrame.deviceId),
+        isTrue,
+      );
 
       await tester.tap(find.text('E-Ink'));
       await settle(tester);
@@ -251,12 +353,12 @@ void main() {
       // be scrolled to them: the page is deliberately taller than one screen now
       // (three labelled fields, then three groups).
       await tester.scrollUntilVisible(
-        find.text('bloom-eink-68ee8f606594'),
+        find.text(bloomBundledFrame.deviceId),
         220,
         scrollable: find.byType(Scrollable).first,
       );
       await settle(tester);
-      expect(find.text('bloom-eink-68ee8f606594'), findsOneWidget);
+      expect(find.text(bloomBundledFrame.deviceId), findsOneWidget);
     });
 
     testWidgets('设备是一个 tile：小字「类型 · 状态」在上，大字号名字在下（参考图布局）', (
@@ -1440,7 +1542,7 @@ void main() {
   });
 
   group('首页设备切换', () {
-    testWidgets('默认显示本机照片，切到相框时显示「登录后可查看此设备的照片」', (tester) async {
+    testWidgets('默认显示本机照片，切到相框时不假装能取到它的照片', (tester) async {
       SharedPreferences.setMockInitialValues(<String, Object>{});
       final devices = bloomDevices(
         credentials: credentials,
@@ -1482,8 +1584,8 @@ void main() {
       );
       await settle(tester);
 
-      // The switcher starts on this phone, so no lock placeholder is shown.
-      expect(find.text('登录后可查看此设备的照片'), findsNothing);
+      // The switcher starts on this phone, so no placeholder is shown.
+      expect(find.text('照片只显示在相框自己的屏幕上'), findsNothing);
 
       await tester.tap(find.byKey(const ValueKey('bloom-device-switcher')));
       await settle(tester);
@@ -1493,8 +1595,14 @@ void main() {
       await settle(tester);
 
       expect(selectedId, frame.deviceId);
-      // Switching to the frame must not pretend its photos can be loaded.
-      expect(find.text('登录后可查看此设备的照片'), findsOneWidget);
+      // 切到相框时不能假装它的照片取得到。
+      //
+      // ⚠️ 这里原先断言的是"登录后可查看此设备的照片"。那句话在 F1 落地后
+      // **依然兑现不了**：相框的照片由 `/carousel/plan` 提供，而它认的是相框
+      // 自己的设备令牌，用户会话解不开（服务端也没有对应的用户会话取图接口）。
+      // 所以文案改成了实话，这条断言跟着改 —— 它守的是"不许承诺做不到的事"。
+      expect(find.text('照片只显示在相框自己的屏幕上'), findsOneWidget);
+      expect(find.text('登录后可查看此设备的照片'), findsNothing);
     });
   });
 }

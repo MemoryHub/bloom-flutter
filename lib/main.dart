@@ -7,11 +7,14 @@ import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
 import 'background_sync.dart';
 import 'core/api/bloom_api_client.dart';
+import 'core/auth/auth_repository.dart';
+import 'core/models/auth_models.dart';
 import 'core/models/device_models.dart';
 import 'core/storage/daily_content_repository.dart';
 import 'core/storage/device_identity_repository.dart';
 import 'core/storage/display_preferences.dart';
 import 'platform/widget_bridge.dart';
+import 'ui/bloom_auth_pages.dart';
 import 'ui/bloom_device_pages.dart';
 import 'ui/bloom_glass_home.dart';
 
@@ -93,6 +96,7 @@ class BloomHomePage extends StatefulWidget {
     this.identity,
     this.api,
     this.displayPreferences,
+    this.auth,
   });
 
   /// Test seams. Production passes nothing and the state builds the real
@@ -102,6 +106,9 @@ class BloomHomePage extends StatefulWidget {
   final DeviceIdentityRepository? identity;
   final BloomApiClient? api;
   final DisplayPreferences? displayPreferences;
+
+  /// 账号会话（F1）。生产不传，由状态自己建。
+  final AuthRepository? auth;
 
   @override
   State<BloomHomePage> createState() => _BloomHomePageState();
@@ -114,6 +121,7 @@ class _BloomHomePageState extends State<BloomHomePage>
   late final BloomApiClient _api = widget.api ?? BloomApiClient();
   late final DisplayPreferences _displayPreferences =
       widget.displayPreferences ?? DisplayPreferences();
+  late final AuthRepository _auth = widget.auth ?? AuthRepository();
 
   Timer? _pairingPoll;
   Timer? _messageTimer;
@@ -148,6 +156,19 @@ class _BloomHomePageState extends State<BloomHomePage>
   String? _photoDeviceId;
   BloomDisplaySettings _displaySettings = const BloomDisplaySettings();
 
+  /// F1 账号状态。
+  ///
+  /// [_account] 为 null 表示未登录。登录与否**不影响**小组件换图 ——
+  /// 那条路径走设备令牌，与账号无关，所以这里从不阻止 `_load()`。
+  AccountInfo? _account;
+
+  /// 登录后从服务端取回的真实绑定关系（服务端模型，转成 [BloomDevice] 由
+  /// `bloomDevicesFromRemote` 负责）。空列表时设备页回退到硬编码列表，
+  /// 这样未登录和"登录了但还没绑定任何设备"都不会让页面变成一片空白。
+  List<UserDevice> _remoteDevices = const [];
+
+  bool _accountBusy = false;
+
   @override
   void initState() {
     super.initState();
@@ -181,6 +202,8 @@ class _BloomHomePageState extends State<BloomHomePage>
     WidgetsBinding.instance.addObserver(this);
     _load();
     _startSlotWatch();
+    // 账号恢复与 `_load()` 并行：它不阻塞首屏，也不影响小组件换图。
+    _restoreAuth();
   }
 
   /// **The page turns itself, like the widget does.**
@@ -866,12 +889,99 @@ class _BloomHomePageState extends State<BloomHomePage>
 
   /// Devices the photo page switcher and the "设备" tab list.
   ///
-  /// Hardcoded on purpose: `listMyDevices()` is a user-session endpoint and
-  /// throws [UnsupportedError] without a login (F1), so nothing here calls it.
-  List<BloomDevice> get _devices => bloomDevices(
-    credentials: _credentials,
-    localOnline: _credentials == null ? null : _paired,
-  );
+  /// 登录后优先用服务端的真实绑定关系（`GET /users/me/devices`，F1 之后
+  /// 它是真的了）；未登录、或登录了但服务端一条绑定都没有时，回退到
+  /// 硬编码的那两条。
+  ///
+  /// **为什么保留回退而不是直接用空列表**：硬编码那份包含相框，而相框今天
+  /// 确实绑定着用户的 Immich 账号。直接换成真实列表会让"刚注册、还没绑定"
+  /// 的用户看到一个空设备页 —— 而他昨天还能看到相框。宁可多显示一条已知的
+  /// 真实设备，也不要让页面凭空变空。
+  List<BloomDevice> get _devices {
+    if (_remoteDevices.isNotEmpty) {
+      return bloomDevicesFromRemote(
+        _remoteDevices,
+        localDeviceId: _credentials?.deviceId,
+        localOnline: _credentials == null ? null : _paired,
+      );
+    }
+    return bloomDevices(
+      credentials: _credentials,
+      localOnline: _credentials == null ? null : _paired,
+    );
+  }
+
+  // ---------- F1 账号 ----------
+
+  /// 启动时恢复本地会话，并向服务端确认它还有效。
+  ///
+  /// 两步分开是刻意的：本地恢复不发网络请求，所以登录状态在离线时也立刻可用；
+  /// 确认失败（非 401）只保留旧状态，不会把用户登出 —— 见 [AuthRepository.refresh]。
+  Future<void> _restoreAuth() async {
+    await _auth.load();
+    if (!mounted) return;
+    setState(() => _account = _auth.account);
+    if (_auth.isSignedIn) {
+      await _refreshAccount();
+    }
+  }
+
+  Future<void> _refreshAccount() async {
+    final account = await _auth.refresh();
+    if (!mounted) return;
+    setState(() => _account = account);
+    if (account != null && account.immichReady) {
+      await _loadRemoteDevices();
+    }
+  }
+
+  /// 取回当前账号绑定的设备。失败时静默保留旧列表 —— 设备列表是展示信息，
+  /// 一次网络抖动不该把页面清空。
+  Future<void> _loadRemoteDevices() async {
+    final token = _auth.token;
+    if (token == null) {
+      if (mounted) setState(() => _remoteDevices = const []);
+      return;
+    }
+    setState(() => _accountBusy = true);
+    try {
+      final devices = await _api.listMyDevices(token);
+      if (!mounted) return;
+      setState(() => _remoteDevices = devices);
+    } catch (_) {
+      // 保留既有列表。
+    } finally {
+      if (mounted) setState(() => _accountBusy = false);
+    }
+  }
+
+  Future<void> _openAuth() async {
+    final account = await Navigator.of(context).push<AccountInfo>(
+      MaterialPageRoute(
+        builder: (_) => BloomAuthPage(
+          auth: _auth,
+          onCancel: () => Navigator.of(context).pop(),
+          onSignedIn: (value) => Navigator.of(context).pop(value),
+        ),
+      ),
+    );
+    if (!mounted || account == null) return;
+    setState(() => _account = account);
+    _notify('登录成功');
+    await _refreshAccount();
+  }
+
+  Future<void> _signOut() async {
+    setState(() => _accountBusy = true);
+    await _auth.signOut();
+    if (!mounted) return;
+    setState(() {
+      _account = null;
+      _remoteDevices = const [];
+      _accountBusy = false;
+    });
+    _notify('已退出登录');
+  }
 
   /// The device whose photos the photo page shows; falls back to this phone.
   BloomDevice? get _photoDevice {
@@ -1192,5 +1302,9 @@ class _BloomHomePageState extends State<BloomHomePage>
     onRefreshPairingCode: _newPairingCode,
     onCopyDeviceId: _copyDeviceId,
     onCopyPairingCode: _copyPairingCode,
+    account: _account,
+    onAccountTap: _openAuth,
+    onSignOut: _signOut,
+    accountBusy: _accountBusy,
   );
 }

@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import '../models/auth_models.dart';
 import '../models/device_models.dart';
 import '../storage/display_preferences.dart';
 
@@ -342,17 +343,123 @@ class BloomApiClient {
 
   /// `POST /users/me/devices`, the devices bound to the signed-in user.
   ///
-  /// This is a **user session** endpoint. The app only has a device token today
-  /// (login is F1), which cannot authenticate it, so the call is intentionally
-  /// not implemented: it always fails with [UnsupportedError] instead of
-  /// pretending to work. The signature is declared so calling code and tests
-  /// can be written against the intended shape; the exact response schema is
-  /// unverified and must be confirmed against the backend when F1 lands.
-  Future<List<Map<String, dynamic>>> listMyDevices() async {
-    throw UnsupportedError(
-      'listMyDevices 需要用户登录态（F1），当前设备令牌无法调用 users/me/devices。',
-    );
+  /// F1 之前这里恒抛 [UnsupportedError]：那是用户会话接口，而 App 只有设备
+  /// 令牌。现在账号体系落地，它变成真调用了 —— 响应形状也已对着服务端的
+  /// `serialize_user_device` 核实过，不再是"待确认的猜测"。
+  ///
+  /// ⚠️ 用的是 [userToken]（账号会话），**不是**设备令牌。两者不能互换：
+  /// 设备令牌只认自己那一台设备。
+  Future<List<UserDevice>> listMyDevices(String userToken) async {
+    final response = await _client
+        .get(_uri('/api/frame/users/me/devices'), headers: _userHeaders(userToken))
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    final devices = _json(response)['devices'];
+    if (devices is! List) return const [];
+    return devices
+        .whereType<Map>()
+        .map((item) => UserDevice.fromJson(item.cast<String, dynamic>()))
+        .toList(growable: false);
   }
+
+  // ---------- F1 账号体系 ----------
+  //
+  // 会话用 Authorization: Bearer，与设备令牌（X-Frame-Token）并存。
+  // 刻意分成两套头而不是合并成一个：合并之后任何一处调用都可能悄悄带上
+  // 另一个身份，而"登录后小组件不再更新"这类症状极难定位。
+
+  Map<String, String> _userHeaders(String userToken) => {
+    'Authorization': 'Bearer $userToken',
+    'Accept': 'application/json',
+  };
+
+  /// 下发短信验证码。`purpose` 为 `register` 或 `login`。
+  ///
+  /// 服务端在开发模式（`FRAME_SMS_PROVIDER=console`）下会在响应里带上
+  /// `dev_code`，用于云片模板报备通过前联调；生产模式恒为 null。
+  Future<SmsCodeResult> sendSmsCode({
+    required String phone,
+    required String purpose,
+  }) async {
+    final response = await _client
+        .post(
+          _uri('/api/frame/auth/sms/send'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: jsonEncode({'phone': phone, 'purpose': purpose}),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return SmsCodeResult.fromJson(_json(response));
+  }
+
+  Future<AuthResult> registerAccount({
+    required String phone,
+    required String code,
+    String? nickname,
+  }) async {
+    final response = await _client
+        .post(
+          _uri('/api/frame/auth/register'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: jsonEncode({
+            'phone': phone,
+            'code': code,
+            if (nickname != null && nickname.trim().isNotEmpty)
+              'nickname': nickname.trim(),
+          }),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 201);
+    return AuthResult.fromJson(_json(response));
+  }
+
+  Future<AuthResult> loginAccount({
+    required String phone,
+    required String code,
+  }) async {
+    final response = await _client
+        .post(
+          _uri('/api/frame/auth/login'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: jsonEncode({'phone': phone, 'code': code}),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return AuthResult.fromJson(_json(response));
+  }
+
+  /// 服务端只吊销这一个会话；其他设备上的登录不受影响。
+  Future<void> logoutAccount(String userToken) async {
+    final response = await _client
+        .post(_uri('/api/frame/auth/logout'), headers: _userHeaders(userToken))
+        .timeout(_requestTimeout);
+    // 204 是正常结果；另外把 401 也当成成功 —— token 本来就无效时，
+    // 本地登出必须照样完成，否则用户会卡在"退不出去"的状态里。
+    if (response.statusCode == 401) return;
+    _ensure(response, 204);
+  }
+
+  Future<AccountInfo> fetchAccount(String userToken) async {
+    final response = await _client
+        .get(_uri('/api/frame/users/me/account'), headers: _userHeaders(userToken))
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    final account = _json(response)['account'];
+    if (account is! Map) {
+      throw const FormatException('account: response has no "account" object');
+    }
+    return AccountInfo.fromJson(account.cast<String, dynamic>());
+  }
+
 
   Map<String, dynamic> _json(http.Response response) =>
       jsonDecode(response.body) as Map<String, dynamic>;
