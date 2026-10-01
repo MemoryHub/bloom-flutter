@@ -306,6 +306,40 @@ void main() {
       reason: '模式标签必须和右侧切换图标在同一条中心线上',
     );
   });
+  testWidgets('换图之后卡片只能剩一张（旧的必须真的退场）', (tester) async {
+    // **真机上出现过：白色纸面上中文标题画了两遍。** 上面一层是大字（两行），
+    // 下面一层是正常字号加英文和日期，中间一条接缝 —— 而且它**不会再自己
+    // 消失**（用户原话："之前还能自动消失 现在不能了"）。
+    //
+    // 卡片外面套着 `AnimatedSwitcher` 做交叉淡出，它的自定义 `layoutBuilder`
+    // 把上一张卡保留在 `Stack` 里。设计上假设"旧卡 480ms 后自己淡出消失"，
+    // 只要这个假设不成立，两层就一直在。
+    //
+    // 这条用例把"树里有几张卡"变成可断言的数字，不再靠肉眼看截图。
+    Widget withItem(int id) => MaterialApp(
+      home: _Harness(
+        initialTab: 0,
+        onTabChanged: (_) {},
+        photoPath: photoPath,
+        credentials: credentials,
+        recommendationId: id,
+      ),
+    );
+
+    await tester.pumpWidget(withItem(3));
+    await settle(tester);
+    expect(find.text('「测试照片」'), findsOneWidget, reason: '一开始就该只有一张卡');
+
+    // 换一张图 —— 这正是真机上发生的事：先显示缓存里那张，加载完再换成
+    // 同步来的那一张。
+    await tester.pumpWidget(withItem(4));
+    await settle(tester);
+    expect(
+      find.text('「测试照片」'),
+      findsOneWidget,
+      reason: '换图之后旧卡片必须已经退场，否则纸面上会叠出两层标题',
+    );
+  });
 }
 
 /// Owns the selected tab so a tap on the nav bar really swaps pages.
@@ -317,6 +351,7 @@ class _Harness extends StatefulWidget {
     required this.credentials,
     this.mode = BloomDisplayMode.recommendation,
     this.message,
+    this.recommendationId = 3,
   });
 
   final int initialTab;
@@ -325,6 +360,10 @@ class _Harness extends StatefulWidget {
   final DeviceCredentials credentials;
   final BloomDisplayMode mode;
   final String? message;
+
+  /// 让用例能换一张"当前展示的照片" —— 卡片的 key 跟着它走，所以换它就是
+  /// 触发一次换图动画。
+  final int recommendationId;
 
   @override
   State<_Harness> createState() => _HarnessState();
@@ -344,12 +383,12 @@ class _HarnessState extends State<_Harness> {
       path: widget.photoPath,
       orientation: 'portrait',
       date: '2026-08-13',
-      recommendationId: 3,
+      recommendationId: widget.recommendationId,
     ),
     originalPhotoPath: widget.photoPath,
-    content: const DailyContent(
+    content: DailyContent(
       date: '2026-08-13',
-      recommendationId: 3,
+      recommendationId: widget.recommendationId,
       captionZh: '测试照片',
       capturedDateText: '2024.01.02',
       locationText: '天津',
