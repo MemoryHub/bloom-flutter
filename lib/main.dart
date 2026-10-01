@@ -1023,7 +1023,22 @@ class _BloomHomePageState extends State<BloomHomePage>
       }
     }
     _notify('登录成功');
+    // 顺序：**先**认领设备、拿到服务端下发的令牌（`_refreshAccount` 里做），
+    // 再取图。反过来的话第一次取图会拿着一个还没被服务端认下的本机令牌去打
+    // 一次 401。
     await _refreshAccount();
+    if (!mounted) return;
+    // **登录成功后必须显式取一次图。**
+    //
+    // `_load()` 现在的第一步是"未登录就什么都不做"，所以启动时那一次（那时还
+    // 没有会话）是空跑的。而登录成功之后**没有任何地方会自动重来**：
+    //   - `_startSlotWatch` 的 30 秒兜底会先问 `isBehind()`，而它第一行就是
+    //     "本地栅格是空的就返回 false" —— 全新安装时栅格恰好是空的，于是兜底
+    //     永远不会触发；
+    //   - 剩下的就只有重启 App 或在首页下拉。
+    // 漏掉这一句，表现就是"登录成功了，但页面停在空态、永远不换图"，
+    // 而且服务端日志里除了那次 `claim` 之外，看不到任何该设备的请求。
+    await _load();
   }
 
   Future<void> _signOut() async {

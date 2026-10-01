@@ -4,11 +4,19 @@ import 'dart:io';
 import 'package:bloom/core/models/auth_models.dart';
 import 'package:bloom/core/models/device_models.dart';
 import 'package:bloom/core/storage/display_preferences.dart';
+import 'package:bloom/core/api/bloom_api_client.dart';
+import 'package:bloom/core/auth/auth_repository.dart';
+import 'package:bloom/core/storage/device_identity_repository.dart';
+import 'package:bloom/main.dart';
+import 'package:bloom/ui/bloom_auth_pages.dart';
 import 'package:bloom/ui/bloom_device_pages.dart';
 import 'package:bloom/ui/bloom_glass_home.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:liquid_glass_easy/liquid_glass_easy.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'support/fake_account.dart';
 
@@ -217,6 +225,118 @@ void main() {
     await pump(tester, account: fakeAccount(nickname: 'Alex'), tab: 3);
     expect(find.byKey(const ValueKey('bloom-profile-signed-out')), findsNothing);
     expect(find.text('Alex'), findsOneWidget);
+  });
+
+  /// **登录成功之后必须自己去取一次图。**
+  ///
+  /// 这条守的是一个真实发生过的故障：`_load()` 改成"未登录就什么都不做"之后，
+  /// 启动时那一次（还没有会话）变成空跑，而登录成功之后没有任何地方会重来一次 ——
+  /// 页面于是停在空态、永远不换图。服务端日志里除了那次 `claim` 之外，看不到
+  /// 该设备的任何 `/status` 请求，这就是当时的现场。
+  ///
+  /// 之所以不能只靠"四个页面各自挡住"那组用例：那些用例验的是**渲染**，
+  /// 而这里漏掉的是**取数**。渲染全对、就是不联网，界面上看不出区别。
+  testWidgets('登录成功后会自动请求本机状态（不会停在空态）', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final requests = <String>[];
+    final secure = <String, String>{};
+
+    // ⚠️ 必须带 charset：`http.Response(body, 200)` 默认按 latin-1 编码，
+    //    body 里只要有中文就抛 ArgumentError（看起来像"网络异常"）。
+    const jsonHeaders = {'content-type': 'application/json; charset=utf-8'};
+
+    Future<http.Response> handler(http.Request request) async {
+      final path = request.url.path;
+      requests.add('${request.method} $path');
+      if (path.endsWith('/auth/login')) {
+        return http.Response(
+          jsonEncode({
+            'token': 'session-token',
+            'expires_at': '2030-01-01T00:00:00Z',
+            'account': {
+              'id': 'acc-1',
+              'phone': '+8613800138000',
+              'nickname': '测试',
+              'provision_status': 'ready',
+              'immich_ready': true,
+            },
+            // 相册已就绪的账号，登录响应里直接带着设备令牌。
+            'device': {'device_id': 'bloom-mobile-test', 'device_token': 'd' * 64},
+          }),
+          200,
+          headers: jsonHeaders,
+        );
+      }
+      if (path.endsWith('/status')) {
+        return http.Response(
+          jsonEncode({'paired': true, 'has_assets': false, 'mode': 'recommend'}),
+          200,
+          headers: jsonHeaders,
+        );
+      }
+      return http.Response('{}', 404);
+    }
+
+    final client = MockClient(handler);
+    final identity = DeviceIdentityRepository(
+      readToken: (key) async => secure[key],
+      writeToken: (key, value) async => secure[key] = value,
+      mirrorToWidget: (_, _) async {},
+    );
+    final api = BloomApiClient(
+      baseUrl: 'https://bloom.jihu.top',
+      client: client,
+    );
+    final auth = AuthRepository(
+      api: BloomApiClient(baseUrl: 'https://bloom.jihu.top', client: client),
+      readValue: (_) async => null,
+      writeValue: (_, _) async {},
+      deleteValue: (_) async {},
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: BloomHomePage(
+          identity: identity,
+          api: api,
+          displayPreferences: DisplayPreferences(api: api),
+          auth: auth,
+        ),
+      ),
+    );
+    await settle(tester);
+
+    expect(
+      requests.where((r) => r.contains('/devices/')),
+      isEmpty,
+      reason: '未登录时一个设备请求都不该发出去',
+    );
+
+    // 走完整的登录流程：点登录入口 → 填手机号与验证码 → 提交。
+    await tester.tap(find.widgetWithText(BloomPrimaryButton, '登录').first);
+    await settle(tester);
+    await tester.enterText(find.byType(TextField).at(0), '13800138000');
+    await tester.enterText(find.byType(TextField).at(1), '123456');
+    await settle(tester);
+    await tester.tap(
+      find.descendant(
+        of: find.byType(BloomAuthPage),
+        matching: find.widgetWithText(BloomPrimaryButton, '登录'),
+      ),
+    );
+    // 登录 → 认领设备 → 列设备 → 取图，中间有多次 await，多推几帧。
+    for (var i = 0; i < 40; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    expect(
+      requests.any((r) => r.contains('/devices/') && r.endsWith('/status')),
+      isTrue,
+      reason: '登录成功后必须自己去取一次图，否则页面停在空态、永远不换图。'
+          '实际发出的请求：$requests；'
+          '登录页还在吗：${find.byType(BloomAuthPage).evaluate().isNotEmpty}；'
+          '屏幕上的文字：${find.byType(Text).evaluate().map((e) => (e.widget as Text).data).where((t) => t != null).toList()}',
+    );
   });
 }
 
