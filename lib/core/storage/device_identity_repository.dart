@@ -24,7 +24,11 @@ class DeviceIdentityRepository {
     Future<String?> Function(String key)? readToken,
     Future<void> Function(String key, String value)? writeToken,
     Future<void> Function(String deviceId, String deviceToken)? mirrorToWidget,
-  }) : _preferences = preferences,
+    Future<Map<String, String>?> Function()? stableCredentials,
+  }) : _stableCredentialsOf =
+           stableCredentials ??
+           BloomWidgetBridgePlatform.stableDeviceCredentials,
+       _preferences = preferences,
        _secureStorage = secureStorage ?? const FlutterSecureStorage(),
        _readToken = readToken,
        _writeToken = writeToken,
@@ -46,6 +50,9 @@ class DeviceIdentityRepository {
   final Future<String?> Function(String key)? _readToken;
   final Future<void> Function(String key, String value)? _writeToken;
 
+  /// 原生侧那份跨重装稳定的身份。见 [initialize]。
+  final Future<Map<String, String>?> Function() _stableCredentialsOf;
+
   /// 把身份镜像到原生侧（iOS 的 App Group）。见 [save] 的说明。
   final Future<void> Function(String deviceId, String deviceToken)
   _mirrorToWidget;
@@ -65,19 +72,62 @@ class DeviceIdentityRepository {
 
   /// 取回本机身份，没有就当场生成一个并持久化。
   ///
+  /// ⚠️ **设备 ID 只生成一次，之后永远复用。** 它是"这台机器"的身份，不是一次
+  /// 会话的凭证：登出、令牌过期、重启都不该让它变。变了就等于换了台设备 ——
+  /// 服务端会新建一条记录（拿的是默认作息，而不是用户配好的那一套），设备列表
+  /// 里不断堆出重复的手机，还会撞上每账号 10 台的额度。这个坑真实发生过：用户
+  /// 登出再登录之后，首页的「下次更新」从自己的节奏变成了"明天 06:00"，因为新
+  /// 记录的 `interval_minutes` 是服务端默认的 1440（一天一格）。
+  ///
   /// **本方法不再抛异常，也不再碰原生通道。** 它以前在 iOS 上会因为
   /// `stableDeviceCredentials` 拿不到值而抛 `StateError`，而调用方只能把这个
   /// 异常当成"服务器连不上"来处理 —— 一个本地身份问题伪装成网络问题，
   /// 正是那个 bug 难查的原因。
   Future<DeviceCredentials> initialize() async {
-    final existing = await read();
-    if (existing != null) return existing;
+    final prefs = await _prefs;
+    final existingId = prefs.getString(_deviceIdKey);
+    final storedToken =
+        await (_readToken?.call(_deviceTokenKey) ??
+            _secureStorage.read(key: _deviceTokenKey));
+    final needsToken = storedToken == null || storedToken.length < 32;
+
+    // 本机没存过 ID 时，先问原生侧要那个**跨重装稳定**的身份
+    // （Android 用 ANDROID_ID 派生，iOS 走 Keychain）。这是用户模块之前的行为：
+    // 重装 App 不该让服务端把你当成另一台设备 —— 否则你配好的轮播作息会留在旧
+    // 记录上，新记录拿到默认的 1440（一天一格），首页就显示"明天 06:00"。
+    //
+    // ⚠️ 拿不到就**安静地退回随机**。以前这里是硬抛 `StateError`，调用方只能把它
+    //    当成"连不上服务器"，一个本地身份问题伪装成网络问题 —— 那正是 iOS"全新
+    //    安装首启卡在配对页"难查的原因。稳定性是**加分项**，不是启动的前提。
+    var deviceId = existingId;
+    var deviceToken = needsToken ? null : storedToken;
+    if (deviceId == null || deviceToken == null) {
+      final stable = await _stableCredentials();
+      deviceId ??= stable?['deviceId'];
+      if (stable?['deviceToken'] case final token? when token.length >= 32) {
+        deviceToken ??= token;
+      }
+    }
+
     final credentials = DeviceCredentials(
-      deviceId: 'bloom-mobile-${_uuidV4()}',
-      deviceToken: _randomHex(32),
+      deviceId: deviceId ?? 'bloom-mobile-${_uuidV4()}',
+      deviceToken: deviceToken ?? _randomHex(32),
     );
-    await save(credentials);
+    // 只有确实缺东西时才写盘，省掉每次启动的存储写入。
+    if (existingId != credentials.deviceId || needsToken) {
+      await save(credentials);
+    }
     return credentials;
+  }
+
+  /// 问原生侧要稳定的设备身份。**任何失败都返回 null**（见 [initialize]）。
+  Future<Map<String, String>?> _stableCredentials() async {
+    try {
+      return await _stableCredentialsOf();
+    } catch (_) {
+      // 平台通道还没装上、或原生侧拒绝了。退回随机，启动照常。
+      return null;
+    }
   }
 
   /// 保存本机身份。
@@ -132,11 +182,16 @@ class DeviceIdentityRepository {
     await _mirror(deviceId, deviceToken);
   }
 
-  /// 忘掉本机身份。登出时用 —— 设备令牌一起丢掉，小组件因此取不到新图
-  /// （"登出即冻结"就是这么实现的，不需要改原生）。
+  /// 登出：让本机再也拿不到图 —— 这就是"登出即冻结"的全部实现。
+  ///
+  /// ⚠️ **设备 ID 必须留下**（对比 [initialize] 的说明）。这里以前把它一起删
+  /// 了，于是每次"登出→登录"都会变成一台全新的服务端设备：用户配好的作息留在
+  /// 旧记录上，新记录拿服务端默认值（`interval_minutes=1440`，一天一格），首页
+  /// 就会显示"明天 06:00"；同时设备列表里堆重复项、并很快撞上 10 台额度。
+  ///
+  /// 要冻结小组件，只需要三件事：清掉"令牌来自服务端"这个标记、删掉令牌本身、
+  /// 把原生侧那份镜像抹掉。设备 ID 不在其中 —— 它没有取图能力，留着无害。
   Future<void> clear() async {
-    await (await _prefs).remove(_deviceIdKey);
-    await (await _prefs).remove(_identityVersionKey);
     await (await _prefs).remove(_serverTokenKey);
     await (_writeToken == null
         ? _secureStorage.delete(key: _deviceTokenKey)

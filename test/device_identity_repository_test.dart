@@ -15,12 +15,15 @@ void main() {
   DeviceIdentityRepository build(
     Map<String, String> secure, {
     List<List<String>>? mirrored,
+    Future<Map<String, String>?> Function()? stable,
   }) => DeviceIdentityRepository(
     readToken: (key) async => secure[key],
     writeToken: (key, value) async => secure[key] = value,
     // 记下镜像调用，用来钉住"什么时候该把令牌交给原生小组件"。
     mirrorToWidget: (deviceId, deviceToken) async =>
         mirrored?.add([deviceId, deviceToken]),
+    // 默认没有原生侧稳定身份（widget 测试里没有平台通道）。
+    stableCredentials: stable ?? () async => null,
   );
 
   test('首次启动会生成一个本机设备身份', () async {
@@ -56,13 +59,16 @@ void main() {
     expect(result.deviceToken, 'b' * 64);
   });
 
-  test('令牌残缺时当作没有身份，重新生成', () async {
+  test('令牌残缺时换一枚新令牌，但**设备 ID 不动**', () async {
     // 半截令牌不能拿去打接口：服务端比对的是它的 sha256，一个被截断的值
     // 只会得到 401，而调用方会把它当成网络问题。
+    //
+    // 但设备 ID 必须留下：它是"这台机器"，不是一次会话的凭证。跟着一起换掉
+    // 就等于换了台设备，服务端会新建记录（拿默认作息）、列表里堆重复项。
     SharedPreferences.setMockInitialValues({'bloom.device_id': 'old-id'});
     final secure = {'bloom.device_token': 'short'};
     final result = await build(secure).initialize();
-    expect(result.deviceId, isNot('old-id'));
+    expect(result.deviceId, 'old-id', reason: '设备 ID 必须复用，不能跟着令牌一起换');
     expect(result.deviceToken.length, 64);
   });
 
@@ -85,7 +91,7 @@ void main() {
     expect(stored.deviceId, local.deviceId);
   });
 
-  test('登出清掉一切，包括"令牌来自服务端"这个标记', () async {
+  test('登出清掉令牌和标记', () async {
     SharedPreferences.setMockInitialValues({});
     final secure = <String, String>{};
     final repository = build(secure);
@@ -97,6 +103,27 @@ void main() {
     expect(await repository.read(), isNull);
     expect(await repository.hasServerToken(), isFalse);
     expect(secure['bloom.device_token'], anyOf(isNull, isEmpty));
+  });
+
+  test('登出之后设备 ID 不变（否则登录会变成一台新设备）', () async {
+    // 这条守的是一个真实发生过的故障：登出把设备 ID 一起删了，重新登录时随机
+    // 生成了一个新的，服务端于是新建了一条设备记录 —— 用户配好的轮播作息留在
+    // 旧记录上，新记录拿的是服务端默认值（interval_minutes=1440，一天一格），
+    // 首页的「下次更新」就从自己的节奏变成了"明天 06:00"。
+    SharedPreferences.setMockInitialValues({});
+    final secure = <String, String>{};
+    final repository = build(secure);
+    final before = await repository.initialize();
+    await repository.saveIssued(deviceId: before.deviceId, deviceToken: 'f' * 64);
+
+    await repository.clear();
+    final after = await repository.initialize();
+
+    expect(
+      after.deviceId,
+      before.deviceId,
+      reason: '设备 ID 是"这台机器"，登出不该把它换掉 —— 换了服务端就当成新设备',
+    );
   });
 
   test('本机自编的令牌不镜像给小组件', () async {
@@ -137,5 +164,52 @@ void main() {
 
     expect(mirrored, hasLength(2));
     expect(mirrored.last[1], isEmpty, reason: '登出必须清掉原生侧的令牌');
+  });
+
+  test('没存过 ID 时用原生侧的稳定身份（重装不该变成新设备）', () async {
+    // 这是用户模块之前的行为：Android 用 ANDROID_ID 派生，iOS 走 Keychain，
+    // 所以重装 App 之后服务端认得的还是同一台设备 —— 用户配好的轮播作息、
+    // 设备名、历史都在。
+    SharedPreferences.setMockInitialValues({});
+    final secure = <String, String>{};
+    final result = await build(
+      secure,
+      stable: () async => {
+        'deviceId': 'bloom-mobile-from-native',
+        'deviceToken': 'a' * 64,
+      },
+    ).initialize();
+
+    expect(result.deviceId, 'bloom-mobile-from-native');
+  });
+
+  test('原生侧拿不到稳定身份时安静退回随机，**不抛异常**', () async {
+    // 这条是当年 iOS 那个 bug 的护栏：以前拿不到就抛 StateError，调用方只能
+    // 当成"连不上服务器"，一个本地身份问题伪装成网络问题。
+    // 稳定性是加分项，不是启动的前提。
+    SharedPreferences.setMockInitialValues({});
+    final secure = <String, String>{};
+    final result = await build(
+      secure,
+      stable: () async => throw StateError('平台通道还没装上'),
+    ).initialize();
+
+    expect(result.deviceId, startsWith('bloom-mobile-'));
+    expect(result.deviceToken.length, 64);
+  });
+
+  test('已存的 ID 优先于原生侧（登出/重启都要复用同一个）', () async {
+    SharedPreferences.setMockInitialValues({'bloom.device_id': 'stored-id'});
+    final secure = {'bloom.device_token': 'b' * 64};
+    final result = await build(
+      secure,
+      stable: () async => {
+        'deviceId': 'bloom-mobile-from-native',
+        'deviceToken': 'c' * 64,
+      },
+    ).initialize();
+
+    expect(result.deviceId, 'stored-id');
+    expect(result.deviceToken, 'b' * 64);
   });
 }
