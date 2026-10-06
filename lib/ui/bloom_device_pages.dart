@@ -123,20 +123,19 @@ List<BloomDevice> bloomDevicesFromRemote(
 }) => [
   for (final device in remote)
     () {
-      final isLocal =
-          localDeviceId != null && device.deviceId == localDeviceId;
+      final isLocal = localDeviceId != null && device.deviceId == localDeviceId;
       return BloomDevice(
         deviceId: device.deviceId,
-        name: (device.name?.trim().isNotEmpty ?? false)
-            ? device.name!.trim()
-            : (device.isFrame ? 'E-Ink' : '手机小组件'),
+        name:
+            (device.name?.trim().isNotEmpty ?? false)
+                ? device.name!.trim()
+                : (device.isFrame ? 'E-Ink' : '手机小组件'),
         type: device.deviceType,
         isLocal: isLocal,
         // 本机小组件的开关状态只对本机有效。家庭里另一台手机也是
         // device_type=mobile，套用本机的开关会把它显示成错误的离线。
-        isOnline: isLocal && localOnline != null
-            ? localOnline
-            : _onlineFrom(device),
+        isOnline:
+            isLocal && localOnline != null ? localOnline : _onlineFrom(device),
       );
     }(),
 ];
@@ -204,7 +203,6 @@ class BloomDeviceListPage extends StatelessWidget {
   /// 登录态正在变化（例如正在取设备列表），期间禁用账号操作，避免重复点击。
   final bool accountBusy;
 
-
   @override
   Widget build(BuildContext context) {
     // 未登录：整页换成登录提示。
@@ -246,86 +244,86 @@ class BloomDeviceListPage extends StatelessWidget {
       );
     }
     return SafeArea(
-    minimum: const EdgeInsets.fromLTRB(
-      BloomSurface.pageInset,
-      BloomSurface.pageInset,
-      BloomSurface.pageInset,
-      0,
-    ),
-    child: ListView(
-      physics: const BouncingScrollPhysics(),
-      padding: const EdgeInsets.only(bottom: 112),
-      children: [
-        BloomPageTitle(
-          title: '设备',
-          subtitle: '管理相框和手机小组件',
-          // Both actions, bare, in the corner the user asked for. 扫码 is the
-          // camera path and ＋ is the plain one — today they open the same
-          // "coming soon" notice, so this is a **placeholder pairing**: when the
-          // real flow lands, ＋ should start a manual add and 扫码 should only
-          // read a QR.
-          trailing: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              BloomIconButton(
-                icon: Icons.qr_code_scanner_rounded,
-                loading: false,
-                onTap: onAddDevice,
+      minimum: const EdgeInsets.fromLTRB(
+        BloomSurface.pageInset,
+        BloomSurface.pageInset,
+        BloomSurface.pageInset,
+        0,
+      ),
+      child: ListView(
+        physics: const BouncingScrollPhysics(),
+        padding: const EdgeInsets.only(bottom: 112),
+        children: [
+          BloomPageTitle(
+            title: '设备',
+            subtitle: '管理相框和手机小组件',
+            // Both actions, bare, in the corner the user asked for. 扫码 is the
+            // camera path and ＋ is the plain one — today they open the same
+            // "coming soon" notice, so this is a **placeholder pairing**: when the
+            // real flow lands, ＋ should start a manual add and 扫码 should only
+            // read a QR.
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                BloomIconButton(
+                  icon: Icons.qr_code_scanner_rounded,
+                  loading: false,
+                  onTap: onAddDevice,
+                ),
+                const SizedBox(width: 2),
+                BloomIconButton(
+                  key: const ValueKey('bloom-add-device'),
+                  icon: Icons.add_rounded,
+                  loading: false,
+                  onTap: onAddDevice,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: BloomPageTitle.contentGap),
+          // An empty list is a designed state, not an absence: one glyph, one
+          // sentence, one button, centred in the space the tiles would have used.
+          if (devices.isEmpty) ...[
+            const SizedBox(height: 96),
+            const Icon(
+              Icons.photo_size_select_actual_outlined,
+              size: 34,
+              color: BloomInk.textFaint,
+            ),
+            const SizedBox(height: 14),
+            Text(
+              '还没有添加设备',
+              textAlign: TextAlign.center,
+              style: BloomType.body.copyWith(color: BloomInk.textMuted),
+            ),
+            const SizedBox(height: 22),
+            Center(
+              child: SizedBox(
+                width: 168,
+                child: BloomPrimaryButton(
+                  key: const ValueKey('bloom-empty-add-device'),
+                  label: '添加设备',
+                  onPressed: onAddDevice,
+                ),
               ),
-              const SizedBox(width: 2),
-              BloomIconButton(
-                key: const ValueKey('bloom-add-device'),
-                icon: Icons.add_rounded,
-                loading: false,
-                onTap: onAddDevice,
+            ),
+          ] else
+            for (var index = 0; index < devices.length; index++) ...[
+              // Tiles are 112 tall now, so the seam between two of them is a real
+              // gap in a list rather than a 9px shim.
+              if (index > 0) const SizedBox(height: 12),
+              _DeviceCard(
+                device: devices[index],
+                // The switch's verdict for this phone outranks the server: with
+                // the widget off, its tile is 离线 wherever the server thinks it
+                // is.
+                onlineOverride:
+                    devices[index].isLocal && !widgetEnabled ? false : null,
+                onTap: () => onOpenDevice(devices[index]),
               ),
             ],
-          ),
-        ),
-        const SizedBox(height: BloomPageTitle.contentGap),
-        // An empty list is a designed state, not an absence: one glyph, one
-        // sentence, one button, centred in the space the tiles would have used.
-        if (devices.isEmpty) ...[
-          const SizedBox(height: 96),
-          const Icon(
-            Icons.photo_size_select_actual_outlined,
-            size: 34,
-            color: BloomInk.textFaint,
-          ),
-          const SizedBox(height: 14),
-          Text(
-            '还没有添加设备',
-            textAlign: TextAlign.center,
-            style: BloomType.body.copyWith(color: BloomInk.textMuted),
-          ),
-          const SizedBox(height: 22),
-          Center(
-            child: SizedBox(
-              width: 168,
-              child: BloomPrimaryButton(
-                key: const ValueKey('bloom-empty-add-device'),
-                label: '添加设备',
-                onPressed: onAddDevice,
-              ),
-            ),
-          ),
-        ] else
-          for (var index = 0; index < devices.length; index++) ...[
-            // Tiles are 112 tall now, so the seam between two of them is a real
-            // gap in a list rather than a 9px shim.
-            if (index > 0) const SizedBox(height: 12),
-            _DeviceCard(
-              device: devices[index],
-              // The switch's verdict for this phone outranks the server: with
-              // the widget off, its tile is 离线 wherever the server thinks it
-              // is.
-              onlineOverride:
-                  devices[index].isLocal && !widgetEnabled ? false : null,
-              onTap: () => onOpenDevice(devices[index]),
-            ),
-          ],
-      ],
-    ),
+        ],
+      ),
     );
   }
 }
@@ -362,133 +360,133 @@ class _DeviceCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final online = onlineOverride ?? device.isOnline;
     return BloomPanel(
-    // The card, raised: pure black with the tooth and the two 1px edges.
-    lifted: true,
-    padding: EdgeInsets.zero,
-    child: Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: onTap,
-        splashColor: const Color(0x14EDF2EF),
-        highlightColor: const Color(0x0AEDF2EF),
-        child: Stack(
-          children: [
-            // **A live card carries its own light.**
-            //
-            // The reference the user sent is a smart-home tile that glows from a
-            // corner while its lamp is on and goes flat when it is off; the ask
-            // was to give this app the same signal — from the *bottom-right*, so
-            // it reads as light spilling in rather than a lamp burning — in the
-            // theme's green. Online gets the glow, offline gets the plain card,
-            // and the only chroma in the list is the one that means something.
-            if (online == true)
-              Positioned.fill(
-                child: IgnorePointer(
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: RadialGradient(
-                        center: const Alignment(.98, 1.08),
-                        // Radius is a fraction of the *short* side (the card is
-                        // ~104 tall, ~350 wide), so 1.8 puts the falloff about
-                        // half way across the item: the user wanted the spill to
-                        // reach roughly half the card and to be brighter.
-                        radius: 1.8,
-                        stops: const [0, .45, 1],
-                        colors: [
-                          BloomInk.accent.withValues(alpha: .52),
-                          BloomInk.accent.withValues(alpha: .20),
-                          BloomInk.accent.withValues(alpha: 0),
-                        ],
+      // The card, raised: pure black with the tooth and the two 1px edges.
+      lifted: true,
+      padding: EdgeInsets.zero,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: onTap,
+          splashColor: const Color(0x14EDF2EF),
+          highlightColor: const Color(0x0AEDF2EF),
+          child: Stack(
+            children: [
+              // **A live card carries its own light.**
+              //
+              // The reference the user sent is a smart-home tile that glows from a
+              // corner while its lamp is on and goes flat when it is off; the ask
+              // was to give this app the same signal — from the *bottom-right*, so
+              // it reads as light spilling in rather than a lamp burning — in the
+              // theme's green. Online gets the glow, offline gets the plain card,
+              // and the only chroma in the list is the one that means something.
+              if (online == true)
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: RadialGradient(
+                          center: const Alignment(.98, 1.08),
+                          // Radius is a fraction of the *short* side (the card is
+                          // ~104 tall, ~350 wide), so 1.8 puts the falloff about
+                          // half way across the item: the user wanted the spill to
+                          // reach roughly half the card and to be brighter.
+                          radius: 1.8,
+                          stops: const [0, .45, 1],
+                          colors: [
+                            BloomInk.accent.withValues(alpha: .52),
+                            BloomInk.accent.withValues(alpha: .20),
+                            BloomInk.accent.withValues(alpha: 0),
+                          ],
+                        ),
                       ),
                     ),
                   ),
                 ),
-              ),
-            SizedBox(
-              // 104 rather than 112: the user's eye read the gap between the glyph
-              // band and the name as "一段很大的距离", and the name itself is now
-              // bigger, so the card gets shorter *and* louder instead of taller.
-              height: 104,
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 14, 14, 15),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    // Band one: the glyph slot and the tiny meta line, exactly where
-                    // the reference puts its "There are N tasks to do".
-                    Row(
-                      children: [
-                        Container(
-                          width: 30,
-                          height: 30,
-                          decoration: BoxDecoration(
-                            color: BloomInk.recess,
-                            borderRadius: BorderRadius.circular(
-                              BloomSurface.innerRadius,
+              SizedBox(
+                // 104 rather than 112: the user's eye read the gap between the glyph
+                // band and the name as "一段很大的距离", and the name itself is now
+                // bigger, so the card gets shorter *and* louder instead of taller.
+                height: 104,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 14, 14, 15),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // Band one: the glyph slot and the tiny meta line, exactly where
+                      // the reference puts its "There are N tasks to do".
+                      Row(
+                        children: [
+                          Container(
+                            width: 30,
+                            height: 30,
+                            decoration: BoxDecoration(
+                              color: BloomInk.recess,
+                              borderRadius: BorderRadius.circular(
+                                BloomSurface.innerRadius,
+                              ),
+                            ),
+                            child: Icon(
+                              device.isFrame
+                                  ? Icons.devices_rounded
+                                  : Icons.phone_iphone_rounded,
+                              size: 16,
+                              color: BloomInk.textMuted,
                             ),
                           ),
-                          child: Icon(
-                            device.isFrame
-                                ? Icons.devices_rounded
-                                : Icons.phone_iphone_rounded,
-                            size: 16,
-                            color: BloomInk.textMuted,
+                          const SizedBox(width: 10),
+                          _PresenceDot(isOnline: online),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              // The phone is only "online" while its master
+                              // switch is on; the frame's state stays the
+                              // server's answer.
+                              onlineOverride == null
+                                  ? device.metaLabel
+                                  : (device.typeLabel == device.name
+                                      ? (online == true ? '在线' : '离线')
+                                      : '${device.typeLabel} · '
+                                          '${online == true ? '在线' : '离线'}'),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: BloomType.meta,
+                            ),
                           ),
-                        ),
-                        const SizedBox(width: 10),
-                        _PresenceDot(isOnline: online),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Text(
-                            // The phone is only "online" while its master
-                            // switch is on; the frame's state stays the
-                            // server's answer.
-                            onlineOverride == null
-                                ? device.metaLabel
-                                : (device.typeLabel == device.name
-                                    ? (online == true ? '在线' : '离线')
-                                    : '${device.typeLabel} · '
-                                        '${online == true ? '在线' : '离线'}'),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: BloomType.meta,
+                        ],
+                      ),
+                      const Spacer(),
+                      // Band two: the name, with the chevron on its own baseline.
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          Expanded(
+                            child: Text(
+                              device.name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: BloomType.tileTitle,
+                            ),
                           ),
-                        ),
-                      ],
-                    ),
-                    const Spacer(),
-                    // Band two: the name, with the chevron on its own baseline.
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        Expanded(
-                          child: Text(
-                            device.name,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: BloomType.tileTitle,
+                          const SizedBox(width: 8),
+                          const Padding(
+                            padding: EdgeInsets.only(bottom: 4),
+                            child: Icon(
+                              Icons.chevron_right_rounded,
+                              size: 20,
+                              color: BloomInk.textFaint,
+                            ),
                           ),
-                        ),
-                        const SizedBox(width: 8),
-                        const Padding(
-                          padding: EdgeInsets.only(bottom: 4),
-                          child: Icon(
-                            Icons.chevron_right_rounded,
-                            size: 20,
-                            color: BloomInk.textFaint,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
-    ),
-  );
+    );
   }
 }
 
@@ -591,6 +589,7 @@ class BloomDeviceDetailPage extends StatefulWidget {
   /// Fired when the master switch flips, so the home page can stop (or resume)
   /// the photo it keeps up to date.
   final ValueChanged<bool>? onWidgetEnabledChanged;
+
   /// The photo the home page is currently showing, painted under this page for
   /// the same reason it is painted under the tabs.
   final String? photoPath;
@@ -622,7 +621,7 @@ class BloomDeviceDetailPage extends StatefulWidget {
             onSaved: onSaved,
             onMirrored: onMirrored,
             photoPath: photoPath,
-          onWidgetEnabledChanged: onWidgetEnabledChanged,
+            onWidgetEnabledChanged: onWidgetEnabledChanged,
           ),
     ),
   );
@@ -667,6 +666,9 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
   /// 用户这次会话里动过来源没有。与 _modeTouched 一字不差的同一规矩：
   /// 没动过就不发送这个键，服务器保持已存的值。
   bool _sourcesTouched = false;
+  String? _orientationMode;
+  bool _orientationSaving = false;
+  int _orientationRevision = 0;
 
   /// 用户自己的轮播作息，在切到「推荐」之前记下来。
   ///
@@ -740,6 +742,62 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
     // server never answers.
     unawaited(_readWidgetEnabled());
     unawaited(_loadServerSettings());
+    if (widget.device.isFrame) unawaited(_loadOrientation());
+  }
+
+  Future<void> _loadOrientation() async {
+    final credentials = widget.credentials;
+    if (credentials == null) return;
+    final revision = _orientationRevision;
+    try {
+      final mode = await widget.preferences.frameOrientation(
+        credentials: credentials,
+        frameDeviceId: widget.device.deviceId,
+      );
+      if (mounted && !_orientationSaving && revision == _orientationRevision) {
+        setState(() => _orientationMode = mode);
+      }
+    } catch (_) {
+      // 老服务端、离线或未绑定时不伪造朝向设置。
+    }
+  }
+
+  Future<void> _pickOrientation() async {
+    if (_orientationSaving || _saving || widget.credentials == null) return;
+    await _pickOption<String>(
+      title: '照片朝向',
+      note: '改变摆放方向后，照片会在放稳后自动调整。墨水屏更新需要片刻。',
+      options: const ['auto', 'locked'],
+      selected: _orientationMode ?? 'auto',
+      label: (mode) => mode == 'auto' ? '自动转向' : '锁定当前朝向',
+      hint: (mode) => mode == 'auto' ? '放稳后调整' : '保持朝向，仍按计划更换照片',
+      onPick: (mode) {
+        unawaited(_saveOrientation(mode));
+      },
+    );
+  }
+
+  Future<void> _saveOrientation(String mode) async {
+    final credentials = widget.credentials;
+    if (credentials == null || _orientationSaving) return;
+    setState(() {
+      _orientationSaving = true;
+      _orientationRevision++;
+    });
+    try {
+      final saved = await widget.preferences.frameOrientation(
+        credentials: credentials,
+        frameDeviceId: widget.device.deviceId,
+        mode: mode,
+      );
+      if (!mounted) return;
+      setState(() => _orientationMode = saved);
+      _showToast('设置已保存。相框下次唤醒时生效，轻按中键可立即同步。');
+    } catch (_) {
+      if (mounted) _showToast('朝向设置未保存，请稍后重试。', isError: true);
+    } finally {
+      if (mounted) setState(() => _orientationSaving = false);
+    }
   }
 
   Future<void> _readWidgetEnabled() async {
@@ -856,9 +914,10 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
         mode: _modeTouched ? draft.mode : null,
         // 与 mode 同一规矩：没碰过就不带这个键，服务器保持已存的值。
         // 空列表也不能发 —— 见 _toggleSource 的注释。
-        sources: _sourcesTouched && _displaySources.isNotEmpty
-            ? _displaySources
-            : null,
+        sources:
+            _sourcesTouched && _displaySources.isNotEmpty
+                ? _displaySources
+                : null,
       );
       final saved = _fromServer(result.settings, draft);
       // 2. Only after the server accepted, and only for the record the mirror
@@ -903,10 +962,7 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
         if (saved.mode == BloomDisplayMode.carousel) {
           _carouselSchedule = saved;
           unawaited(
-            widget.preferences.rememberCarouselSchedule(
-              saved,
-              target: _target,
-            ),
+            widget.preferences.rememberCarouselSchedule(saved, target: _target),
           );
         }
         if (_modeTouched) _mirrorMode = saved.mode;
@@ -1045,10 +1101,7 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
         // ⚠️ 按 target 记：手机和相框各有各的作息，共用一组 key 会互相覆盖。
         _carouselSchedule = _draft;
         unawaited(
-          widget.preferences.rememberCarouselSchedule(
-            _draft,
-            target: _target,
-          ),
+          widget.preferences.rememberCarouselSchedule(_draft, target: _target),
         );
         // 推荐模式的作息是固定的：把三个值【真的填进草稿】，随这次保存一起
         // 提交。服务器对四个参数零特例，不会"因为推荐就忽略间隔"，
@@ -1063,14 +1116,15 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
         // 切回轮播：把用户自己那份作息原样还回去，而不是留着推荐的固定值。
         // 只改 mode 的话，用户会看到自己的设置被"看一眼推荐"这件事改掉了。
         final own = _carouselSchedule;
-        _draft = own == null
-            ? _draft.copyWith(mode: mode)
-            : _draft.copyWith(
-                mode: mode,
-                activeStart: own.activeStart,
-                activeEnd: own.activeEnd,
-                intervalMinutes: own.intervalMinutes,
-              );
+        _draft =
+            own == null
+                ? _draft.copyWith(mode: mode)
+                : _draft.copyWith(
+                  mode: mode,
+                  activeStart: own.activeStart,
+                  activeEnd: own.activeEnd,
+                  intervalMinutes: own.intervalMinutes,
+                );
       }
     });
     unawaited(HapticFeedback.selectionClick());
@@ -1391,6 +1445,24 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
                   // ("这些文字完全不要了"), so what is left is only what can be
                   // changed or read.
                   if (carousel) _cadenceCard() else _RecommendationCard(),
+                  if (widget.device.isFrame && _orientationMode != null)
+                    BloomPanel(
+                      padding: const EdgeInsets.all(16),
+                      child: _Field(
+                        key: const ValueKey('bloom-orientation-field'),
+                        label: '照片朝向',
+                        value:
+                            _orientationSaving
+                                ? '保存中…'
+                                : _orientationMode == 'auto'
+                                ? '自动转向'
+                                : '锁定当前朝向',
+                        onTap:
+                            _orientationSaving || _saving
+                                ? null
+                                : _pickOrientation,
+                      ),
+                    ),
                   _SourcesCard(
                     selected: _displaySources,
                     onToggle: _saving ? null : _toggleSource,
@@ -1787,11 +1859,12 @@ class _GlassAction extends StatelessWidget {
 ///
 /// 单独放一个 getter 而不是在文案里写死数字：数字和作息必须永远一致，
 /// 否则改了间隔而忘了改文案，界面就会给出错的一天几张。
-int get recommendPhotosPerDay => BloomDisplaySettings(
-  intervalMinutes: recommendIntervalMinutes,
-  activeStart: recommendActiveStart,
-  activeEnd: recommendActiveEnd,
-).expectedDailyItems;
+int get recommendPhotosPerDay =>
+    BloomDisplaySettings(
+      intervalMinutes: recommendIntervalMinutes,
+      activeStart: recommendActiveStart,
+      activeEnd: recommendActiveEnd,
+    ).expectedDailyItems;
 
 /// 照片来源。
 ///
@@ -1822,9 +1895,11 @@ class _SourcesCard extends StatelessWidget {
             checked: selected.contains(source),
             // 只剩这一个时不能再取消 —— 全不选就没有来源了。
             // 把 onTap 置空，行会呈现为不可点，比"点了没反应"清楚。
-            onTap: onToggle == null || (selected.length <= 1 && selected.contains(source))
-                ? null
-                : () => onToggle!(source),
+            onTap:
+                onToggle == null ||
+                        (selected.length <= 1 && selected.contains(source))
+                    ? null
+                    : () => onToggle!(source),
           ),
       ],
     ),
@@ -2033,11 +2108,7 @@ class _Field extends StatelessWidget {
 /// Small on purpose: 设备信息 is the least important thing on this page now, and
 /// the user asked for it to read that way ("作为小字部分不那么起眼儿").
 class _InfoRow extends StatelessWidget {
-  const _InfoRow({
-    required this.label,
-    required this.value,
-    this.onCopy,
-  });
+  const _InfoRow({required this.label, required this.value, this.onCopy});
 
   final String label;
   final String value;

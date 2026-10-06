@@ -26,8 +26,7 @@ enum BloomPhotoSource {
 
   /// 小组件生成的内容（天气 / 股票 / 自创）。注意它是【内容来源】，
   /// 不是设备类型 —— 设备类型是 target，两者不要混。
-  widget('widget', '小组件'),
-  ;
+  widget('widget', '小组件');
 
   const BloomPhotoSource(this.wire, this.label);
 
@@ -58,11 +57,12 @@ enum BloomPhotoSource {
 /// ⚠️ 空列表【不发送】而不是发 `[]`：服务器的语义是"没送 = 别动已存的值"
 ///    （与 mode 一字不差的同一规矩）。发 `[]` 会被 normalize_sources 当成
 ///    "什么都没说"而回退到 personal，等于把用户的选择悄悄改掉。
-List<Map<String, Object?>> bloomSourcesToWire(Iterable<BloomPhotoSource> sources) =>
-    <Map<String, Object?>>[
-      for (final source in sources)
-        <String, Object?>{'name': source.wire, 'weight': 1},
-    ];
+List<Map<String, Object?>> bloomSourcesToWire(
+  Iterable<BloomPhotoSource> sources,
+) => <Map<String, Object?>>[
+  for (final source in sources)
+    <String, Object?>{'name': source.wire, 'weight': 1},
+];
 
 /// 解析服务器回显的 `sources` 字段。
 ///
@@ -94,7 +94,6 @@ const List<String> bloomSourceWireValues = <String>[
   'news',
   'widget',
 ];
-
 
 /// The value the server stores for [mode] in `frame_device_settings.mode`.
 ///
@@ -189,11 +188,14 @@ class BloomDisplaySettings {
   /// 界面少显示一项，但用户的其余选择原样保留 —— 丢掉会让用户觉得
   /// "我选的来源没了"。
   static List<BloomPhotoSource> sourcesFromWire(Iterable<String> names) {
-    final out = names
-        .map(BloomPhotoSource.fromWire)
-        .whereType<BloomPhotoSource>()
-        .toList();
-    return out.isEmpty ? const <BloomPhotoSource>[BloomPhotoSource.personal] : out;
+    final out =
+        names
+            .map(BloomPhotoSource.fromWire)
+            .whereType<BloomPhotoSource>()
+            .toList();
+    return out.isEmpty
+        ? const <BloomPhotoSource>[BloomPhotoSource.personal]
+        : out;
   }
 
   /// Whether [value] can describe a schedule at all.
@@ -306,6 +308,16 @@ class BloomDisplaySettings {
 /// and silently revert the user's edit, so the wiring belongs in the same
 /// change as the UI.
 class DisplayPreferences {
+  Future<String> frameOrientation({
+    required DeviceCredentials credentials,
+    required String frameDeviceId,
+    String? mode,
+  }) => _api.frameOrientation(
+    credentials,
+    frameDeviceId: frameDeviceId,
+    mode: mode,
+  );
+
   DisplayPreferences({BloomApiClient? api}) : _injectedApi = api;
 
   /// Lazily built so a local-only read (the background isolate's path) does not
@@ -537,7 +549,10 @@ class DisplayPreferences {
         carouselStashIntervalKey(target),
         settings.intervalMinutes,
       );
-      await prefs.setString(carouselStashStartKey(target), settings.activeStart);
+      await prefs.setString(
+        carouselStashStartKey(target),
+        settings.activeStart,
+      );
       await prefs.setString(carouselStashEndKey(target), settings.activeEnd);
     } catch (_) {
       // 记不住不该让切换模式失败：大不了切回来时还原不了。
@@ -642,9 +657,7 @@ class DisplayPreferences {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(
       modeKey,
-      settings.mode == BloomDisplayMode.carousel
-          ? 'carousel'
-          : 'recommend',
+      settings.mode == BloomDisplayMode.carousel ? 'carousel' : 'recommend',
     );
     await prefs.setInt(intervalKey, settings.intervalMinutes);
     await prefs.setString(startKey, settings.activeStart);

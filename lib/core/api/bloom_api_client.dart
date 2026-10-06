@@ -277,6 +277,35 @@ class BloomApiClient {
   }
 
   /// Reads the carousel settings the server stores for [target].
+  Future<String> frameOrientation(
+    DeviceCredentials credentials, {
+    required String frameDeviceId,
+    String? mode,
+  }) async {
+    final action = mode == null ? 'get' : 'set';
+    final response = await _client
+        .post(
+          _uri(
+            '/api/frame/devices/${Uri.encodeComponent(frameDeviceId)}/orientation/settings/$action',
+          ),
+          headers: {
+            ..._headers(credentials.deviceToken),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'caller_device_id': credentials.deviceId,
+            if (mode != null) 'mode': mode,
+          }),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    final saved = _json(response)['mode'];
+    if (saved != 'auto' && saved != 'locked') {
+      throw const FormatException('invalid_orientation_mode');
+    }
+    return saved as String;
+  }
+
   Future<DeviceCarouselSettingsEnvelope> getDeviceSettings(
     DeviceCredentials credentials, {
     required String target,
@@ -359,7 +388,10 @@ class BloomApiClient {
   /// 设备令牌只认自己那一台设备。
   Future<List<UserDevice>> listMyDevices(String userToken) async {
     final response = await _client
-        .get(_uri('/api/frame/users/me/devices'), headers: _userHeaders(userToken))
+        .get(
+          _uri('/api/frame/users/me/devices'),
+          headers: _userHeaders(userToken),
+        )
         .timeout(_requestTimeout);
     _ensure(response, 200);
     final devices = _json(response)['devices'];
@@ -491,7 +523,10 @@ class BloomApiClient {
 
   Future<AccountInfo> fetchAccount(String userToken) async {
     final response = await _client
-        .get(_uri('/api/frame/users/me/account'), headers: _userHeaders(userToken))
+        .get(
+          _uri('/api/frame/users/me/account'),
+          headers: _userHeaders(userToken),
+        )
         .timeout(_requestTimeout);
     _ensure(response, 200);
     final account = _json(response)['account'];
@@ -500,7 +535,6 @@ class BloomApiClient {
     }
     return AccountInfo.fromJson(account.cast<String, dynamic>());
   }
-
 
   Map<String, dynamic> _json(http.Response response) =>
       jsonDecode(response.body) as Map<String, dynamic>;
@@ -539,18 +573,17 @@ class BloomApiClient {
   /// string.
   static Object? _detailMessage(Object? detail) {
     if (detail is List) {
-      final parts =
-          detail
-              .map(
-                (entry) =>
-                    entry is Map
-                        ? (entry['msg'] ?? entry['detail'] ?? entry)
-                        : entry,
-              )
-              .where((entry) => entry != null)
-              .map((entry) => entry.toString())
-              .where((entry) => entry.isNotEmpty)
-              .toList(growable: false);
+      final parts = detail
+          .map(
+            (entry) =>
+                entry is Map
+                    ? (entry['msg'] ?? entry['detail'] ?? entry)
+                    : entry,
+          )
+          .where((entry) => entry != null)
+          .map((entry) => entry.toString())
+          .where((entry) => entry.isNotEmpty)
+          .toList(growable: false);
       return parts.isEmpty ? null : parts.join('; ');
     }
     return detail;
