@@ -84,12 +84,16 @@ class BloomWidgetBridgePlatform {
       _channel.invokeMapMethod<Object?, Object?>('readDisplayPreferences');
 
   static Future<void> writeDisplayPreferences({
+    List<String> sources = const ['personal'],
+    bool usesScheduledPlan = false,
     required String mode,
     required int intervalMinutes,
     required String activeStart,
     required String activeEnd,
   }) => _channel.invokeMethod<void>('writeDisplayPreferences', {
     'mode': mode,
+    'sources': sources,
+    'usesScheduledPlan': usesScheduledPlan,
     'intervalMinutes': intervalMinutes,
     'activeStart': activeStart,
     'activeEnd': activeEnd,
@@ -102,8 +106,9 @@ class BloomWidgetBridgePlatform {
   /// 不需要写任何 iOS 专属分支。
   static Future<List<KeepAliveItem>> keepAliveStatus() async {
     if (!Platform.isAndroid) return const [];
-    final raw =
-        await _channel.invokeListMethod<Map<Object?, Object?>>('keepAliveStatus');
+    final raw = await _channel.invokeListMethod<Map<Object?, Object?>>(
+      'keepAliveStatus',
+    );
     return [
       for (final item in raw ?? const <Map<Object?, Object?>>[])
         KeepAliveItem.fromMap(item),
@@ -122,8 +127,7 @@ class BloomWidgetBridgePlatform {
 
   static Future<bool> openKeepAlive(String id) async {
     if (!Platform.isAndroid) return false;
-    return await _channel
-            .invokeMethod<bool>('openKeepAlive', {'id': id}) ??
+    return await _channel.invokeMethod<bool>('openKeepAlive', {'id': id}) ??
         false;
   }
 }

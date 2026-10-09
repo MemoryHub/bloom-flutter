@@ -14,6 +14,7 @@ import 'dart:io';
 
 import 'package:bloom/core/api/bloom_api_client.dart';
 import 'package:bloom/core/storage/daily_content_repository.dart';
+import 'package:bloom/platform/widget_bridge.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -44,11 +45,7 @@ void main() {
   Future<void> writeState(List<int> slotMs) async {
     await File('${dir.path}/carousel-state.json').writeAsString(
       jsonEncode({
-        'plan': {
-          'plan_id': 150,
-          'settings_hash': 'h1',
-          'day': '2026-09-28',
-        },
+        'plan': {'plan_id': 150, 'settings_hash': 'h1', 'day': '2026-09-28'},
         'grid': [
           for (var i = 0; i < slotMs.length; i++)
             {'slot_at_ms': slotMs[i], 'item_id': 5000 + i, 'asset_id': 'a$i'},
@@ -61,17 +58,50 @@ void main() {
 
   /// 写一份 `daily.json` 投影，只带 `next_slot_at_ms`。
   Future<void> writeProjection(int? nextSlotAtMs) async {
-    await File('${dir.path}/daily.json').writeAsString(
-      jsonEncode({'next_slot_at_ms': nextSlotAtMs}),
-    );
+    await File(
+      '${dir.path}/daily.json',
+    ).writeAsString(jsonEncode({'next_slot_at_ms': nextSlotAtMs}));
   }
 
-  int minutesFromNow(int minutes) => DateTime.now()
-      .add(Duration(minutes: minutes))
-      .millisecondsSinceEpoch;
+  int minutesFromNow(int minutes) =>
+      DateTime.now().add(Duration(minutes: minutes)).millisecondsSinceEpoch;
 
   Future<int?> read() =>
       DailyContentRepository(api: BloomApiClient()).nextSlotAtMillis();
+
+  test('原生闹钟推进艺术项后恢复资料，不能串用上一项资料', () async {
+    await File('${dir.path}/carousel-state.json').writeAsString(
+      jsonEncode({
+        'timeline_entries': [
+          {
+            'item_id': 8,
+            'date_ms': 100,
+            'source_name': 'art',
+            'content_snapshot': {'title': 'Sunflowers'},
+          },
+        ],
+      }),
+    );
+    await File('${dir.path}/daily.json').writeAsString(
+      jsonEncode({
+        'recommendation_id': 7,
+        'date': '2026-10-09',
+        'source_name': 'personal',
+      }),
+    );
+    final repository = DailyContentRepository(api: BloomApiClient());
+    final art = await repository.contentForNative(
+      const WidgetCurrentState(recommendationId: 8),
+    );
+    expect(art.sourceName, 'art');
+    expect(art.artwork['title'], 'Sunflowers');
+    final other = await repository.contentForNative(
+      const WidgetCurrentState(recommendationId: 9),
+      fallback: art,
+    );
+    expect(other.sourceName, 'personal');
+    expect(other.artwork, isEmpty);
+  });
 
   test('回归：缓存值已过去时，必须由栅格给出未来那一格', () async {
     // 这正是真机上出现空窗的现场：整点刚过，投影还停在整点。
@@ -83,11 +113,7 @@ void main() {
     final at = await read();
 
     expect(at, isNotNull, reason: '文案不能因为缓存值过期就整段消失');
-    expect(
-      at,
-      next,
-      reason: '应取栅格中晚于此刻的第一格，而不是已过去的缓存值',
-    );
+    expect(at, next, reason: '应取栅格中晚于此刻的第一格，而不是已过去的缓存值');
   });
 
   test('既有未来栅格时，缓存值再新也不采用', () async {

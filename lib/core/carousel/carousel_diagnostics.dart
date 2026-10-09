@@ -77,9 +77,8 @@ class CarouselDiagnostics {
     try {
       if (!await _file.exists()) return const [];
       final lines = await _file.readAsLines();
-      final slice = lines.length <= limit
-          ? lines
-          : lines.sublist(lines.length - limit);
+      final slice =
+          lines.length <= limit ? lines : lines.sublist(lines.length - limit);
       return [
         for (final line in slice)
           if (line.trim().isNotEmpty)

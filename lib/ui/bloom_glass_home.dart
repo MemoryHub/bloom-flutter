@@ -7,6 +7,7 @@ import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
 import '../core/models/auth_models.dart';
 import '../core/models/device_models.dart';
+import '../core/rendering/mobile_artwork_renderer.dart';
 import '../core/storage/display_preferences.dart';
 import 'bloom_device_pages.dart';
 import 'bloom_profile_page.dart';
@@ -229,6 +230,7 @@ class BloomGlassHome extends StatelessWidget {
     this.onSignOut,
     this.accountBusy = false,
     this.credentials,
+    this.discoverPage,
     this.portrait,
     this.originalPhotoPath,
     this.content,
@@ -242,6 +244,7 @@ class BloomGlassHome extends StatelessWidget {
 
   final bool nextLoading;
   final int selectedTab;
+  final Widget? discoverPage;
   final DeviceCredentials? credentials;
   final CachedWidgetImage? portrait;
   final String? originalPhotoPath;
@@ -603,10 +606,12 @@ class BloomGlassHome extends StatelessWidget {
         //    没有这一行】—— 明明 main.dart 已经为推荐模式算好了下一格
         //    （推荐没有服务端计划戳，它的节奏由固定作息给出），却在这一层被
         //    丢掉。两种模式都有下一次更新，这个条件本身就是错的。
-        nextSlotText: widgetEnabled
-            ? nextSlotText(settings, nextSlotAt)
-            : null,
+        nextSlotText: widgetEnabled ? nextSlotText(settings, nextSlotAt) : null,
         originalPhotoPath: originalPhotoPath,
+        portraitPath:
+            portrait?.recommendationId == content?.recommendationId
+                ? portrait?.path
+                : null,
         content: content,
         date: date,
         mode: settings.mode,
@@ -616,6 +621,7 @@ class BloomGlassHome extends StatelessWidget {
         account: account,
         onSignIn: onAccountTap,
       ),
+      discoverPage ?? const SizedBox.shrink(),
       _PhotoLibraryPlaceholderPage(account: account, onSignIn: onAccountTap),
       BloomDeviceListPage(
         devices: devices,
@@ -674,6 +680,11 @@ class BloomGlassHome extends StatelessWidget {
               icon: Icons.home_outlined,
               selectedIcon: Icons.home_rounded,
               label: '首页',
+            ),
+            LiquidGlassTabBarItem(
+              icon: Icons.explore_outlined,
+              selectedIcon: Icons.explore,
+              label: '发现',
             ),
             LiquidGlassTabBarItem(
               icon: Icons.photo_outlined,
@@ -1140,6 +1151,7 @@ class _PhotoPage extends StatelessWidget {
   const _PhotoPage({
     required this.nextSlotText,
     required this.originalPhotoPath,
+    this.portraitPath,
     required this.content,
     required this.date,
     required this.mode,
@@ -1153,6 +1165,7 @@ class _PhotoPage extends StatelessWidget {
   final String? nextSlotText;
 
   final String? originalPhotoPath;
+  final String? portraitPath;
   final DailyContent? content;
   final String? date;
   final BloomDisplayMode mode;
@@ -1454,6 +1467,7 @@ class _PhotoPage extends StatelessWidget {
                                           'bloom-letter-card',
                                         ),
                                         imagePath: originalPhotoPath!,
+                                        artworkImagePath: portraitPath,
                                         revision:
                                             '${mode.name}:${content?.recommendationId}:${content?.photo?.url}',
                                         content: content,
@@ -1590,15 +1604,16 @@ class _PhotoLibraryPlaceholderPage extends StatelessWidget {
         Expanded(
           child: Padding(
             padding: const EdgeInsets.only(bottom: 96),
-            child: account == null
-                ? BloomSignInPrompt(
-                    key: const ValueKey('bloom-photos-signed-out'),
-                    illustration: const _EmptyFrameIllustration(),
-                    title: '照片库即将上线',
-                    message: '以后可以在这里回看每天推荐过的照片。',
-                    onSignIn: onSignIn,
-                  )
-                : const _PhotoLibraryComingSoon(),
+            child:
+                account == null
+                    ? BloomSignInPrompt(
+                      key: const ValueKey('bloom-photos-signed-out'),
+                      illustration: const _EmptyFrameIllustration(),
+                      title: '照片库即将上线',
+                      message: '以后可以在这里回看每天推荐过的照片。',
+                      onSignIn: onSignIn,
+                    )
+                    : const _PhotoLibraryComingSoon(),
           ),
         ),
       ],
@@ -1711,16 +1726,53 @@ class _RemoteDeviceCard extends StatelessWidget {
   );
 }
 
+// A local layout can be rebuilt for the same item. FileImage otherwise keeps
+// decoded bytes by path, so include the atomic replacement's modification time.
+class _RenderedFileImage extends FileImage {
+  _RenderedFileImage(super.file) : modified = _modified(file);
+
+  final int modified;
+  static int _modified(File file) {
+    try {
+      return file.statSync().modified.microsecondsSinceEpoch;
+    } on FileSystemException {
+      return 0;
+    }
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is _RenderedFileImage &&
+      other.file.path == file.path &&
+      other.scale == scale &&
+      other.modified == modified;
+
+  @override
+  int get hashCode => Object.hash(file.path, scale, modified);
+}
+
+class _ArtworkLabelPainter extends CustomPainter {
+  const _ArtworkLabelPainter(this.metadata);
+  final Map<String, dynamic> metadata;
+  @override
+  void paint(Canvas canvas, Size size) =>
+      MobileArtworkRenderer.paintLabel(canvas, metadata, size);
+  @override
+  bool shouldRepaint(_ArtworkLabelPainter oldDelegate) => true;
+}
+
 class _LetterPhotoCard extends StatelessWidget {
   const _LetterPhotoCard({
     super.key,
     required this.imagePath,
+    this.artworkImagePath,
     required this.revision,
     required this.content,
     required this.fallbackDate,
   });
 
   final String imagePath;
+  final String? artworkImagePath;
   final Object revision;
   final DailyContent? content;
   final String? fallbackDate;
@@ -1778,28 +1830,48 @@ class _LetterPhotoCard extends StatelessWidget {
             // landing, the label ticking, the backdrop updating) must not
             // animate it again. And the *whole* card fades, photo and words
             // together: the two can never be seen from different items.
-            child: Column(
-              key: ValueKey(content?.recommendationId ?? imagePath),
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Expanded(
-                  flex: 3,
-                  child: Image.file(
-                    File(imagePath),
-                    fit: BoxFit.cover,
-                    alignment: Alignment(fx * 2 - 1, fy * 2 - 1),
-                    gaplessPlayback: true,
-                    errorBuilder: (_, __, ___) => const _LetterPhotoFallback(),
-                  ),
-                ),
-                Expanded(
-                  child: _LetterPaper(
-                    content: content,
-                    fallbackDate: fallbackDate,
-                  ),
-                ),
-              ],
-            ),
+            child:
+                content?.sourceName == 'art'
+                    ? Stack(
+                      key: ValueKey('art:${content?.recommendationId}'),
+                      fit: StackFit.expand,
+                      children: [
+                        Image(
+                          image: _RenderedFileImage(File(imagePath)),
+                          fit: BoxFit.cover,
+                          alignment: Alignment(fx * 2 - 1, fy * 2 - 1),
+                          gaplessPlayback: true,
+                          errorBuilder:
+                              (_, __, ___) => const _LetterPhotoFallback(),
+                        ),
+                        CustomPaint(
+                          painter: _ArtworkLabelPainter(content!.artwork),
+                        ),
+                      ],
+                    )
+                    : Column(
+                      key: ValueKey(content?.recommendationId ?? imagePath),
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Expanded(
+                          flex: 3,
+                          child: Image.file(
+                            File(imagePath),
+                            fit: BoxFit.cover,
+                            alignment: Alignment(fx * 2 - 1, fy * 2 - 1),
+                            gaplessPlayback: true,
+                            errorBuilder:
+                                (_, __, ___) => const _LetterPhotoFallback(),
+                          ),
+                        ),
+                        Expanded(
+                          child: _LetterPaper(
+                            content: content,
+                            fallbackDate: fallbackDate,
+                          ),
+                        ),
+                      ],
+                    ),
           ),
         ),
       ),
@@ -2078,7 +2150,6 @@ class _BindingCheckExperience extends StatelessWidget {
     ),
   );
 }
-
 
 /// The app's ink: warm white type on a warm-black wall.
 ///
@@ -2934,7 +3005,6 @@ class BloomPageTitle extends StatelessWidget {
     );
   }
 }
-
 
 /// The app's one transient message: the glass slip that floats over a page.
 ///

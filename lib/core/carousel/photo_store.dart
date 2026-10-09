@@ -13,6 +13,9 @@ library;
 import 'carousel_diagnostics.dart';
 import 'dart:async';
 import 'dart:io';
+import '../rendering/mobile_artwork_renderer.dart';
+import 'dart:convert';
+import 'state_store.dart';
 
 import 'package:flutter/foundation.dart';
 
@@ -71,7 +74,10 @@ class PhotoFetchResult {
 
 /// 照片仓库：负责下载原图、渲染三个规格，并复用已存在的文件。
 class CarouselPhotoStore {
-  CarouselPhotoStore({required this.api, this.downloadLeash = const Duration(seconds: 25)});
+  CarouselPhotoStore({
+    required this.api,
+    this.downloadLeash = const Duration(seconds: 25),
+  });
 
   final BloomApiClient api;
 
@@ -106,10 +112,58 @@ class CarouselPhotoStore {
     int attempts = 2,
     String? etag,
   }) async {
+    final lock = CarouselLock('${dir.path}/photo-prepare-${item.itemId}.lock');
+    final deadline = DateTime.now().add(const Duration(seconds: 60));
+    while (!await lock.acquire()) {
+      if (DateTime.now().isAfter(deadline)) {
+        return const PhotoFetchResult(
+          outcome: PhotoFetchOutcome.unavailable,
+          reason: 'preparation_busy',
+        );
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+    }
+    try {
+      return await _prepareUnlocked(
+        dir: dir,
+        item: item,
+        credentials: credentials,
+        attempts: attempts,
+        etag: etag,
+      );
+    } finally {
+      await lock.release();
+    }
+  }
+
+  Future<PhotoFetchResult> _prepareUnlocked({
+    required Directory dir,
+    required CarouselItemContent item,
+    required DeviceCredentials credentials,
+    int attempts = 2,
+    String? etag,
+  }) async {
     final itemId = item.itemId;
     final startedMs = DateTime.now().millisecondsSinceEpoch;
     try {
-      if (await isReady(dir, itemId)) {
+      final marker = File('${dir.path}/mobile-render-$itemId.json');
+      final signature = jsonEncode({
+        'asset': item.assetId,
+        'layout': MobileArtworkRenderer.template,
+        'source': item.sourceName,
+        'photo': [item.photo.focusX, item.photo.focusY],
+        'artwork': item.artwork,
+      });
+      if (await originalFile(dir, itemId).exists()) {
+        final fresh =
+            await marker.exists() && await marker.readAsString() == signature;
+        await _renderAll(
+          dir,
+          item,
+          await originalFile(dir, itemId).readAsBytes(),
+          force: !fresh,
+        );
+        await _writeAtomic(marker, utf8.encode(signature));
         return PhotoFetchResult(
           outcome: PhotoFetchOutcome.ready,
           photo: _pathsFor(dir, item, etag: etag),
@@ -126,11 +180,16 @@ class CarouselPhotoStore {
             etag: etag,
             destination: originalFile(dir, itemId),
           );
-          final downloadMs = DateTime.now().millisecondsSinceEpoch - downloadStartedMs;
+          final downloadMs =
+              DateTime.now().millisecondsSinceEpoch - downloadStartedMs;
 
           final renderStartedMs = DateTime.now().millisecondsSinceEpoch;
-          await _renderAll(dir, item, bytes);
-          final renderMs = DateTime.now().millisecondsSinceEpoch - renderStartedMs;
+          // A surviving PNG may belong to an old layout even when its source
+          // was deleted. Never mark that old PNG as freshly rendered.
+          await _renderAll(dir, item, bytes, force: true);
+          await _writeAtomic(marker, utf8.encode(signature));
+          final renderMs =
+              DateTime.now().millisecondsSinceEpoch - renderStartedMs;
 
           // **关键路径的耗时分解，必须分开记。**
           //
@@ -156,7 +215,9 @@ class CarouselPhotoStore {
           lastReason = error.toString();
         }
       }
-      debugPrint('[BloomCarousel] photo unavailable item=$itemId reason=$lastReason');
+      debugPrint(
+        '[BloomCarousel] photo unavailable item=$itemId reason=$lastReason',
+      );
       // **诊断日志。** 2026-09-28 两端各有一张反复 timeout，而服务端实测是正常
       // 200——只靠服务端日志无法区分「服务端慢」和「客户端处理慢」，必须在这里
       // 记下耗时和原因。字段两端一致（同一份 Dart）。
@@ -200,7 +261,7 @@ class CarouselPhotoStore {
       return bytes;
     }
     final response = await api
-        .carouselPhoto(credentials, itemId, etag: etag)
+        .carouselPhoto(credentials, itemId)
         .timeout(downloadLeash);
     final bytes = response.bodyBytes;
     if (bytes.isEmpty) {
@@ -214,12 +275,13 @@ class CarouselPhotoStore {
   Future<void> _renderAll(
     Directory dir,
     CarouselItemContent item,
-    Uint8List photoBytes,
-  ) async {
+    Uint8List photoBytes, {
+    bool force = false,
+  }) async {
     final manifest = item.asDailyContent();
     for (final family in _families) {
       final output = renderedFile(dir, family, item.itemId);
-      if (await output.exists()) continue;
+      if (!force && await output.exists()) continue;
       final rendered = await MobileLetterRenderer.render(
         photoBytes,
         manifest,
@@ -258,7 +320,9 @@ class CarouselPhotoStore {
   );
 
   Future<void> _writeAtomic(File target, List<int> bytes) async {
-    final temp = File('${target.path}.tmp');
+    final temp = File(
+      '${target.path}.$pid.${DateTime.now().microsecondsSinceEpoch}.tmp',
+    );
     await temp.writeAsBytes(bytes, flush: true);
     await temp.rename(target.path);
   }

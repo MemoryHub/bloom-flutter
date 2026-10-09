@@ -13,6 +13,7 @@ import '../core/storage/display_preferences.dart';
 import 'bloom_glass_home.dart';
 import 'bloom_keep_alive_card.dart';
 import 'bloom_sign_in_prompt.dart';
+import 'bloom_discover_page.dart';
 
 /// One row of the F3 device list.
 ///
@@ -544,6 +545,7 @@ class BloomDeviceDetailPage extends StatefulWidget {
     required this.preferences,
     required this.settings,
     this.credentials,
+    this.userToken,
     this.callerDeviceId,
     this.onModeChanged,
     this.onSaved,
@@ -567,6 +569,7 @@ class BloomDeviceDetailPage extends StatefulWidget {
   final DeviceCredentials? credentials;
 
   /// The app's own device id, sent as `caller_device_id`.
+  final String? userToken;
   final String? callerDeviceId;
 
   /// Fired after a save that changed the display mode, so the home page can
@@ -603,6 +606,7 @@ class BloomDeviceDetailPage extends StatefulWidget {
     required BloomDisplaySettings settings,
     DeviceCredentials? credentials,
     String? callerDeviceId,
+    String? userToken,
     ValueChanged<BloomDisplaySettings>? onModeChanged,
     ValueChanged<BloomDisplaySettings>? onSaved,
     Future<void> Function(BloomDisplaySettings settings)? onMirrored,
@@ -617,6 +621,7 @@ class BloomDeviceDetailPage extends StatefulWidget {
             settings: settings,
             credentials: credentials,
             callerDeviceId: callerDeviceId,
+            userToken: userToken,
             onModeChanged: onModeChanged,
             onSaved: onSaved,
             onMirrored: onMirrored,
@@ -857,6 +862,7 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
     }
     final remote = await widget.preferences.readServer(
       credentials: credentials,
+      deviceId: widget.device.deviceId,
       target: _target,
     );
     if (!mounted || remote == null) return;
@@ -907,6 +913,7 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
         draft,
         credentials: credentials,
         callerDeviceId: callerDeviceId,
+        deviceId: widget.device.deviceId,
         target: _target,
         // 带不带 mode 只看用户有没有动过它，与 target 无关 —— 相框同样需要
         // 把自己的选择发给服务器。（本地镜像是另一回事，见下面
@@ -1008,6 +1015,7 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
     // fallback (`copyWith` treats `null` as "leave it").
     mode: bloomModeFromWire(remote.mode),
     sources: BloomDisplaySettings.sourcesFromWire(remote.sources),
+    sourceWeights: remote.sourceWeights,
     intervalMinutes: remote.intervalMinutes,
     activeStart: remote.activeStart,
     activeEnd: remote.activeEnd,
@@ -1065,8 +1073,7 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
       _sources ?? widget.settings.sources;
 
   void _toggleSource(BloomPhotoSource source) {
-    // ⚠️ 界面只放出 BloomPhotoSource.implemented。art / news 还没有取片能力，
-    //    给它们一个能勾的框，用户设完相框毫无变化 —— 就是"设了没反应"。
+    // 只放出已实现来源；新闻和动态组件仍然预留。
     if (!BloomPhotoSource.implemented.contains(source)) return;
     final next = List<BloomPhotoSource>.from(_displaySources);
     if (next.contains(source)) {
@@ -1464,9 +1471,33 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
                       ),
                     ),
                   _SourcesCard(
+                    allowArt: true,
                     selected: _displaySources,
                     onToggle: _saving ? null : _toggleSource,
                   ),
+                  if (widget.userToken != null)
+                    BloomPanel(
+                      child: ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: Text('展示内容', style: BloomType.rowTitle),
+                        trailing: const Icon(Icons.chevron_right, size: 18),
+                        onTap:
+                            () => Navigator.of(context).push(
+                              MaterialPageRoute<void>(
+                                builder:
+                                    (_) => BloomContentManagerPage(
+                                      api: BloomApiClient(),
+                                      token: widget.userToken!,
+                                      frame: GalleryFrame(
+                                        widget.device.deviceId,
+                                        widget.device.name,
+                                        isMobile: !widget.device.isFrame,
+                                      ),
+                                    ),
+                              ),
+                            ),
+                      ),
+                    ),
                   // 后台保活自检：**这台手机自己的事**，所以只在本机（手机小组件）
                   // 的详情页出现，相框上没有。iOS 上原生返回空列表，卡片整个不渲染。
                   if (widget.device.isLocal) const BloomKeepAliveCard(),
@@ -1868,12 +1899,15 @@ int get recommendPhotosPerDay =>
 
 /// 照片来源。
 ///
-/// ⚠️ 只列出 BloomPhotoSource.implemented —— 服务器登记了四个名字，但只有
-/// personal 真正取得出照片。给还没实现的来源一个能勾的框，用户设完相框
-/// 毫无变化，就是"设了没反应"。等 art 真能取片了，把它加进 implemented，
-/// 这里自动多一项，界面代码一个字都不用改。
+/// 相框和手机小组件共用个人照片与艺术来源；两者各自保留作息。
 class _SourcesCard extends StatelessWidget {
-  const _SourcesCard({required this.selected, required this.onToggle});
+  const _SourcesCard({
+    required this.selected,
+    required this.onToggle,
+    this.allowArt = false,
+  });
+
+  final bool allowArt;
 
   final List<BloomPhotoSource> selected;
 
@@ -1888,7 +1922,9 @@ class _SourcesCard extends StatelessWidget {
       children: [
         Text('照片来源', style: BloomType.sectionTitle),
         const SizedBox(height: 4),
-        for (final source in BloomPhotoSource.implemented)
+        for (final source in BloomPhotoSource.implemented.where(
+          (s) => allowArt || s == BloomPhotoSource.personal,
+        ))
           _SourceRow(
             key: ValueKey('bloom-source-${source.wire}'),
             source: source,

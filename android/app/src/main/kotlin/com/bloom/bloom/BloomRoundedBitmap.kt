@@ -19,6 +19,7 @@ object BloomRoundedBitmap {
         val cropped = if (scaled.width != targetWidth || scaled.height != targetHeight) {
             Bitmap.createBitmap(scaled, left, top, targetWidth.coerceAtMost(scaled.width), targetHeight.coerceAtMost(scaled.height))
         } else scaled
+        if (scaled !== source && scaled !== cropped) scaled.recycle()
         val rounded = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(rounded)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
@@ -53,8 +54,7 @@ object BloomRoundedBitmap {
         // headroom.
         val radius = 27f * context.resources.displayMetrics.density
         canvas.drawRoundRect(RectF(0f, 0f, targetWidth.toFloat(), targetHeight.toFloat()), radius, radius, paint)
-        if (cropped !== scaled) cropped.recycle()
-        if (scaled !== source) scaled.recycle()
+        if (cropped !== source) cropped.recycle()
         return rounded
     }
 }

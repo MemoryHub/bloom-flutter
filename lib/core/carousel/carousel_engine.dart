@@ -173,7 +173,11 @@ class CarouselEngine {
     FullPlan? plan;
     String? planError;
     try {
-      plan = await _planClient.fetchFullDay(credentials, settings);
+      plan = await _planClient.fetchFullDay(
+        credentials,
+        settings,
+        cachedItemIds: before.photos.map((photo) => photo.itemId).toList(),
+      );
     } catch (error) {
       planError = error.toString();
       debugPrint('[BloomCarousel] plan fetch failed: $error');
@@ -205,16 +209,17 @@ class CarouselEngine {
         await store.mutate(
           writer: writer,
           incomingPlan: plan.identity,
-          update: (current) => current.copyWith(
-            plan: plan!.identity,
-            grid: grid,
-            nextSlotAtMs: resolution?.atMs,
-            nextSlotSource: source,
-            clearNextSlot: resolution == null,
-          ),
+          update:
+              (current) => current.copyWith(
+                plan: plan!.identity,
+                grid: grid,
+                nextSlotAtMs: resolution?.atMs,
+                nextSlotSource: source,
+                clearNextSlot: resolution == null,
+              ),
         );
         try {
-        await bridge.refresh();
+          await bridge.refresh();
         } catch (error) {
           debugPrint('[BloomCarousel] early refresh failed: $error');
         }
@@ -233,19 +238,20 @@ class CarouselEngine {
     final stats = CarouselPrepareStats();
 
     // 当前格优先：它就是此刻应当显示的那张。
-    final currentReady = slotNow == null
-        ? false
-        : await _prepareSlot(
-            dir: dir,
-            plan: plan,
-            slot: slotNow,
-            credentials: credentials,
-            photos: photos,
-            before: before.photos,
-            attempted: attempted,
-            stats: stats,
-            nowMs: nowMs,
-          );
+    final currentReady =
+        slotNow == null
+            ? false
+            : await _prepareSlot(
+              dir: dir,
+              plan: plan,
+              slot: slotNow,
+              credentials: credentials,
+              photos: photos,
+              before: before.photos,
+              attempted: attempted,
+              stats: stats,
+              nowMs: nowMs,
+            );
 
     // 当前格取不到时，向服务端申请替补——只替换这一格，栅格不动。
     var substitutedContent = plan?.contentFor(slotNow?.itemId);
@@ -260,6 +266,7 @@ class CarouselEngine {
       );
       if (replacement != null) {
         substitutedContent = replacement;
+        plan?.contentById[slotNow.itemId] = replacement;
         stats.prepared++;
         if (stats.unavailable > 0) stats.unavailable--;
       }
@@ -269,17 +276,18 @@ class CarouselEngine {
     final unavailable = stats.unavailable;
 
     // ---- 判定显示项与状态 ----
-    final slotNowPhoto = slotNow == null ? null : photoFor(photos, slotNow.itemId);
-    final displayedItemId = slotNowPhoto == null
-        ? before.currentItemId
-        : slotNow!.itemId;
+    final slotNowPhoto =
+        slotNow == null ? null : photoFor(photos, slotNow.itemId);
+    final displayedItemId =
+        slotNowPhoto == null ? before.currentItemId : slotNow!.itemId;
     final displayedPhoto = slotNowPhoto ?? photoFor(photos, displayedItemId);
     // 文案必须与照片同属一格，否则会出现「照片是 A、文字是 B」。
     // 替补会换掉该格的 asset（文案可能随之变化），因此替补结果优先。
     final displayedContent =
-        substitutedContent != null && substitutedContent.itemId == displayedItemId
-        ? substitutedContent
-        : plan?.contentFor(displayedItemId);
+        substitutedContent != null &&
+                substitutedContent.itemId == displayedItemId
+            ? substitutedContent
+            : plan?.contentFor(displayedItemId);
 
     final status = _statusFor(
       planFetched: planFetched,
@@ -288,9 +296,10 @@ class CarouselEngine {
       fallbackPhotoAvailable: displayedPhoto != null,
     );
 
-    final previousItemId = before.currentItemId != displayedItemId
-        ? before.currentItemId
-        : before.previousItemId;
+    final previousItemId =
+        before.currentItemId != displayedItemId
+            ? before.currentItemId
+            : before.previousItemId;
     final upcomingIds = [for (final slot in upcoming) slot.itemId];
 
     // 烘焙时间线：把「已经拿到照片的格子」写成一张到点即可直接上屏的表。
@@ -321,9 +330,10 @@ class CarouselEngine {
         incomingPlan: plan?.identity ?? before.plan,
         update: (current) {
           final kept = retainPhotos(
-            mode: generationChanged
-                ? RetentionMode.generation
-                : RetentionMode.normal,
+            mode:
+                generationChanged
+                    ? RetentionMode.generation
+                    : RetentionMode.normal,
             photos: photos,
             currentItemId: displayedItemId,
             previousItemId: previousItemId,
@@ -333,9 +343,7 @@ class CarouselEngine {
           final keptPaths = {for (final photo in kept) photo.path};
           removed
             ..clear()
-            ..addAll(
-              photos.where((photo) => !keptPaths.contains(photo.path)),
-            );
+            ..addAll(photos.where((photo) => !keptPaths.contains(photo.path)));
 
           return current.copyWith(
             plan: plan?.identity,
@@ -344,10 +352,7 @@ class CarouselEngine {
             currentItemId: displayedItemId,
             currentPhotoPath: displayedPhoto?.path,
             previousItemId: previousItemId,
-            previousPhotoPath: photoFor(
-              kept,
-              previousItemId,
-            )?.path,
+            previousPhotoPath: photoFor(kept, previousItemId)?.path,
             status: status,
             nextSlotAtMs: resolution?.atMs,
             nextSlotSource: source,
@@ -471,6 +476,7 @@ class CarouselEngine {
           photos: photos,
         );
         if (replacement != null) {
+          plan.contentById[slot.itemId] = replacement;
           stats.prepared++;
           if (stats.unavailable > 0) stats.unavailable--;
         }
@@ -479,13 +485,14 @@ class CarouselEngine {
       // 显示项判定与关键路径同一条规则：**宁可不切换，也不切到一张空图。**
       // 时间在这期间可能已经跨到下一格，若那一格的照片没备好，就仍然停在
       // `before.currentItemId`。
-      final slotNowPhoto = slotNow == null ? null : photoFor(photos, slotNow.itemId);
-      final displayedItemId = slotNowPhoto == null
-          ? before.currentItemId
-          : slotNow!.itemId;
-      final previousItemId = before.currentItemId != displayedItemId
-          ? before.currentItemId
-          : before.previousItemId;
+      final slotNowPhoto =
+          slotNow == null ? null : photoFor(photos, slotNow.itemId);
+      final displayedItemId =
+          slotNowPhoto == null ? before.currentItemId : slotNow!.itemId;
+      final previousItemId =
+          before.currentItemId != displayedItemId
+              ? before.currentItemId
+              : before.previousItemId;
       final upcomingIds = [for (final slot in upcoming) slot.itemId];
       final generationChanged = isNewGeneration(before.plan, plan.identity);
 
@@ -509,9 +516,10 @@ class CarouselEngine {
           incomingPlan: plan.identity,
           update: (current) {
             final kept = retainPhotos(
-              mode: generationChanged
-                  ? RetentionMode.generation
-                  : RetentionMode.normal,
+              mode:
+                  generationChanged
+                      ? RetentionMode.generation
+                      : RetentionMode.normal,
               photos: photos,
               currentItemId: displayedItemId,
               previousItemId: previousItemId,
@@ -521,7 +529,9 @@ class CarouselEngine {
             final keptPaths = {for (final photo in kept) photo.path};
             removed
               ..clear()
-              ..addAll(photos.where((photo) => !keptPaths.contains(photo.path)));
+              ..addAll(
+                photos.where((photo) => !keptPaths.contains(photo.path)),
+              );
 
             return current.copyWith(
               grid: grid,
@@ -588,13 +598,50 @@ class CarouselEngine {
     required CarouselPrepareStats stats,
     required int nowMs,
   }) async {
-    if (photoFor(photos, slot.itemId) != null) return true;
+    final existing = photoFor(photos, slot.itemId);
+    if (existing != null) {
+      final descriptor = plan?.contentFor(slot.itemId);
+      if (descriptor != null) {
+        final result = await _photoStore.prepare(
+          dir: dir,
+          item: descriptor,
+          credentials: credentials,
+          etag: existing.etag,
+        );
+        if (result.isReady) {
+          // A cached entry may still reference the legacy server-rendered file.
+          // Preparing also migrates/rebuilds the local layout; publish its paths.
+          photos.removeWhere((p) => p.itemId == slot.itemId);
+          photos.add(result.photo!.toEntry(existing.fetchedAtMs));
+          return true;
+        }
+      } else if (await CarouselPhotoStore.isReady(dir, slot.itemId)) {
+        return true;
+      }
+      photos.removeWhere((p) => p.itemId == slot.itemId);
+    }
     if (!attempted.add(slot.itemId)) {
       return photoFor(photos, slot.itemId) != null;
     }
-    final content = plan?.contentFor(slot.itemId);
+    var content = plan?.contentFor(slot.itemId);
     // 离线时拿不到内容描述符，本轮无法取图——这是 offline，不是 download_failed。
     if (content == null) return false;
+    try {
+      content = await api.prepareCarouselItem(credentials, slot.itemId);
+      plan!.contentById[slot.itemId] = content;
+      final index = plan.grid.indexWhere((item) => item.itemId == slot.itemId);
+      if (index >= 0) {
+        plan.grid[index] = Slot(
+          slotAtMs: slot.slotAtMs,
+          itemId: slot.itemId,
+          assetId: content.assetId,
+        );
+      }
+    } catch (error) {
+      debugPrint('[BloomCarousel] photo claim failed: $error');
+      stats.unavailable++;
+      return false;
+    }
     final result = await _photoStore.prepare(
       dir: dir,
       item: content,
@@ -621,22 +668,23 @@ class CarouselEngine {
     dateMs: slot.slotAtMs,
     itemId: slot.itemId,
     portraitPath: photo.path,
-    squarePath: CarouselPhotoStore.renderedFile(
-      dir,
-      'square',
-      slot.itemId,
-    ).path,
-    largeSquarePath: CarouselPhotoStore.renderedFile(
-      dir,
-      'largeSquare',
-      slot.itemId,
-    ).path,
+    squarePath:
+        CarouselPhotoStore.renderedFile(dir, 'square', slot.itemId).path,
+    largeSquarePath:
+        CarouselPhotoStore.renderedFile(dir, 'largeSquare', slot.itemId).path,
     originalPath: CarouselPhotoStore.originalFile(dir, slot.itemId).path,
     date: content.displayAt.toLocal().toIso8601String().substring(0, 10),
     captionZh: content.captionZh,
     captionEn: content.captionEn,
     capturedDateText: content.capturedDateText,
     locationText: content.locationText,
+    sourceName: content.sourceName,
+    artwork: content.artwork,
+    photoMetadata: {
+      'url': content.photo.url,
+      'focus_x': content.photo.focusX,
+      'focus_y': content.photo.focusY,
+    },
   );
 
   /// 状态归类。
@@ -737,10 +785,10 @@ class CarouselEngine {
       // 时才更新。离线或串项时保持原样：屏幕上那一张本来也没有变。
       final sameItem = content != null && content.itemId == state.currentItemId;
       if (planFetched && sameItem) {
-        raw['date'] = content.displayAt
-            .toLocal()
-            .toIso8601String()
-            .substring(0, 10);
+        raw['date'] = content.displayAt.toLocal().toIso8601String().substring(
+          0,
+          10,
+        );
         raw['recommendation_id'] = content.itemId;
         raw['carousel_item_id'] = content.itemId;
         raw['caption_zh'] = content.captionZh;
@@ -748,6 +796,13 @@ class CarouselEngine {
         raw['captured_date_text'] = content.capturedDateText;
         raw['location_text'] = content.locationText;
         raw['photo_orientation'] = content.photoOrientation;
+        raw['source_name'] = content.sourceName;
+        raw['content_snapshot'] = content.artwork;
+        raw['photo_metadata'] = {
+          'url': content.photo.url,
+          'focus_x': content.photo.focusX,
+          'focus_y': content.photo.focusY,
+        };
       }
 
       final temp = File('${file.path}.tmp');

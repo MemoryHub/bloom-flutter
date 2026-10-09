@@ -81,13 +81,21 @@ void main() {
     await settle(tester);
   }
 
-  testWidgets('底部导航是四个 tab：首页 / 照片 / 设备 / 我的', (tester) async {
+  testWidgets('底部导航顺序：首页 / 发现 / 照片 / 设备 / 我的', (tester) async {
     await tester.pumpWidget(home());
     await settle(tester);
 
     expect(nav, findsOneWidget);
     // 「我的」是后加的第四个：账号原先挂在设备页底部的一个角落，那是个临时位置。
-    for (final label in ['首页', '照片', '设备', '我的']) {
+    final labels = ['首页', '发现', '照片', '设备', '我的'];
+    expect(
+      tester
+          .widget<LiquidGlassBottomNavBar>(nav)
+          .items
+          .map((item) => item.label),
+      labels,
+    );
+    for (final label in labels) {
       expect(
         find.descendant(of: nav, matching: find.text(label)),
         findsNWidgets(2),
@@ -96,6 +104,17 @@ void main() {
     }
     // The removed playback tab must not come back.
     expect(find.descendant(of: nav, matching: find.text('播放')), findsNothing);
+  });
+
+  testWidgets('发现位于第二页，照片位于第三页，导航与内容同步', (tester) async {
+    await tester.pumpWidget(home());
+    await settle(tester);
+    await tapTab(tester, '发现');
+    expect(tabIndex(tester), 1);
+    expect(find.text('发现测试内容'), findsOneWidget);
+    await tapTab(tester, '照片');
+    expect(tabIndex(tester), 2);
+    expect(find.text('照片库即将上线'), findsOneWidget);
   });
 
   testWidgets('默认进入首页，首页显示照片卡片', (tester) async {
@@ -117,8 +136,35 @@ void main() {
       ),
       findsOneWidget,
     );
-    expect(find.text('「测试照片」'), findsOneWidget);
+    expect(find.byKey(const ValueKey<Object>(3)), findsOneWidget);
     expect(find.text('2024.01.02'), findsOneWidget);
+  });
+
+  testWidgets('艺术首页取纯图片并实时绘制展签，不叠加个人信纸', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: _Harness(
+          initialTab: 0,
+          onTabChanged: (_) {},
+          photoPath: photoPath,
+          credentials: credentials,
+          sourceName: 'art',
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.byKey(const ValueKey('art:3')), findsOneWidget);
+    final image = tester.widget<Image>(
+      find
+          .descendant(
+            of: find.byKey(const ValueKey('art:3')),
+            matching: find.byType(Image),
+          )
+          .first,
+    );
+    expect((image.image as FileImage).file.path, photoPath);
+    expect(find.text('「测试照片」'), findsNothing);
+    expect(find.text('2024.01.02'), findsNothing);
   });
 
   testWidgets('点「照片」→ 占位页，不是旧播放页', (tester) async {
@@ -127,7 +173,7 @@ void main() {
 
     await tapTab(tester, '照片');
 
-    expect(tabIndex(tester), 1);
+    expect(tabIndex(tester), 2);
     expect(find.text('照片库即将上线'), findsOneWidget);
     // Nothing from the deleted playback page may be reachable again.
     expect(find.text('播放'), findsNothing);
@@ -141,7 +187,7 @@ void main() {
 
     await tapTab(tester, '设备');
 
-    expect(tabIndex(tester), 2);
+    expect(tabIndex(tester), 3);
     expect(find.text('E-Ink'), findsOneWidget);
     // Each device is a tile: a small top line (type · state) over a large name.
     // See bloom_device_pages_test.
@@ -161,7 +207,7 @@ void main() {
     await tapTab(tester, '首页');
 
     expect(tabIndex(tester), 0);
-    expect(find.text('「测试照片」'), findsOneWidget);
+    expect(find.byKey(const ValueKey<Object>(3)), findsOneWidget);
   });
 
   testWidgets('首页模式只报短标签，长文案不再出现（推荐 / 轮播两种都要对）', (tester) async {
@@ -222,7 +268,9 @@ void main() {
     await tester.pumpWidget(home());
     await settle(tester);
 
-    final card = tester.getRect(find.byKey(const ValueKey('bloom-letter-card')));
+    final card = tester.getRect(
+      find.byKey(const ValueKey('bloom-letter-card')),
+    );
     // The whole label block (glyph included), not the bare text: the glyph is
     // what the eye reads as its left edge.
     final mode = tester.getRect(find.byKey(const ValueKey('bloom-mode-tag')));
@@ -267,10 +315,7 @@ void main() {
     // not the text: the padding is what must clear the camera.
     final toast = tester.getRect(
       find
-          .ancestor(
-            of: find.text('扫码配对即将支持'),
-            matching: find.byType(Padding),
-          )
+          .ancestor(of: find.text('扫码配对即将支持'), matching: find.byType(Padding))
           .first,
     );
     expect(
@@ -328,16 +373,20 @@ void main() {
 
     await tester.pumpWidget(withItem(3));
     await settle(tester);
-    expect(find.text('「测试照片」'), findsOneWidget, reason: '一开始就该只有一张卡');
+    expect(
+      find.byKey(const ValueKey<Object>(3)),
+      findsOneWidget,
+      reason: '一开始就该只有一张卡',
+    );
 
     // 换一张图 —— 这正是真机上发生的事：先显示缓存里那张，加载完再换成
     // 同步来的那一张。
     await tester.pumpWidget(withItem(4));
     await settle(tester);
     expect(
-      find.text('「测试照片」'),
+      find.byKey(const ValueKey<Object>(4)),
       findsOneWidget,
-      reason: '换图之后旧卡片必须已经退场，否则纸面上会叠出两层标题',
+      reason: '换图之后合成图只保留当前一项',
     );
   });
 }
@@ -352,6 +401,7 @@ class _Harness extends StatefulWidget {
     this.mode = BloomDisplayMode.recommendation,
     this.message,
     this.recommendationId = 3,
+    this.sourceName = 'personal',
   });
 
   final int initialTab;
@@ -364,6 +414,7 @@ class _Harness extends StatefulWidget {
   /// 让用例能换一张"当前展示的照片" —— 卡片的 key 跟着它走，所以换它就是
   /// 触发一次换图动画。
   final int recommendationId;
+  final String sourceName;
 
   @override
   State<_Harness> createState() => _HarnessState();
@@ -374,6 +425,7 @@ class _HarnessState extends State<_Harness> {
 
   @override
   Widget build(BuildContext context) => BloomGlassHome(
+    discoverPage: const Text('发现测试内容'),
     message: widget.message,
     loading: false,
     nextLoading: false,
@@ -390,15 +442,13 @@ class _HarnessState extends State<_Harness> {
       date: '2026-08-13',
       recommendationId: widget.recommendationId,
       captionZh: '测试照片',
+      sourceName: widget.sourceName,
       capturedDateText: '2024.01.02',
       locationText: '天津',
     ),
     date: '2026-08-13',
     settings: BloomDisplaySettings(mode: widget.mode),
-    devices: bloomDevices(
-      credentials: widget.credentials,
-      localOnline: true,
-    ),
+    devices: bloomDevices(credentials: widget.credentials, localOnline: true),
     selectedDeviceId: widget.credentials.deviceId,
     onTabChanged: (index) {
       setState(() => _tab = index);

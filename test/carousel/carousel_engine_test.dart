@@ -91,14 +91,19 @@ class _FakePhotoStore extends CarouselPhotoStore {
         reason: 'fake failure',
       );
     }
-    prepared.add(item.itemId);
+    final complete = await CarouselPhotoStore.isReady(dir, item.itemId);
+    if (!complete) prepared.add(item.itemId);
     if (nextSlotSeenDuringPrepare.isEmpty) {
       final state = await CarouselStateStore(directory: dir).read();
       nextSlotSeenDuringPrepare.add(state.nextSlotAtMs);
     }
     final original = CarouselPhotoStore.originalFile(dir, item.itemId);
     await original.writeAsBytes([1, 2, 3]);
-    final portrait = CarouselPhotoStore.renderedFile(dir, 'portrait', item.itemId);
+    final portrait = CarouselPhotoStore.renderedFile(
+      dir,
+      'portrait',
+      item.itemId,
+    );
     await portrait.writeAsBytes([1, 2, 3]);
     for (final family in ['square', 'largeSquare']) {
       await CarouselPhotoStore.renderedFile(
@@ -114,12 +119,14 @@ class _FakePhotoStore extends CarouselPhotoStore {
         assetId: item.assetId,
         originalPath: original.path,
         portraitPath: portrait.path,
-        squarePath: CarouselPhotoStore.renderedFile(dir, 'square', item.itemId).path,
-        largeSquarePath: CarouselPhotoStore.renderedFile(
-          dir,
-          'largeSquare',
-          item.itemId,
-        ).path,
+        squarePath:
+            CarouselPhotoStore.renderedFile(dir, 'square', item.itemId).path,
+        largeSquarePath:
+            CarouselPhotoStore.renderedFile(
+              dir,
+              'largeSquare',
+              item.itemId,
+            ).path,
       ),
     );
   }
@@ -167,8 +174,28 @@ void main() {
     } catch (_) {}
   });
 
-  BloomApiClient apiWith(Future<http.Response> Function(http.Request) handler) =>
-      BloomApiClient(client: MockClient(handler));
+  BloomApiClient apiWith(Future<http.Response> Function(http.Request) handler) {
+    final descriptors = <int, Map<String, dynamic>>{};
+    return BloomApiClient(
+      client: MockClient((request) async {
+        if (request.url.path.endsWith('/carousel/prepare')) {
+          final id = (jsonDecode(request.body)['item_id'] as num).toInt();
+          return descriptors.containsKey(id)
+              ? ok(jsonEncode({'item': descriptors[id]}))
+              : http.Response('not found', 404);
+        }
+        final response = await handler(request);
+        if (request.url.path.endsWith('/carousel/plan') &&
+            response.statusCode == 200) {
+          for (final item in jsonDecode(response.body)['items'] as List) {
+            descriptors[(item['item_id'] as num)
+                .toInt()] = Map<String, dynamic>.from(item);
+          }
+        }
+        return response;
+      }),
+    );
+  }
 
   const credentials = DeviceCredentials(deviceId: 'dev-1', deviceToken: 'tok');
   const settings = BloomDisplaySettings(intervalMinutes: 1440);
@@ -187,14 +214,67 @@ void main() {
         _FakePhotoStore(api: api, failFor: failFor, failAssets: failAssets),
   );
 
+  test(
+    'cached legacy image paths migrate to the rebuilt local layout',
+    () async {
+      final api = apiWith(
+        (request) async => ok(
+          planBody(
+            planId: 150,
+            items: [itemJson(4400, '2026-09-28T06:00:00')],
+            nextCheckAt: '2026-09-29T06:00:00',
+          ),
+        ),
+      );
+      final engine = engineFor(api, now: DateTime.parse('2026-09-28T11:32:00'));
+      await engine.tick(
+        credentials: credentials,
+        settings: settings,
+        writer: 'test',
+      );
+      final store = CarouselStateStore(directory: dir);
+      final first = await store.read();
+      final old = first.photos.single;
+      await store.mutate(
+        writer: 'test',
+        incomingPlan: first.plan,
+        update:
+            (s) => s.copyWith(
+              photos: [
+                PhotoEntry(
+                  itemId: old.itemId,
+                  assetId: old.assetId,
+                  path: '${dir.path}/legacy-portrait.png',
+                  etag: old.etag,
+                  fetchedAtMs: old.fetchedAtMs,
+                ),
+              ],
+            ),
+      );
+      await engine.tick(
+        credentials: credentials,
+        settings: settings,
+        writer: 'test',
+      );
+      final migrated = await store.read();
+      final expected =
+          CarouselPhotoStore.renderedFile(dir, 'portrait', 4400).path;
+      expect(migrated.photos.single.path, expected);
+      expect(migrated.photos.single.fetchedAtMs, old.fetchedAtMs);
+      expect(migrated.timelineEntries.first.portraitPath, expected);
+    },
+  );
+
   test('回归：默认设置当天格子已过，文案必须落明天第一格而不是空值', () async {
     final api = apiWith((request) async {
       if (request.url.path.endsWith('/carousel/plan')) {
-        return ok(planBody(
+        return ok(
+          planBody(
             planId: 151,
             items: [itemJson(4434, '2026-09-28T06:00:00')],
             nextCheckAt: '2026-09-29T06:00:00',
-          ));
+          ),
+        );
       }
       return http.Response('nope', 404);
     });
@@ -224,7 +304,8 @@ void main() {
   test('15 分钟间隔：11:20 时下一格是 11:30，且当前格是 11:15', () async {
     final api = apiWith((request) async {
       if (request.url.path.endsWith('/carousel/plan')) {
-        return ok(planBody(
+        return ok(
+          planBody(
             planId: 200,
             items: [
               itemJson(1, '2026-09-28T11:15:00'),
@@ -232,7 +313,8 @@ void main() {
               itemJson(3, '2026-09-28T11:45:00'),
             ],
             nextCheckAt: '2026-09-28T11:30:00',
-          ));
+          ),
+        );
       }
       return http.Response('nope', 404);
     });
@@ -263,14 +345,16 @@ void main() {
         return http.Response('{"detail":"not found"}', 404);
       }
       if (request.url.path.endsWith('/carousel/plan')) {
-        return ok(planBody(
+        return ok(
+          planBody(
             planId: 201,
             items: [
               itemJson(10, '2026-09-28T11:15:00'),
               itemJson(11, '2026-09-28T11:30:00'),
             ],
             nextCheckAt: '2026-09-28T11:30:00',
-          ));
+          ),
+        );
       }
       return http.Response('nope', 404);
     });
@@ -382,7 +466,10 @@ void main() {
     );
 
     // ⑤ 后续格子照常预取，替补没有中断预取。
-    expect(state.photos.map((photo) => photo.itemId), containsAll([4482, 4483]));
+    expect(
+      state.photos.map((photo) => photo.itemId),
+      containsAll([4482, 4483]),
+    );
   });
 
   test('回归：预取失败的未来格也要替补，否则时间线留永久空洞', () async {
@@ -396,10 +483,7 @@ void main() {
     // 修法是把替补从「等它变成当前格」提前到预取阶段。规则一个字没改：
     // 仍然只换失败的这一格，栅格永不动。
     final substituteCalls = <int>[];
-    const when = {
-      4482: '2026-09-28T11:30:00',
-      4483: '2026-09-28T11:45:00',
-    };
+    const when = {4482: '2026-09-28T11:30:00', 4483: '2026-09-28T11:45:00'};
     final api = apiWith((request) async {
       if (request.url.path.endsWith('/carousel/item/substitute')) {
         final body = jsonDecode(request.body) as Map<String, dynamic>;
@@ -447,11 +531,7 @@ void main() {
       writer: 'test',
     );
 
-    expect(
-      substituteCalls,
-      [4482],
-      reason: '预取失败的那一格必须替补；当前格正常时不该打扰服务端',
-    );
+    expect(substituteCalls, [4482], reason: '预取失败的那一格必须替补；当前格正常时不该打扰服务端');
 
     final state = await CarouselStateStore(directory: dir).read();
 
@@ -518,14 +598,16 @@ void main() {
     // 第一次在线，播下缓存。
     final onlineApi = apiWith((request) async {
       if (request.url.path.endsWith('/carousel/plan')) {
-        return ok(planBody(
+        return ok(
+          planBody(
             planId: 202,
             items: [
               itemJson(20, '2026-09-28T11:15:00'),
               itemJson(21, '2026-09-28T11:30:00'),
             ],
             nextCheckAt: '2026-09-28T11:30:00',
-          ));
+          ),
+        );
       }
       return http.Response('nope', 404);
     });
@@ -541,7 +623,10 @@ void main() {
     );
 
     // 第二次断网。
-    final second = engineFor(offlineApi, now: DateTime.parse('2026-09-28T11:25:00'));
+    final second = engineFor(
+      offlineApi,
+      now: DateTime.parse('2026-09-28T11:25:00'),
+    );
     final outcome = await second.tick(
       credentials: credentials,
       settings: settings,
@@ -561,20 +646,21 @@ void main() {
   test('写入成功后会通知对端刷新', () async {
     final api = apiWith((request) async {
       if (request.url.path.endsWith('/carousel/plan')) {
-        return ok(planBody(
+        return ok(
+          planBody(
             planId: 203,
             items: [itemJson(30, '2026-09-28T11:15:00')],
             nextCheckAt: '2026-09-28T11:30:00',
-          ));
+          ),
+        );
       }
       return http.Response('nope', 404);
     });
 
-    await engineFor(api, now: DateTime.parse('2026-09-28T11:20:00')).tick(
-      credentials: credentials,
-      settings: settings,
-      writer: 'test',
-    );
+    await engineFor(
+      api,
+      now: DateTime.parse('2026-09-28T11:20:00'),
+    ).tick(credentials: credentials, settings: settings, writer: 'test');
 
     expect(refreshCalls, isNotEmpty);
   });
@@ -629,11 +715,10 @@ void main() {
       return http.Response('nope', 404);
     });
 
-    await engineFor(api, now: DateTime.parse('2026-09-28T11:20:00')).tick(
-      credentials: credentials,
-      settings: settings,
-      writer: 'test',
-    );
+    await engineFor(
+      api,
+      now: DateTime.parse('2026-09-28T11:20:00'),
+    ).tick(credentials: credentials, settings: settings, writer: 'test');
 
     final state = await CarouselStateStore(directory: dir).read();
     expect(
@@ -652,10 +737,7 @@ void main() {
       first.squarePath,
       CarouselPhotoStore.renderedFile(dir, 'square', 60).path,
     );
-    expect(
-      first.originalPath,
-      CarouselPhotoStore.originalFile(dir, 60).path,
-    );
+    expect(first.originalPath, CarouselPhotoStore.originalFile(dir, 60).path);
     expect(first.date, '2026-09-28');
     expect(first.captionZh, '中文60');
 
@@ -680,23 +762,24 @@ void main() {
   test('daily.json 投影与权威状态一致，且不产生第二份真相', () async {
     final api = apiWith((request) async {
       if (request.url.path.endsWith('/carousel/plan')) {
-        return ok(planBody(
+        return ok(
+          planBody(
             planId: 204,
             items: [
               itemJson(40, '2026-09-28T11:15:00'),
               itemJson(41, '2026-09-28T11:30:00'),
             ],
             nextCheckAt: '2026-09-28T11:30:00',
-          ));
+          ),
+        );
       }
       return http.Response('nope', 404);
     });
 
-    await engineFor(api, now: DateTime.parse('2026-09-28T11:20:00')).tick(
-      credentials: credentials,
-      settings: settings,
-      writer: 'test',
-    );
+    await engineFor(
+      api,
+      now: DateTime.parse('2026-09-28T11:20:00'),
+    ).tick(credentials: credentials, settings: settings, writer: 'test');
 
     final state = await CarouselStateStore(directory: dir).read();
     final projection =
@@ -779,11 +862,7 @@ void main() {
 
     // ---- 第 1 轮：没有上一张，当前格 + 整个预取窗口一次取满 ----
     final first = await tick();
-    expect(
-      first.downloads,
-      1 + window,
-      reason: '首轮 = 当前 1 张 + 预取 $window 张',
-    );
+    expect(first.downloads, 1 + window, reason: '首轮 = 当前 1 张 + 预取 $window 张');
     expect(first.cached, 1 + window);
     expect(first.previous, isNull);
 
@@ -802,17 +881,11 @@ void main() {
     expect(third.cached, 2 + window, reason: '稳态缓存不随轮次增长');
 
     // ---- 历史严格只有 2 张 ----
-    final ids = (await stateStore.read()).photos
-        .map((photo) => photo.itemId)
-        .toList()
-      ..sort();
+    final ids =
+        (await stateStore.read()).photos.map((photo) => photo.itemId).toList()
+          ..sort();
     // 稳态池 = 上一张(4501) + 当前(4502) + 未来 window 格，即 4501..(4500+2+window)。
     expect(ids, [for (var i = 1; i <= 2 + window; i++) 4500 + i]);
-    expect(
-      ids,
-      isNot(contains(4500)),
-      reason: '比「上一张」更早的照片必须已被删除——历史就是 2 张',
-    );
+    expect(ids, isNot(contains(4500)), reason: '比「上一张」更早的照片必须已被删除——历史就是 2 张');
   });
-
 }

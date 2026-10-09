@@ -17,6 +17,7 @@ import 'platform/widget_bridge.dart';
 import 'ui/bloom_auth_pages.dart';
 import 'ui/bloom_device_pages.dart';
 import 'ui/bloom_glass_home.dart';
+import 'ui/bloom_discover_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -124,8 +125,10 @@ class _BloomHomePageState extends State<BloomHomePage>
   late final AuthRepository _auth = widget.auth ?? AuthRepository();
 
   Timer? _messageTimer;
+
   /// Turns the page when its slot arrives while the app is open.
   Timer? _slotWatch;
+
   /// Fires exactly when the next slot begins.
   Timer? _slotWake;
   Timer? _followNative;
@@ -177,6 +180,13 @@ class _BloomHomePageState extends State<BloomHomePage>
       if (!mounted || _loading) return;
       final repository = DailyContentRepository(api: _api);
       await repository.drainWidgetTimelineLog();
+      final nextAt =
+          _displaySettings.usesScheduledPlan
+              ? await repository.nextSlotAtMillis()
+              : _nextRecommendSlotMs(_displaySettings);
+      if (mounted && nextAt != null && nextAt != _nextSlotAt) {
+        setState(() => _nextSlotAt = nextAt);
+      }
       final native = await repository.nativeContent();
       if (!mounted || native == null) return;
       if (native.recommendationId == _content?.recommendationId) return;
@@ -187,13 +197,16 @@ class _BloomHomePageState extends State<BloomHomePage>
       //    冷启动时这个定时器以前被 `_loading` 挡着（一轮 sync 要 60 秒），
       //    现在本机那张会先被画上去，`_loading` 提前转 false，它就会真的跑 ——
       //    所以这里必须把路径一起换掉。
-      final path =
-          await repository.photoPathFor(native.recommendationId) ??
-          await repository.originalPhotoPath();
-      if (!mounted) return;
+      final path = await repository.photoPathFor(native.recommendationId);
+      if (!mounted || path == null) return;
+      final portrait = await repository.cached('portrait');
       setState(() {
         _content = native;
-        if (path != null) _originalPhotoPath = path;
+        _originalPhotoPath = path;
+        _portrait =
+            portrait?.recommendationId == native.recommendationId
+                ? portrait
+                : null;
       });
     });
     WidgetsBinding.instance.addObserver(this);
@@ -257,15 +270,22 @@ class _BloomHomePageState extends State<BloomHomePage>
     // ⚠️ 推荐的下一格**不在** `next_slot_at_ms` 里（那是轮播的戳，推荐路径不写）。
     //    在推荐模式下读它只会拿到上一轮轮播留下的过期值，于是这次唤醒要么永远
     //    不响、要么在错误的时刻响。两边用同一个来源：推荐按固定作息算。
-    final at = _displaySettings.mode == BloomDisplayMode.recommendation
-        ? _nextRecommendSlotMs(_displaySettings)
-        : await DailyContentRepository(api: _api).nextSlotAtMillis();
+    final at =
+        !_displaySettings.usesScheduledPlan
+            ? _nextRecommendSlotMs(_displaySettings)
+            : await DailyContentRepository(api: _api).nextSlotAtMillis();
     if (!mounted || at == null) return;
     final delay = at - DateTime.now().millisecondsSinceEpoch;
     if (delay <= 0) return;
     _slotWake?.cancel();
     _slotWake = Timer(Duration(milliseconds: delay + 1500), () async {
       if (!mounted || !_widgetEnabled) return;
+      // Advance the label from the local grid before a network/photo sync.
+      final nextAt =
+          _displaySettings.usesScheduledPlan
+              ? await DailyContentRepository(api: _api).nextSlotAtMillis()
+              : _nextRecommendSlotMs(_displaySettings);
+      if (mounted && nextAt != null) setState(() => _nextSlotAt = nextAt);
       await _load(showSpinner: false);
       await _armNextSlotWake();
     });
@@ -290,7 +310,13 @@ class _BloomHomePageState extends State<BloomHomePage>
     final now = DateTime.now();
     final (startHour, startMinute) = parseClock(settings.activeStart, 6, 0);
     final (endHour, endMinute) = parseClock(settings.activeEnd, 22, 0);
-    final start = DateTime(now.year, now.month, now.day, startHour, startMinute);
+    final start = DateTime(
+      now.year,
+      now.month,
+      now.day,
+      startHour,
+      startMinute,
+    );
     final end = DateTime(now.year, now.month, now.day, endHour, endMinute);
     final step = Duration(minutes: settings.intervalMinutes);
     if (step.inMinutes <= 0) return null;
@@ -343,22 +369,12 @@ class _BloomHomePageState extends State<BloomHomePage>
     try {
       final native = await WidgetBridge().readCurrentState();
       if (native != null) {
-        final path =
-            await repository.photoPathFor(native.recommendationId) ??
-            native.originalPhotoPath ??
-            native.portraitPath;
+        final path = await repository.photoPathFor(native.recommendationId);
         if (path != null && await File(path).exists()) {
           photoPath = path;
-          content = DailyContent(
-            date: native.date ?? '',
-            recommendationId: native.recommendationId,
-            captionZh: native.captionZh,
-            captionEn: native.captionEn,
-            capturedDateText: native.capturedDateText,
-            locationText: native.locationText,
-          );
+          content = await repository.contentForNative(native);
           portrait = CachedWidgetImage(
-            path: path,
+            path: native.portraitPath ?? path,
             orientation: 'portrait',
             date: native.date,
             recommendationId: native.recommendationId,
@@ -371,9 +387,7 @@ class _BloomHomePageState extends State<BloomHomePage>
     if (photoPath == null) {
       try {
         final cached = await repository.cachedContent();
-        final path =
-            await repository.photoPathFor(cached?.recommendationId) ??
-            await repository.originalPhotoPath();
+        final path = await repository.photoPathFor(cached?.recommendationId);
         if (cached != null && path != null) {
           photoPath = path;
           content = cached;
@@ -384,6 +398,11 @@ class _BloomHomePageState extends State<BloomHomePage>
       }
     }
     if (photoPath == null || !mounted) return;
+    final nextAt =
+        _displaySettings.usesScheduledPlan
+            ? await repository.nextSlotAtMillis()
+            : _nextRecommendSlotMs(_displaySettings);
+    if (!mounted) return;
     debugPrint(
       '[BloomUI] local-first show id=${content?.recommendationId} '
       'photo=$photoPath',
@@ -394,6 +413,7 @@ class _BloomHomePageState extends State<BloomHomePage>
       _content = content;
       _portrait = portrait ?? _portrait;
       _date = content?.date ?? _date;
+      _nextSlotAt = nextAt ?? _nextSlotAt;
       _loading = false;
     });
   }
@@ -488,7 +508,7 @@ class _BloomHomePageState extends State<BloomHomePage>
       //    「下次更新」**只有保存过设置之后才会出现**，冷启动永远没有那一行。
       //    下面同步路径里那一处赋值只是复核（设置可能刚被改过），不是唯一来源。
       final localSettings = await displaySettingsFuture;
-      if (localSettings.mode == BloomDisplayMode.recommendation && mounted) {
+      if (!localSettings.usesScheduledPlan && mounted) {
         setState(() => _nextSlotAt = _nextRecommendSlotMs(localSettings));
       }
       // ⭐ **本机已有的那张，先画上去 —— 在任何网络请求之前。**
@@ -582,23 +602,27 @@ class _BloomHomePageState extends State<BloomHomePage>
           if (cachedBeforeSync != null &&
               cachedPortraitBeforeSync != null &&
               mounted) {
-            final cachedOriginal = await repository.originalPhotoPath();
-            setState(() {
-              _paired = true;
-              _portrait = cachedPortraitBeforeSync;
-              _content = cachedBeforeSync;
-              // A cache read that comes back empty must not *erase* a photo
-              // that is already on screen: the file is being renamed into place
-              // at exactly the wrong moment during every background refill, and
-              // the null it returns then used to blank the card — permanently,
-              // once anything re-read the cache periodically. Lines 433/623
-              // already merge this way; these two were the odd ones out.
-              _originalPhotoPath = cachedOriginal ?? _originalPhotoPath;
-              _date = cachedBeforeSync.date;
-              _displaySettings = displaySettings;
-              _loading = false;
-              _message = null;
-            });
+            final cachedOriginal = await repository.photoPathFor(
+              cachedBeforeSync.recommendationId,
+            );
+            if (cachedOriginal != null) {
+              setState(() {
+                _paired = true;
+                _portrait = cachedPortraitBeforeSync;
+                _content = cachedBeforeSync;
+                // A cache read that comes back empty must not *erase* a photo
+                // that is already on screen: the file is being renamed into place
+                // at exactly the wrong moment during every background refill, and
+                // the null it returns then used to blank the card — permanently,
+                // once anything re-read the cache periodically. Lines 433/623
+                // already merge this way; these two were the odd ones out.
+                _originalPhotoPath = cachedOriginal;
+                _date = cachedBeforeSync.date;
+                _displaySettings = displaySettings;
+                _loading = false;
+                _message = null;
+              });
+            }
           }
           // A widget alarm can advance the shared native cache while the
           // carousel plan is still being downloaded. Seed the photo page from
@@ -614,8 +638,18 @@ class _BloomHomePageState extends State<BloomHomePage>
               (cachedBeforeSync == null ||
                   nativeBeforeSync.recommendationId >=
                       cachedBeforeSync.recommendationId);
-          if (nativeBeforeIsCurrent && mounted) {
+          final nativeBeforeOriginal = await repository.photoPathFor(
+            nativeBeforeSync?.recommendationId,
+          );
+          if (nativeBeforeIsCurrent &&
+              nativeBeforeOriginal != null &&
+              mounted) {
             final nativeBefore = nativeBeforeSync;
+            final nativeContent = await repository.contentForNative(
+              nativeBefore,
+              fallback: cachedBeforeSync,
+            );
+            if (!mounted) return;
             setState(() {
               _portrait = CachedWidgetImage(
                 path: nativeBeforePortrait,
@@ -623,16 +657,8 @@ class _BloomHomePageState extends State<BloomHomePage>
                 date: nativeBefore.date,
                 recommendationId: nativeBefore.recommendationId,
               );
-              _content = DailyContent(
-                date: nativeBefore.date ?? '',
-                recommendationId: nativeBefore.recommendationId,
-                captionZh: nativeBefore.captionZh,
-                captionEn: nativeBefore.captionEn,
-                capturedDateText: nativeBefore.capturedDateText,
-                locationText: nativeBefore.locationText,
-              );
-              _originalPhotoPath =
-                  nativeBefore.originalPhotoPath ?? _originalPhotoPath;
+              _content = nativeContent;
+              _originalPhotoPath = nativeBeforeOriginal;
               _date = nativeBefore.date;
               _displaySettings = displaySettings;
               _loading = false;
@@ -644,7 +670,7 @@ class _BloomHomePageState extends State<BloomHomePage>
               '(mode=${displaySettings.mode.name} '
               'window=${displaySettings.activeStart}-${displaySettings.activeEnd})',
             );
-            if (displaySettings.mode == BloomDisplayMode.carousel) {
+            if (displaySettings.usesScheduledPlan) {
               // **This path needed the same catch-up as the manual "下一张"
               // button.** `_watchNextSlot` was wired only to that button, so
               // "下次更新" appeared within ~1 s after a manual advance but sat
@@ -658,7 +684,7 @@ class _BloomHomePageState extends State<BloomHomePage>
             // ⚠️ 推荐走它自己的算法路径，不与轮播共用引擎（见
             //    background_sync.dart 的说明）。
             content =
-                displaySettings.mode == BloomDisplayMode.carousel
+                displaySettings.usesScheduledPlan
                     ? await repository.syncCarousel(
                       credentials,
                       displaySettings,
@@ -691,27 +717,19 @@ class _BloomHomePageState extends State<BloomHomePage>
           final nativePhoto =
               native == null
                   ? null
-                  : (await repository.photoPathFor(native.recommendationId) ??
-                      native.originalPhotoPath ??
-                      native.portraitPath);
+                  : await repository.photoPathFor(native.recommendationId);
           final nativePhotoExists =
               nativePhoto != null && await File(nativePhoto).exists();
           final expectedMode =
-              displaySettings.mode == BloomDisplayMode.carousel
-                  ? 'carousel'
-                  : 'recommend';
+              displaySettings.usesScheduledPlan ? 'carousel' : 'recommend';
           final networkId = content?.recommendationId ?? 0;
           if (native != null &&
               nativePhotoExists &&
               (native.mode == null || native.mode == expectedMode) &&
               native.recommendationId >= networkId) {
-            content = DailyContent(
-              date: native.date ?? content?.date ?? '',
-              recommendationId: native.recommendationId,
-              captionZh: native.captionZh,
-              captionEn: native.captionEn,
-              capturedDateText: native.capturedDateText,
-              locationText: native.locationText,
+            content = await repository.contentForNative(
+              native,
+              fallback: content,
             );
             originalPhotoPath = nativePhoto;
             portrait =
@@ -733,9 +751,9 @@ class _BloomHomePageState extends State<BloomHomePage>
           // the one mutable `original.photo`, whose bytes the next background
           // sync overwrites in place (that is what made the photo change while
           // the caption stayed behind).
-          originalPhotoPath ??=
-              await repository.photoPathFor(content?.recommendationId) ??
-              await repository.originalPhotoPath();
+          originalPhotoPath ??= await repository.photoPathFor(
+            content?.recommendationId,
+          );
           // Read the slot stamp the same sync just wrote, so the label under the
           // card always belongs to the plan that is on screen.
           //
@@ -745,9 +763,10 @@ class _BloomHomePageState extends State<BloomHomePage>
           //    之后才出现（那条路会把 `_nextRecommendSlotMs` 塞进 `_nextSlotAt`）。
           //    推荐的节奏由固定作息唯一决定（06:00–22:00 / 12 小时 → 06:00、18:00），
           //    所以这里直接按作息算，冷启动和保存后走同一个来源。
-          nextSlotAt = displaySettings.mode == BloomDisplayMode.recommendation
-              ? _nextRecommendSlotMs(displaySettings)
-              : await repository.nextSlotAtMillis();
+          nextSlotAt =
+              !displaySettings.usesScheduledPlan
+                  ? _nextRecommendSlotMs(displaySettings)
+                  : await repository.nextSlotAtMillis();
           debugPrint(
             '[BloomUI] show id=${content?.recommendationId} '
             'photo=${originalPhotoPath ?? 'none'} '
@@ -775,7 +794,9 @@ class _BloomHomePageState extends State<BloomHomePage>
                   : await repository.cached('largeSquare');
           date = content?.date;
           await _evictOriginalPhoto(originalPhotoPath);
-          if (portrait != null) {
+          if (portrait != null &&
+              portrait.recommendationId == content?.recommendationId &&
+              originalPhotoPath != null) {
             await WidgetBridge().update(
               portraitPath: portrait.path,
               squarePath: square?.path ?? portrait.path,
@@ -795,9 +816,7 @@ class _BloomHomePageState extends State<BloomHomePage>
               capturedDateText: content?.capturedDateText,
               locationText: content?.locationText,
               mode:
-                  displaySettings.mode == BloomDisplayMode.carousel
-                      ? 'carousel'
-                      : 'recommend',
+                  displaySettings.usesScheduledPlan ? 'carousel' : 'recommend',
             );
           }
         } else {
@@ -823,9 +842,14 @@ class _BloomHomePageState extends State<BloomHomePage>
       setState(() {
         _credentials = credentials;
         _paired = isPaired;
-        _portrait = portrait ?? _portrait;
-        _content = content ?? _content;
-        _originalPhotoPath = originalPhotoPath ?? _originalPhotoPath;
+        if (content != null && originalPhotoPath != null) {
+          _portrait =
+              portrait?.recommendationId == content.recommendationId
+                  ? portrait
+                  : null;
+          _content = content;
+          _originalPhotoPath = originalPhotoPath;
+        }
         _nextSlotAt = nextSlotAt ?? _nextSlotAt;
         _date = date ?? _date;
         _message = message;
@@ -864,7 +888,8 @@ class _BloomHomePageState extends State<BloomHomePage>
       return;
     }
     if (state != AppLifecycleState.resumed) return;
-    final away = _pausedAt == null ? null : DateTime.now().difference(_pausedAt!);
+    final away =
+        _pausedAt == null ? null : DateTime.now().difference(_pausedAt!);
     _pausedAt = null;
     // `null` means this is the resume that every cold start produces (the first
     // `_load` is already running), and a blink shorter than this is the
@@ -998,14 +1023,15 @@ class _BloomHomePageState extends State<BloomHomePage>
     final credentials = _credentials;
     final result = await Navigator.of(context).push<AuthResult>(
       MaterialPageRoute(
-        builder: (_) => BloomAuthPage(
-          auth: _auth,
-          // 登录时顺带上报本机，服务端据此把这台手机认领到账号下 ——
-          // 这就是"激活码"那套机制的替代品。
-          device: credentials == null ? null : _claimFor(credentials),
-          onCancel: () => Navigator.of(context).pop(),
-          onSignedIn: (value) => Navigator.of(context).pop(value),
-        ),
+        builder:
+            (_) => BloomAuthPage(
+              auth: _auth,
+              // 登录时顺带上报本机，服务端据此把这台手机认领到账号下 ——
+              // 这就是"激活码"那套机制的替代品。
+              device: credentials == null ? null : _claimFor(credentials),
+              onCancel: () => Navigator.of(context).pop(),
+              onSignedIn: (value) => Navigator.of(context).pop(value),
+            ),
       ),
     );
     if (!mounted || result == null) return;
@@ -1091,6 +1117,7 @@ class _BloomHomePageState extends State<BloomHomePage>
       context,
       device: device,
       preferences: _displayPreferences,
+      userToken: _auth.token,
       settings: _displaySettings,
       credentials: credentials,
       // The app writes with the token it holds, so the caller is the app's own
@@ -1138,7 +1165,7 @@ class _BloomHomePageState extends State<BloomHomePage>
     if (credentials == null) return;
     final repository = DailyContentRepository(api: _api);
     try {
-      if (settings.mode == BloomDisplayMode.carousel) {
+      if (settings.usesScheduledPlan) {
         await repository.syncCarousel(
           credentials,
           settings,
@@ -1149,7 +1176,9 @@ class _BloomHomePageState extends State<BloomHomePage>
         final at = await repository.nextSlotAtMillis();
         if (!mounted) return;
         setState(() => _nextSlotAt = at);
-        debugPrint('[BloomUI] resynced (carousel) after save: next=${at ?? 'none'}');
+        debugPrint(
+          '[BloomUI] resynced (carousel) after save: next=${at ?? 'none'}',
+        );
       } else {
         await repository.sync(credentials);
         if (!mounted) return;
@@ -1168,7 +1197,6 @@ class _BloomHomePageState extends State<BloomHomePage>
       debugPrint('[BloomUI] resync after save failed (ignored): $error');
     }
   }
-
 
   /// A mode change made **on a device's own detail page**.
   ///
@@ -1223,9 +1251,9 @@ class _BloomHomePageState extends State<BloomHomePage>
       final portrait = await repository.cached('portrait');
       final square = await repository.cached('square');
       final largeSquare = await repository.cached('largeSquare');
-      final originalPhotoPath =
-          await repository.photoPathFor(content.recommendationId) ??
-          await repository.originalPhotoPath();
+      final originalPhotoPath = await repository.photoPathFor(
+        content.recommendationId,
+      );
       await _evictOriginalPhoto(originalPhotoPath);
       await _evictPreviewImages([portrait, square, largeSquare]);
       if (portrait != null) {
@@ -1246,9 +1274,14 @@ class _BloomHomePageState extends State<BloomHomePage>
       await _precacheIncoming(originalPhotoPath);
       if (!mounted) return;
       setState(() {
-        _portrait = portrait ?? _portrait;
-        _content = content;
-        _originalPhotoPath = originalPhotoPath ?? _originalPhotoPath;
+        if (originalPhotoPath != null) {
+          _portrait =
+              portrait?.recommendationId == content.recommendationId
+                  ? portrait
+                  : null;
+          _content = content;
+          _originalPhotoPath = originalPhotoPath;
+        }
         _date = content.date;
       });
       await HapticFeedback.mediumImpact();
@@ -1321,7 +1354,6 @@ class _BloomHomePageState extends State<BloomHomePage>
     });
   }
 
-
   /// Re-reads the next-slot stamp while a sync is running, so "下次更新" can appear
   /// as soon as the plan is known rather than at the end of the batch.
   Future<void> _watchNextSlot(DailyContentRepository repository) async {
@@ -1338,10 +1370,44 @@ class _BloomHomePageState extends State<BloomHomePage>
     }
   }
 
+  Future<void> _galleryContentChanged(String deviceId) async {
+    final credentials = _credentials;
+    if (credentials == null || credentials.deviceId != deviceId) return;
+    final settings = await DisplayPreferences().readServer(
+      credentials: credentials,
+      target: BloomApiClient.settingsTargetMobile,
+      api: _api,
+    );
+    if (settings == null) return;
+    await DisplayPreferences().cacheLocal(settings);
+    await configureBackgroundSync(settings);
+    if (mounted) setState(() => _displaySettings = settings);
+    // Rendering and prefetch are separate from the selection save.
+    unawaited(_load());
+  }
+
   @override
   Widget build(BuildContext context) => BloomGlassHome(
     loading: _loading,
     nextLoading: _nextLoading,
+    discoverPage: BloomDiscoverPage(
+      api: _api,
+      userToken: _auth.token,
+      session: GallerySession(
+        onContentChanged: _galleryContentChanged,
+        token: () => _auth.token,
+        frames:
+            () => [
+              for (final d in bloomDevicesFromRemote(_remoteDevices))
+                GalleryFrame(d.deviceId, d.name, isMobile: !d.isFrame),
+            ],
+      ),
+      frames: [
+        for (final d in bloomDevicesFromRemote(_remoteDevices))
+          GalleryFrame(d.deviceId, d.name, isMobile: !d.isFrame),
+      ],
+      onSignIn: _openAuth,
+    ),
     selectedTab: _selectedTab,
     credentials: _credentials,
     portrait: _portrait,
@@ -1353,7 +1419,8 @@ class _BloomHomePageState extends State<BloomHomePage>
     devices: _devices,
     nextSlotAt: _nextSlotAt,
     widgetEnabled: _widgetEnabled,
-    onWidgetEnabledChanged: (enabled) => setState(() => _widgetEnabled = enabled),
+    onWidgetEnabledChanged:
+        (enabled) => setState(() => _widgetEnabled = enabled),
     selectedDeviceId: _photoDevice?.deviceId,
     onTabChanged: _changeTab,
     onRefresh: _load,

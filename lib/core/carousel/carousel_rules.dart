@@ -182,7 +182,7 @@ List<PhotoEntry> retainPhotos({
 ///
 /// 它限制的是**照片预取与时间线烘焙的深度**（计划本身永远是全天全量），
 /// 与旧实现的 `batch_limit = 4` 不是一回事：后者限制的是**计划元数据的分页
-/// 大小**，那是相框固件的照片缓存深度，被误用到了接口上。
+/// 大小**；相框只预存一张未来照片，不能从批次大小推断照片缓存深度。
 ///
 /// **这个数字直接决定冷启动、以及每次补货要下多少张。** 它同时也是"App 不在
 /// 跑时小组件还能自己走多久"，但那个方向的收益**远远不及**它的代价：
@@ -199,7 +199,11 @@ List<PhotoEntry> retainPhotos({
 const int kTimelineBakeDepth = 4;
 
 /// 取栅格中接下来的 [depth] 个格子（严格晚于 [nowMs]）。
-List<Slot> upcomingSlots(Iterable<Slot> grid, int nowMs, {int depth = kTimelineBakeDepth}) {
+List<Slot> upcomingSlots(
+  Iterable<Slot> grid,
+  int nowMs, {
+  int depth = kTimelineBakeDepth,
+}) {
   final future = [
     for (final slot in grid)
       if (slot.slotAtMs > nowMs) slot,

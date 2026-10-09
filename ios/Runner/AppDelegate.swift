@@ -468,6 +468,7 @@ import workmanager
         let defaults = UserDefaults(suiteName: Self.bloomAppGroup)
         result([
           "mode": defaults?.string(forKey: "bloom.display_mode") ?? "recommend",
+          "sources": defaults?.stringArray(forKey: "bloom.content_sources") ?? ["personal"],
           "intervalMinutes": defaults?.integer(forKey: "bloom.carousel_interval_minutes") ?? 1440,
           "activeStart": defaults?.string(forKey: "bloom.carousel_active_start") ?? "06:00",
           "activeEnd": defaults?.string(forKey: "bloom.carousel_active_end") ?? "22:00",
@@ -481,6 +482,8 @@ import workmanager
           return
         }
         defaults.set(arguments["mode"], forKey: "bloom.display_mode")
+        defaults.set(arguments["sources"], forKey: "bloom.content_sources")
+        defaults.set(arguments["usesScheduledPlan"], forKey: "bloom.scheduled_plan")
         defaults.set(arguments["intervalMinutes"], forKey: "bloom.carousel_interval_minutes")
         defaults.set(arguments["activeStart"], forKey: "bloom.carousel_active_start")
         defaults.set(arguments["activeEnd"], forKey: "bloom.carousel_active_end")
@@ -536,12 +539,13 @@ import workmanager
     // 现在与小组件走**同一条规则、同一份数据**：共享状态里 `date_ms <= now`
     // 的最后一条。照片与文案取自**同一条目**，错配在结构上就不可能发生。
     // 安卓原生读的也是这份状态，三端因此同源。
-    if mode == "carousel",
+    if (mode == "carousel" || defaults.bool(forKey: "bloom.scheduled_plan")),
        let shared = BloomSharedState.load(),
        let due = BloomCarouselRule.currentEntry(
          BloomSharedState.timelineEntries(shared),
          nowMillis: Date().timeIntervalSince1970 * 1000
        ) {
+      state["mode"] = "carousel"
       state["recommendationId"] = (due["item_id"] as? NSNumber)?.intValue ?? 0
       put("originalPhotoPath", due["original_path"] as? String)
       put("portraitPath", due["portrait_path"] as? String)

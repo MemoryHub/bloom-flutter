@@ -157,7 +157,8 @@ private enum BloomWidgetRemoteLoader {
       return ([cachedEntry(family: family)], missingCredentialsNext)
     }
 
-    let mode = defaults.string(forKey: "bloom.display_mode") ?? "recommend"
+    let selectionMode = defaults.string(forKey: "bloom.display_mode") ?? "recommend"
+    let mode = defaults.bool(forKey: "bloom.scheduled_plan") ? "carousel" : selectionMode
     let appEntry = freshAppCompositeEntry(family: family, defaults: defaults)
     do {
       if mode == "carousel" {

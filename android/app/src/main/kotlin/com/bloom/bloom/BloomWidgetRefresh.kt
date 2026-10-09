@@ -62,7 +62,7 @@ object BloomWidgetRefresh {
             .getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
             .getString("flutter.bloom.display_mode", null)
         Log.i(TAG, "Preparing carousel recovery after restart mode=$mode")
-        if (mode != "carousel") return
+        if (mode != "carousel" && !context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE).getBoolean("flutter.bloom.scheduled_plan", false)) return
 
         // Carousel refill alarms replace the generic 15-minute worker. The
         // two schedules running together were the source of overlapping Dart

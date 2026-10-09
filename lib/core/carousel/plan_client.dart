@@ -1,7 +1,7 @@
 /// 全天计划拉取。
 ///
 /// 与旧实现的根本区别：**一次性取回整天的计划栅格**，不再用 4 条的批次窗口
-/// 去推导「下一格」。4 条是相框固件的照片缓存深度，与计划元数据无关。
+/// 去推导「下一格」。4 条是相框计划元数据的批次大小；相框只预存一张未来照片。
 ///
 /// **服务端不必先升级，但也不能假设它宽容。** 曾经这里写着「尚未放开的服务端
 /// 会按自己的上限返回并置 has_more」——那是错的：旧服务端把 `batch_limit`
@@ -70,8 +70,8 @@ class CarouselPlanClient {
 
   /// 旧服务端接受的上限。
   ///
-  /// 4 是相框固件的照片缓存深度（`BLOOM_CAROUSEL_BATCH_MAX`），曾被误用成
-  /// 计划接口的校验上限。新服务端已把上限放开，但客户端不能假设它一定升过级。
+  /// 4 是旧计划接口的批次上限，不是照片缓存数量。
+  /// 新服务端已把上限放开，但客户端不能假设它一定升过级。
   static const int legacyPageSize = 4;
 
   /// 循环上限，防止服务端异常时无限翻页。
@@ -85,8 +85,9 @@ class CarouselPlanClient {
   /// 的全部格子」——这正是计算「下次更新」与预取下一张所需的全部信息。
   Future<FullPlan> fetchFullDay(
     DeviceCredentials credentials,
-    BloomDisplaySettings settings,
-  ) async {
+    BloomDisplaySettings settings, {
+    List<int>? cachedItemIds,
+  }) async {
     final slots = <int, Slot>{};
     final content = <int, CarouselItemContent>{};
     int? cursor;
@@ -109,6 +110,7 @@ class CarouselPlanClient {
           settings,
           batchLimit: limit,
           afterItemId: cursor,
+          cachedItemIds: cachedItemIds,
         );
       } on BloomApiException catch (error) {
         // 400/422 = 服务端不认这个上限（旧服务端是 Pydantic 的 le=4）。
@@ -150,8 +152,8 @@ class CarouselPlanClient {
       cursor = lastItemId;
     }
 
-    final grid = slots.values.toList()
-      ..sort((a, b) => a.slotAtMs.compareTo(b.slotAtMs));
+    final grid =
+        slots.values.toList()..sort((a, b) => a.slotAtMs.compareTo(b.slotAtMs));
 
     return FullPlan(
       identity: PlanIdentity(

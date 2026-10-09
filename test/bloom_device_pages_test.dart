@@ -85,7 +85,10 @@ void main() {
     },
     'purged_plans': 1,
     'next_check_at':
-        DateTime.now().add(const Duration(minutes: 30)).toUtc().toIso8601String(),
+        DateTime.now()
+            .add(const Duration(minutes: 30))
+            .toUtc()
+            .toIso8601String(),
   };
 
   /// Stub for both endpoints the detail page uses. `settings/get` answers with
@@ -132,8 +135,7 @@ void main() {
             'updated_at': '2026-09-21T10:00:00+08:00',
           },
           'allowed_interval_minutes': BloomDisplaySettings.allowedIntervals,
-          'next_check_at':
-              '2026-09-21T10:30:00+08:00',
+          'next_check_at': '2026-09-21T10:30:00+08:00',
         }),
         200,
         headers: jsonHeaders,
@@ -208,9 +210,10 @@ void main() {
       deviceType: type,
       enabled: true,
       lastSeenAt: lastSeen,
-      settings: intervalMinutes == null
-          ? null
-          : UserDeviceSettings(intervalMinutes: intervalMinutes),
+      settings:
+          intervalMinutes == null
+              ? null
+              : UserDeviceSettings(intervalMinutes: intervalMinutes),
     );
 
     test('只把本机那一行标成 isLocal', () {
@@ -237,11 +240,7 @@ void main() {
       final devices = bloomDevicesFromRemote(
         [
           remote(id: credentials.deviceId, type: 'mobile'),
-          remote(
-            id: 'other-phone',
-            type: 'mobile',
-            lastSeen: DateTime.now(),
-          ),
+          remote(id: 'other-phone', type: 'mobile', lastSeen: DateTime.now()),
         ],
         localDeviceId: credentials.deviceId,
         localOnline: false,
@@ -256,24 +255,20 @@ void main() {
       // 成"离线"，而这个提示长期不准之后用户就再也不看它了。
       final justNow = DateTime.now();
 
-      final freshWithLongInterval = bloomDevicesFromRemote(
-        [
-          remote(
-            lastSeen: justNow.subtract(const Duration(minutes: 40)),
-            intervalMinutes: 60,
-          ),
-        ],
-      );
+      final freshWithLongInterval = bloomDevicesFromRemote([
+        remote(
+          lastSeen: justNow.subtract(const Duration(minutes: 40)),
+          intervalMinutes: 60,
+        ),
+      ]);
       expect(freshWithLongInterval.single.isOnline, isTrue);
 
-      final stale = bloomDevicesFromRemote(
-        [
-          remote(
-            lastSeen: justNow.subtract(const Duration(hours: 5)),
-            intervalMinutes: 60,
-          ),
-        ],
-      );
+      final stale = bloomDevicesFromRemote([
+        remote(
+          lastSeen: justNow.subtract(const Duration(hours: 5)),
+          intervalMinutes: 60,
+        ),
+      ]);
       expect(stale.single.isOnline, isFalse);
     });
 
@@ -302,10 +297,7 @@ void main() {
           client: MockClient((_) async => http.Response('{}', 200)),
         ),
       );
-      final devices = bloomDevices(
-        credentials: credentials,
-        localOnline: true,
-      );
+      final devices = bloomDevices(credentials: credentials, localOnline: true);
 
       await tester.pumpWidget(
         MaterialApp(
@@ -362,9 +354,7 @@ void main() {
       expect(find.text(bloomBundledFrame.deviceId), findsOneWidget);
     });
 
-    testWidgets('设备是一个 tile：小字「类型 · 状态」在上，大字号名字在下（参考图布局）', (
-      tester,
-    ) async {
+    testWidgets('设备是一个 tile：小字「类型 · 状态」在上，大字号名字在下（参考图布局）', (tester) async {
       SharedPreferences.setMockInitialValues(<String, Object>{});
       await tester.pumpWidget(
         MaterialApp(
@@ -435,9 +425,7 @@ void main() {
       });
       final requests = <http.Request>[];
       // The frame's own record: 每天一次, 轮播.
-      final client = BloomApiClient(
-        client: settingsServer(requests: requests),
-      );
+      final client = BloomApiClient(client: settingsServer(requests: requests));
 
       await tester.pumpWidget(
         detail(
@@ -453,7 +441,10 @@ void main() {
       await settle(tester);
 
       // The page read the frame's `eink` record on open.
-      expect(jsonDecode(reads(requests).single.body), {'target': 'eink'});
+      expect(jsonDecode(reads(requests).single.body), {
+        'target': 'eink',
+        'caller_device_id': credentials.deviceId,
+      });
 
       await tester.ensureVisible(
         find.byKey(const ValueKey('bloom-interval-dropdown')),
@@ -468,9 +459,10 @@ void main() {
       expect(writes(requests), hasLength(1));
       expect(
         writes(requests).single.url.path,
-        '/api/frame/devices/bloom-mobile-test/carousel/settings/set',
+        '/api/frame/devices/${bloomBundledFrame.deviceId}/carousel/settings/set',
       );
-      final body = jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
+      final body =
+          jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
       expect(body['interval_minutes'], 120);
       expect(body['target'], 'eink');
       expect(body['caller_device_id'], credentials.deviceId);
@@ -544,7 +536,8 @@ void main() {
       // The merge is UI-only: the API still stores a window as two fields, and
       // 全天 is 23:59 rather than 00:00 because the server's rule is a strict
       // `active_start < active_end`.
-      final body = jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
+      final body =
+          jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
       expect(body['active_start'], '00:00');
       expect(body['active_end'], '23:59');
       // (The cadence in the body is the server's own record — this page reads it
@@ -590,7 +583,8 @@ void main() {
       await settle(tester);
 
       expect(writes(requests), hasLength(1));
-      final body = jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
+      final body =
+          jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
       expect(body['target'], 'mobile');
       expect(body['interval_minutes'], 60);
       // The user never mentioned the mode, so the request carries none and the
@@ -678,9 +672,7 @@ void main() {
       expect(find.textContaining('同一账号'), findsOneWidget);
     });
 
-    testWidgets('当前值 45 不在 6 档里 → 打开不崩溃，菜单里有「每45分钟」且能保存', (
-      tester,
-    ) async {
+    testWidgets('当前值 45 不在 6 档里 → 打开不崩溃，菜单里有「每45分钟」且能保存', (tester) async {
       SharedPreferences.setMockInitialValues(<String, Object>{});
       final requests = <http.Request>[];
       // The server has no record at all here, so the page keeps the value it
@@ -741,7 +733,8 @@ void main() {
       await settle(tester);
 
       expect(writes(requests), hasLength(1));
-      final body = jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
+      final body =
+          jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
       // The out-of-tier value survives untouched; nothing rewrites it to 1440.
       expect(body['interval_minutes'], 45);
     });
@@ -769,9 +762,12 @@ void main() {
       await settle(tester);
 
       expect(find.text('照片来源'), findsOneWidget);
-      expect(find.byKey(const ValueKey('bloom-source-personal')), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('bloom-source-personal')),
+        findsOneWidget,
+      );
       // 还没实现的三个名字一个都不该出现。
-      expect(find.byKey(const ValueKey('bloom-source-art')), findsNothing);
+      expect(find.byKey(const ValueKey('bloom-source-art')), findsOneWidget);
       expect(find.byKey(const ValueKey('bloom-source-news')), findsNothing);
       expect(find.byKey(const ValueKey('bloom-source-widget')), findsNothing);
     });
@@ -802,13 +798,12 @@ void main() {
       await settle(tester);
 
       // ① 不立刻发请求。
-      expect(
-        writes(requests).length,
-        before,
-        reason: '点来源应当只改草稿，等「保存」',
-      );
+      expect(writes(requests).length, before, reason: '点来源应当只改草稿，等「保存」');
       // ② 唯一选中的那个取消不掉 —— 框还应当是勾着的。
-      expect(find.byKey(const ValueKey('bloom-source-personal')), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('bloom-source-personal')),
+        findsOneWidget,
+      );
     });
 
     testWidgets('打开时没碰来源 -> 请求里【不含】sources 这个键', (tester) async {
@@ -838,9 +833,9 @@ void main() {
       await tester.tap(find.text('保存'), warnIfMissed: false);
       await settle(tester);
 
-      final body = jsonDecode(writes(requests).last.body) as Map<String, dynamic>;
-      expect(body.containsKey('sources'), isFalse,
-          reason: '没碰来源就不该发送这个键');
+      final body =
+          jsonDecode(writes(requests).last.body) as Map<String, dynamic>;
+      expect(body.containsKey('sources'), isFalse, reason: '没碰来源就不该发送这个键');
     });
 
     testWidgets('⭐ 推荐模式下碰过来源 → 「保存」出现，并且真的把它送出去', (tester) async {
@@ -881,18 +876,15 @@ void main() {
       await settle(tester);
 
       // 碰过之后必须出现，否则这次改动永远送不出去。
-      expect(
-        find.text('保存'),
-        findsOneWidget,
-        reason: '推荐模式下改了来源也必须有办法提交',
-      );
+      expect(find.text('保存'), findsOneWidget, reason: '推荐模式下改了来源也必须有办法提交');
       expect(writes(requests), isEmpty, reason: '来源是表单，点它不该立刻发请求');
 
       await tester.tap(find.text('保存'), warnIfMissed: false);
       await settle(tester);
 
       expect(writes(requests), hasLength(1));
-      final body = jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
+      final body =
+          jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
       expect(body['mode'], isNull, reason: '没碰模式就不该带 mode');
       expect(body['sources'], [
         {'name': 'art', 'weight': 1},
@@ -931,7 +923,7 @@ void main() {
         findsOneWidget,
         reason: '服务器说来源是 art，personal 就不该显示成已选中',
       );
-      expect(find.byIcon(Icons.check_box_rounded), findsNothing);
+      expect(find.byIcon(Icons.check_box_rounded), findsOneWidget);
     });
   });
 
@@ -967,7 +959,10 @@ void main() {
       expect(find.text('轮播'), findsOneWidget);
 
       // 胶囊现在是【真控件】：点另一段必须发出一次写请求。
-      expect(find.byKey(const ValueKey('bloom-mode-recommend')), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('bloom-mode-recommend')),
+        findsOneWidget,
+      );
       await tester.tap(find.byKey(const ValueKey('bloom-mode-recommend')));
       await settle(tester);
 
@@ -1082,7 +1077,6 @@ void main() {
       expect(find.text('生效时间'), findsWidgets);
     });
 
-
     testWidgets('本机点「推荐模式」→ 立刻发请求（target=mobile、mode=recommend）并写本地镜像', (
       tester,
     ) async {
@@ -1119,7 +1113,8 @@ void main() {
         hasLength(1),
         reason: '点模式必须立刻走 settings/set，而不是等保存',
       );
-      final body = jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
+      final body =
+          jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
       expect(body['target'], 'mobile');
       // 服务器与本地镜像现在【同一个拼写】，两边都是 `recommend`。
       // 间隔随同一个请求走 —— 而推荐模式的间隔是固定值（12 小时），
@@ -1145,10 +1140,7 @@ void main() {
       final client = BloomApiClient(
         client: settingsServer(requests: requests, mode: 'carousel'),
       );
-      final preferences = _RecordingPreferences(
-        api: client,
-        events: events,
-      );
+      final preferences = _RecordingPreferences(api: client, events: events);
 
       await tester.pumpWidget(
         detail(
@@ -1175,9 +1167,7 @@ void main() {
       expect(prefs.getString('bloom.display_mode'), 'recommend');
     });
 
-    testWidgets('档位改动留在草稿里；点模式则立即把两者一起提交（服务器不会拿到新模式的旧档位）', (
-      tester,
-    ) async {
+    testWidgets('档位改动留在草稿里；点模式则立即把两者一起提交（服务器不会拿到新模式的旧档位）', (tester) async {
       useTallWindow(tester);
       SharedPreferences.setMockInitialValues(Map<String, Object>.from(mirror));
       final requests = <http.Request>[];
@@ -1219,7 +1209,8 @@ void main() {
       await settle(tester);
 
       expect(writes(requests), hasLength(1));
-      final body = jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
+      final body =
+          jsonDecode(writes(requests).single.body) as Map<String, dynamic>;
       // 推荐模式带着自己的【固定作息】过来，所以这里不是刚才在界面上点的 120。
       // 测试的原意仍然成立：服务器拿到的是"与新模式相配"的档位，而绝不是
       // 新模式配旧档位。
@@ -1291,7 +1282,10 @@ void main() {
       );
       await settle(tester);
       final frameRead = reads(frameRequests).single;
-      expect(jsonDecode(frameRead.body), {'target': 'eink'});
+      expect(jsonDecode(frameRead.body), {
+        'target': 'eink',
+        'caller_device_id': credentials.deviceId,
+      });
 
       // Tear the frame page down first: pumping another `BloomDeviceDetailPage`
       // straight away would reuse its `State` (same type, same position) and
@@ -1317,11 +1311,9 @@ void main() {
 
       // Same endpoint (the target is a body field, not a path segment), two
       // different records.
-      expect(frameRead.url.path, localRead.url.path);
-      expect(
-        jsonDecode(frameRead.body),
-        isNot(jsonDecode(localRead.body)),
-      );
+      expect(frameRead.url.path, contains(bloomBundledFrame.deviceId));
+      expect(localRead.url.path, contains(credentials.deviceId));
+      expect(jsonDecode(frameRead.body), isNot(jsonDecode(localRead.body)));
     });
 
     test('mode 全线同一个拼写；旧安装里的 recommendation 仍能读出来', () {
@@ -1539,11 +1531,7 @@ void main() {
       await settle(tester);
 
       final label = find.byKey(const ValueKey('bloom-next-slot'));
-      expect(
-        label,
-        findsOneWidget,
-        reason: '推荐的节奏由固定作息唯一决定，冷启动就该有这一行',
-      );
+      expect(label, findsOneWidget, reason: '推荐的节奏由固定作息唯一决定，冷启动就该有这一行');
       expect(tester.widget<Text>(label).data ?? '', startsWith('下次更新 '));
 
       await tester.pumpWidget(const SizedBox());
@@ -1553,10 +1541,7 @@ void main() {
   group('首页设备切换', () {
     testWidgets('默认显示本机照片，切到相框时不假装能取到它的照片', (tester) async {
       SharedPreferences.setMockInitialValues(<String, Object>{});
-      final devices = bloomDevices(
-        credentials: credentials,
-        localOnline: true,
-      );
+      final devices = bloomDevices(credentials: credentials, localOnline: true);
       final frame = devices.firstWhere((device) => device.isFrame);
       var selectedId = devices.firstWhere((device) => device.isLocal).deviceId;
 

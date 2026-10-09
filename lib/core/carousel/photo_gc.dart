@@ -20,10 +20,13 @@ import 'dart:io';
 /// iOS 扩展自己管理的 `ios-widget-remote-*.jpg`、`widget-timeline.log`，以及各种
 /// `.json` 也都不在范围内。
 final RegExp _originalFile = RegExp(r'^carousel-original-\d+\.photo$');
+final RegExp _markerFile = RegExp(r'^mobile-render-\d+\.json$');
 final RegExp _renderedFile = RegExp(r'^mobile-local-[A-Za-z]+-\d+\.png$');
 
 bool isOwnedPhotoFile(String name) =>
-    _originalFile.hasMatch(name) || _renderedFile.hasMatch(name);
+    _originalFile.hasMatch(name) ||
+    _renderedFile.hasMatch(name) ||
+    _markerFile.hasMatch(name);
 
 /// 删除 [dir] 中所有属于本项目命名、但不在 [alivePaths] 里的文件。
 ///
@@ -32,13 +35,36 @@ bool isOwnedPhotoFile(String name) =>
 Future<int> sweepOrphanPhotos({
   required Directory dir,
   required Iterable<String> alivePaths,
+  Duration minimumAge = Duration.zero,
 }) async {
-  final alive = alivePaths.where((path) => path.isNotEmpty).toSet();
+  // App Group paths may use /var or /private/var aliases on iOS.
+  final alive = <String>{};
+  for (final path in alivePaths.where((p) => p.isNotEmpty)) {
+    alive.add(path);
+    try {
+      alive.add(await File(path).resolveSymbolicLinks());
+    } catch (_) {}
+  }
   var swept = 0;
   await for (final entity in dir.list()) {
     if (entity is! File) continue;
     if (!isOwnedPhotoFile(entity.uri.pathSegments.last)) continue;
+    if (minimumAge > Duration.zero &&
+        DateTime.now().difference((await entity.stat()).modified) <
+            minimumAge) {
+      continue;
+    }
+    final id = RegExp(
+      r'-(\d+)\.(?:photo|png|json)$',
+    ).firstMatch(entity.path)?.group(1);
+    if (id != null &&
+        await File('${dir.path}/photo-prepare-$id.lock').exists()) {
+      continue;
+    }
     if (alive.contains(entity.path)) continue;
+    try {
+      if (alive.contains(await entity.resolveSymbolicLinks())) continue;
+    } catch (_) {}
     try {
       await entity.delete();
       swept++;

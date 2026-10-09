@@ -91,11 +91,7 @@ class PlanIdentity {
     final settingsHash = raw['settings_hash'] as String?;
     final day = raw['day'] as String?;
     if (planId == null || settingsHash == null || day == null) return null;
-    return PlanIdentity(
-      planId: planId,
-      settingsHash: settingsHash,
-      day: day,
-    );
+    return PlanIdentity(planId: planId, settingsHash: settingsHash, day: day);
   }
 
   @override
@@ -205,6 +201,9 @@ class TimelineEntry {
     this.captionEn,
     this.capturedDateText,
     this.locationText,
+    this.sourceName = 'personal',
+    this.artwork = const {},
+    this.photoMetadata = const {},
   });
 
   /// 该格应当上屏的时刻（UTC 纪元毫秒）。
@@ -225,10 +224,12 @@ class TimelineEntry {
   final String? captionEn;
   final String? capturedDateText;
   final String? locationText;
+  final String sourceName;
+  final Map<String, dynamic> artwork;
+  final Map<String, dynamic> photoMetadata;
 
   /// 该条目的照片是否真的在本地。
-  bool get hasPhoto =>
-      portraitPath.isNotEmpty || originalPath.isNotEmpty;
+  bool get hasPhoto => portraitPath.isNotEmpty || originalPath.isNotEmpty;
 
   Map<String, Object?> toJson() => {
     'date_ms': dateMs,
@@ -242,6 +243,9 @@ class TimelineEntry {
     'caption_en': captionEn,
     'captured_date_text': capturedDateText,
     'location_text': locationText,
+    'source_name': sourceName,
+    'content_snapshot': artwork,
+    'photo_metadata': photoMetadata,
   };
 
   static TimelineEntry? fromJson(Object? raw) {
@@ -261,6 +265,13 @@ class TimelineEntry {
       captionEn: raw['caption_en'] as String?,
       capturedDateText: raw['captured_date_text'] as String?,
       locationText: raw['location_text'] as String?,
+      sourceName: raw['source_name'] as String? ?? 'personal',
+      photoMetadata: Map<String, dynamic>.from(
+        raw['photo_metadata'] as Map? ?? const {},
+      ),
+      artwork: Map<String, dynamic>.from(
+        raw['content_snapshot'] as Map? ?? const {},
+      ),
     );
   }
 }
@@ -344,8 +355,11 @@ class CarouselState {
       currentItemId:
           clearCurrentSlot ? null : (currentItemId ?? this.currentItemId),
       currentPhotoPath:
-          clearCurrentPhoto ? null : (currentPhotoPath ?? this.currentPhotoPath),
-      previousItemId: clearPrevious ? null : (previousItemId ?? this.previousItemId),
+          clearCurrentPhoto
+              ? null
+              : (currentPhotoPath ?? this.currentPhotoPath),
+      previousItemId:
+          clearPrevious ? null : (previousItemId ?? this.previousItemId),
       previousPhotoPath:
           clearPrevious ? null : (previousPhotoPath ?? this.previousPhotoPath),
       status: status ?? this.status,
@@ -392,7 +406,9 @@ class CarouselState {
       previousPhotoPath: raw['previous_photo_path'] as String?,
       status: CurrentStatus.fromWire(raw['current_status'] as String?),
       nextSlotAtMs: (raw['next_slot_at_ms'] as num?)?.toInt(),
-      nextSlotSource: NextSlotSource.fromWire(raw['next_slot_source'] as String?),
+      nextSlotSource: NextSlotSource.fromWire(
+        raw['next_slot_source'] as String?,
+      ),
       photos: [
         for (final entry in (raw['photos'] as List? ?? const []))
           if (PhotoEntry.fromJson(entry) != null) PhotoEntry.fromJson(entry)!,

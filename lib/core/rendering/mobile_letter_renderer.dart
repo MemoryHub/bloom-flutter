@@ -3,6 +3,7 @@ import 'dart:ui' as ui;
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../models/device_models.dart';
+import 'mobile_artwork_renderer.dart';
 
 /// Renders the same photo + letter composition for the app and all widgets.
 class MobileLetterRenderer {
@@ -17,6 +18,9 @@ class MobileLetterRenderer {
     DailyContent content,
     String family,
   ) async {
+    if (content.sourceName == 'art') {
+      return MobileArtworkRenderer.render(bytes, content, family);
+    }
     final size = sizes[family] ?? sizes['portrait']!;
     final photoHeight = size.height * .75;
     // Decode near the actual widget resolution. A phone photo can otherwise

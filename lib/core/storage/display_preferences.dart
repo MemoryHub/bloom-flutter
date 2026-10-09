@@ -19,7 +19,7 @@ enum BloomPhotoSource {
   personal('personal', '我的照片'),
 
   /// 名画 / 油画。服务器已登记，取片能力待实现。
-  art('art', '名画'),
+  art('art', '艺术作品'),
 
   /// 新闻图片。服务器已登记，取片能力待实现。
   news('news', '新闻'),
@@ -38,7 +38,10 @@ enum BloomPhotoSource {
 
   /// 服务器【真正能取到照片】的来源。UI 只应该给出这些选项 ——
   /// 给出还没实现的来源，用户设完之后相框毫无变化，就是"设了没反应"。
-  static const implemented = <BloomPhotoSource>[BloomPhotoSource.personal];
+  static const implemented = <BloomPhotoSource>[
+    BloomPhotoSource.personal,
+    BloomPhotoSource.art,
+  ];
 
   /// 从协议值解析；认不出来返回 null（调用方当作"保持现状"）。
   static BloomPhotoSource? fromWire(String? value) {
@@ -161,6 +164,7 @@ class BloomDisplaySettings {
     // 默认只有一个来源 —— personal 是目前唯一真正取得出照片的来源，
     // 与服务器 carousel.SUPPORTED_SOURCES / IMPLEMENTED_SOURCES 保持一致。
     this.sources = const <BloomPhotoSource>[BloomPhotoSource.personal],
+    this.sourceWeights = const <String, double>{},
     this.intervalMinutes = 1440,
     this.activeStart = '06:00',
     this.activeEnd = '22:00',
@@ -214,7 +218,14 @@ class BloomDisplaySettings {
   ///
   /// 与 mode 正交：sources 决定"从哪些池子里取候选"，mode 决定"怎么排序"。
   /// 服务器对四个参数零特例，任何组合都合法。
+  final Map<String, double> sourceWeights;
   final List<BloomPhotoSource> sources;
+
+  /// Art follows the same schedule in both ranking modes. Native widgets read
+  /// the prepared plan; recommendation remains a server selection strategy.
+  bool get usesScheduledPlan =>
+      mode == BloomDisplayMode.carousel ||
+      sources.contains(BloomPhotoSource.art);
   final String activeStart;
   final String activeEnd;
 
@@ -234,6 +245,7 @@ class BloomDisplaySettings {
     BloomDisplayMode? mode,
     int? intervalMinutes,
     List<BloomPhotoSource>? sources,
+    Map<String, double>? sourceWeights,
     String? activeStart,
     String? activeEnd,
     String? timezone,
@@ -244,6 +256,7 @@ class BloomDisplaySettings {
         intervalMinutes != null || activeStart != null || activeEnd != null;
     return BloomDisplaySettings(
       mode: mode ?? this.mode,
+      sourceWeights: sourceWeights ?? this.sourceWeights,
       intervalMinutes: intervalMinutes ?? this.intervalMinutes,
       sources: sources ?? this.sources,
       activeStart: activeStart ?? this.activeStart,
@@ -414,6 +427,7 @@ class DisplayPreferences {
       mode: local.mode,
       intervalMinutes: remote.intervalMinutes,
       sources: BloomDisplaySettings.sourcesFromWire(remote.sources),
+      sourceWeights: remote.sourceWeights,
       activeStart: remote.activeStart,
       activeEnd: remote.activeEnd,
       timezone: remote.timezone,
@@ -452,6 +466,7 @@ class DisplayPreferences {
   Future<BloomDisplaySettings?> readServer({
     required DeviceCredentials credentials,
     required String target,
+    String? deviceId,
     BloomApiClient? api,
   }) async {
     final DeviceCarouselSettingsEnvelope envelope;
@@ -459,6 +474,7 @@ class DisplayPreferences {
       envelope = await (api ?? _api).getDeviceSettings(
         credentials,
         target: target,
+        deviceId: deviceId,
       );
     } catch (_) {
       // Timeout, offline, 403/422/5xx or a malformed payload: the caller keeps
@@ -482,6 +498,7 @@ class DisplayPreferences {
       //    卡片显示的仍是 personal，看起来就像"设了没反应"。
       //    与 [read] 走同一个转换（认不出来的名字跳过，不崩、不清空）。
       sources: BloomDisplaySettings.sourcesFromWire(remote.sources),
+      sourceWeights: remote.sourceWeights,
       intervalMinutes: remote.intervalMinutes,
       activeStart: remote.activeStart,
       activeEnd: remote.activeEnd,
@@ -520,6 +537,7 @@ class DisplayPreferences {
     BloomApiClient? api,
     BloomDisplayMode? mode,
     List<BloomPhotoSource>? sources,
+    String? deviceId,
   }) => (api ?? _api).setDeviceSettings(
     credentials,
     target: target,
@@ -528,10 +546,20 @@ class DisplayPreferences {
     activeEnd: settings.activeEnd,
     intervalMinutes: settings.intervalMinutes,
     callerDeviceId: callerDeviceId,
+    deviceId: deviceId,
     mode: mode == null ? null : bloomModeToWire(mode),
     // null = 用户没碰过来源 -> 请求里不带这个键 -> 服务器保持已存的值。
     // 这与 mode 一字不差的同一规矩。
-    sources: sources == null ? null : bloomSourcesToWire(sources),
+    sources:
+        sources == null
+            ? null
+            : [
+              for (final source in sources)
+                <String, Object?>{
+                  'name': source.wire,
+                  'weight': settings.sourceWeights[source.wire] ?? 1,
+                },
+            ],
   );
 
   /// 记下用户自己的轮播作息（切到推荐之前调用）。
@@ -610,6 +638,9 @@ class DisplayPreferences {
             BloomDisplaySettings.isValidIntervalMinutes(interval)
                 ? interval
                 : 1440,
+        sources: BloomDisplaySettings.sourcesFromWire(
+          (values['sources'] as List? ?? ['personal']).cast<String>(),
+        ),
         activeStart: values['activeStart'] as String? ?? '06:00',
         activeEnd: values['activeEnd'] as String? ?? '22:00',
       );
@@ -626,6 +657,9 @@ class DisplayPreferences {
           BloomDisplaySettings.isValidIntervalMinutes(interval)
               ? interval
               : 1440,
+      sources: BloomDisplaySettings.sourcesFromWire(
+        prefs.getStringList('bloom.content_sources') ?? ['personal'],
+      ),
       activeStart: prefs.getString(startKey) ?? '06:00',
       activeEnd: prefs.getString(endKey) ?? '22:00',
     );
@@ -648,6 +682,8 @@ class DisplayPreferences {
             settings.mode == BloomDisplayMode.carousel
                 ? 'carousel'
                 : 'recommend',
+        sources: settings.sources.map((s) => s.wire).toList(),
+        usesScheduledPlan: settings.usesScheduledPlan,
         intervalMinutes: settings.intervalMinutes,
         activeStart: settings.activeStart,
         activeEnd: settings.activeEnd,
@@ -659,6 +695,11 @@ class DisplayPreferences {
       modeKey,
       settings.mode == BloomDisplayMode.carousel ? 'carousel' : 'recommend',
     );
+    await prefs.setStringList(
+      'bloom.content_sources',
+      settings.sources.map((s) => s.wire).toList(),
+    );
+    await prefs.setBool('bloom.scheduled_plan', settings.usesScheduledPlan);
     await prefs.setInt(intervalKey, settings.intervalMinutes);
     await prefs.setString(startKey, settings.activeStart);
     await prefs.setString(endKey, settings.activeEnd);

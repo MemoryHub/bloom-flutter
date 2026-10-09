@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.0.9+7011
+version: 1.0.19+7023
 
 environment:
   sdk: ^3.7.2
@@ -68,7 +68,10 @@ flutter:
   uses-material-design: true
 
   fonts:
-    # 霞鹜文楷 (LXGW WenKai, OFL): the app's one typeface, Latin included.
+    - family: BloomGallery
+      fonts:
+        - asset: assets/fonts/Arimo.ttf
+    # 霞鹜文楷 (LXGW WenKai, OFL): unchanged Chinese interface typography.
     - family: BloomSerif
       fonts:
         - asset: assets/fonts/LXGWWenKai-Regular.ttf
@@ -95,11 +98,17 @@ flutter:
   # fonts:
   #   - family: Schyler
   #     fonts:
+    - family: BloomGallery
+      fonts:
+        - asset: assets/fonts/Arimo.ttf
   #       - asset: fonts/Schyler-Regular.ttf
   #       - asset: fonts/Schyler-Italic.ttf
   #         style: italic
   #   - family: Trajan Pro
   #     fonts:
+    - family: BloomGallery
+      fonts:
+        - asset: assets/fonts/Arimo.ttf
   #       - asset: fonts/TrajanPro.ttf
   #       - asset: fonts/TrajanPro_Bold.ttf
   #         weight: 700

@@ -43,12 +43,13 @@ void main() {
     final first = await store.mutate(
       writer: 'test',
       incomingPlan: _plan(151),
-      update: (current) => current.copyWith(
-        plan: _plan(151),
-        grid: const [Slot(slotAtMs: 1000, itemId: 7, assetId: 'a7')],
-        currentItemId: 7,
-        nextSlotAtMs: 2000,
-      ),
+      update:
+          (current) => current.copyWith(
+            plan: _plan(151),
+            grid: const [Slot(slotAtMs: 1000, itemId: 7, assetId: 'a7')],
+            currentItemId: 7,
+            nextSlotAtMs: 2000,
+          ),
     );
     expect(first, isNotNull);
     expect(first!.revision, 1);
@@ -70,7 +71,9 @@ void main() {
 
   test('锁被占用时写入直接放弃，不阻塞也不覆盖', () async {
     // 模拟另一个写者正持有锁。
-    await store.lockFile.writeAsString('${DateTime.now().millisecondsSinceEpoch}');
+    await store.lockFile.writeAsString(
+      '${DateTime.now().millisecondsSinceEpoch}',
+    );
 
     final result = await store.mutate(
       writer: 'test',
@@ -102,13 +105,15 @@ void main() {
     await store.mutate(
       writer: 'ios',
       incomingPlan: _plan(152),
-      update: (current) => current.copyWith(plan: _plan(152), nextSlotAtMs: 9000),
+      update:
+          (current) => current.copyWith(plan: _plan(152), nextSlotAtMs: 9000),
     );
 
     final stale = await store.mutate(
       writer: 'android',
       incomingPlan: _plan(151),
-      update: (current) => current.copyWith(plan: _plan(151), nextSlotAtMs: 1000),
+      update:
+          (current) => current.copyWith(plan: _plan(151), nextSlotAtMs: 1000),
     );
 
     expect(stale, isNull, reason: '旧计划不得覆盖新计划');
@@ -121,7 +126,8 @@ void main() {
     await store.mutate(
       writer: 'ios',
       incomingPlan: _plan(151),
-      update: (current) => current.copyWith(plan: _plan(151), nextSlotAtMs: 1000),
+      update:
+          (current) => current.copyWith(plan: _plan(151), nextSlotAtMs: 1000),
     );
     final next = await store.mutate(
       writer: 'android',
@@ -138,18 +144,8 @@ void main() {
     final missing = File('${dir.path}/never.png');
 
     await store.deletePhotos([
-      PhotoEntry(
-        itemId: 1,
-        assetId: 'a',
-        path: present.path,
-        fetchedAtMs: 0,
-      ),
-      PhotoEntry(
-        itemId: 2,
-        assetId: 'b',
-        path: missing.path,
-        fetchedAtMs: 0,
-      ),
+      PhotoEntry(itemId: 1, assetId: 'a', path: present.path, fetchedAtMs: 0),
+      PhotoEntry(itemId: 2, assetId: 'b', path: missing.path, fetchedAtMs: 0),
     ]);
 
     expect(present.existsSync(), isFalse);
@@ -160,7 +156,8 @@ void main() {
     await store.mutate(
       writer: 'test',
       incomingPlan: _plan(151),
-      update: (current) => current.copyWith(plan: _plan(151), nextSlotAtMs: 5000),
+      update:
+          (current) => current.copyWith(plan: _plan(151), nextSlotAtMs: 5000),
       onCommitted: (committed) async {
         seen = committed;
         // 回调执行时权威状态必须已经落盘，派生投影才能与之一致。
@@ -209,23 +206,22 @@ void main() {
     expect((json['plan']! as Map)['plan_id'], 152);
 
     final entry = (json['timeline_entries']! as List).single as Map;
-    expect(
-      entry.keys.toSet(),
-      {
-        'date_ms',
-        'item_id',
-        'portrait_path',
-        'square_path',
-        'large_square_path',
-        'original_path',
-        'date',
-        'caption_zh',
-        'caption_en',
-        'captured_date_text',
-        'location_text',
-      },
-      reason: 'IOS 的 BloomSharedState.planItems 逐个按这些键名取值',
-    );
+    expect(entry.keys.toSet(), {
+      'date_ms',
+      'item_id',
+      'portrait_path',
+      'square_path',
+      'large_square_path',
+      'original_path',
+      'date',
+      'caption_zh',
+      'caption_en',
+      'captured_date_text',
+      'location_text',
+      'source_name',
+      'content_snapshot',
+      'photo_metadata',
+    }, reason: 'IOS 的 BloomSharedState.planItems 逐个按这些键名取值');
 
     final slot = (json['grid']! as List).single as Map;
     expect(slot.keys.toSet(), {'slot_at_ms', 'item_id', 'asset_id'});
@@ -236,7 +232,10 @@ void main() {
     expect(restored.grid.single.itemId, 4481);
     expect(restored.nextSlotAtMs, 1790567100000);
     expect(restored.status, CurrentStatus.ok);
-    expect(restored.timelineEntries.single.originalPath, entry['original_path']);
+    expect(
+      restored.timelineEntries.single.originalPath,
+      entry['original_path'],
+    );
     expect(restored.timelineEntries.single.captionZh, '中文');
   });
 }

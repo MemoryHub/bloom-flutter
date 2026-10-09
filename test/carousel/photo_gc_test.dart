@@ -60,10 +60,7 @@ void main() {
     // 状态里两份清单理论上一致，但删文件这件事不值得赌它们一致。
     final only = await make('mobile-local-square-4405.png');
 
-    final swept = await sweepOrphanPhotos(
-      dir: dir,
-      alivePaths: [only.path],
-    );
+    final swept = await sweepOrphanPhotos(dir: dir, alivePaths: [only.path]);
 
     expect(swept, 0);
     expect(await names(), contains('mobile-local-square-4405.png'));
@@ -107,6 +104,31 @@ void main() {
     expect(await names(), {'ios-widget-remote-1.jpg'});
   });
 
+  test('iOS-like symlink paths preserve all referenced bytes', () async {
+    final photo = await make('carousel-original-9.photo');
+    final alias = Link(
+      '${dir.parent.path}/bloom-gc-alias-${dir.uri.pathSegments[dir.uri.pathSegments.length - 2]}',
+    );
+    await alias.create(dir.path);
+    try {
+      expect(
+        await sweepOrphanPhotos(
+          dir: dir,
+          alivePaths: ['${alias.path}/carousel-original-9.photo'],
+        ),
+        0,
+      );
+      expect(await photo.exists(), isTrue);
+    } finally {
+      await alias.delete();
+    }
+  });
+  test('in-flight render survives a concurrent garbage sweep', () async {
+    final file = await make('carousel-original-9.photo');
+    await make('photo-prepare-9.lock');
+    expect(await sweepOrphanPhotos(dir: dir, alivePaths: []), 0);
+    expect(await file.exists(), isTrue);
+  });
   test('空目录不报错', () async {
     expect(await sweepOrphanPhotos(dir: dir, alivePaths: const []), 0);
   });

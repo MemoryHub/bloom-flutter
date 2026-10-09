@@ -53,7 +53,10 @@ bool get _backgroundSyncSupported => Platform.isAndroid || Platform.isIOS;
 /// 后台同步是**增强**，不是主流程：任何一步失败都必须安静退化，绝不能把启动
 /// 或切模式打断。这个 App 只发 iOS / 安卓，但测试宿主是 macOS，workmanager 在
 /// 那里没有实现，`MissingPluginException` 会直接抛出来。
-Future<void> _guardBackgroundSync(String what, Future<void> Function() action) async {
+Future<void> _guardBackgroundSync(
+  String what,
+  Future<void> Function() action,
+) async {
   try {
     await action();
   } catch (error) {
@@ -86,8 +89,7 @@ Future<void> initializeBackgroundSync() async {
 /// 一句话：安卓那边周期任务是多余的，iOS 这边周期任务是唯一的那条路。
 Future<void> configureBackgroundSync(BloomDisplaySettings settings) async {
   if (!_backgroundSyncSupported) return;
-  final wantPeriodic =
-      Platform.isIOS || settings.mode != BloomDisplayMode.carousel;
+  final wantPeriodic = Platform.isIOS || !settings.usesScheduledPlan;
   if (!wantPeriodic) {
     await _guardBackgroundSync(
       'cancel periodic',
@@ -177,18 +179,23 @@ void _backgroundCallback() {
       if (!status.paired || !status.hasAssets) return true;
       final repository = DailyContentRepository(api: api);
       stage = 'read-settings';
-      final settings = await DisplayPreferences().read();
+      final preferences = DisplayPreferences();
+      // Selections may be sent from a different family member's phone.
+      // Refresh this phone's own server record before choosing the pipeline.
+      final settings =
+          await preferences.readServer(
+            credentials: credentials,
+            target: BloomApiClient.settingsTargetMobile,
+            api: api,
+          ) ??
+          await preferences.readLocal();
+      await preferences.cacheLocal(settings);
       debugPrint('[BloomSync] mode=${settings.mode.name}');
       stage = 'sync-content';
-      // ⚠️ 推荐【不能】改走轮播引擎。
-      //
-      // 接口是一套（同一批端点、同一份设置），但推荐有自己的**推荐算法** ——
-      // 由服务器实现（按天出推荐，不是把轮播计划的间隔调慢）。曾经试过让
-      // 推荐复用 syncCarousel，结果是: 推荐的节奏被换成"作息 + 间隔"的格子，
-      // 当前格 12 小时不变 → 照片不换；切回轮播时作息又被推荐值覆盖 →
-      // 变成半天一次。所以两条路必须各自保留。
+      // Private daily recommendation keeps the existing daily path. Art uses
+      // scheduled snapshots in either ranking mode, without changing settings.
       final daily =
-          settings.mode == BloomDisplayMode.carousel
+          settings.usesScheduledPlan
               ? await repository.syncCarousel(credentials, settings)
               : await repository.sync(credentials);
       stage = 'read-rendered-cache';
@@ -208,10 +215,7 @@ void _backgroundCallback() {
           captionEn: daily.captionEn,
           capturedDateText: daily.capturedDateText,
           locationText: daily.locationText,
-          mode:
-              settings.mode == BloomDisplayMode.carousel
-                  ? 'carousel'
-                  : 'recommend',
+          mode: settings.usesScheduledPlan ? 'carousel' : 'recommend',
         );
       }
       debugPrint(

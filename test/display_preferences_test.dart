@@ -43,6 +43,33 @@ void main() {
     'next_check_at': '2026-09-21T10:30:00+08:00',
   };
 
+  test(
+    'art recommendation uses the scheduled widget pipeline without changing the ranking mode',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final preferences = DisplayPreferences();
+      const art = BloomDisplaySettings(
+        mode: BloomDisplayMode.recommendation,
+        sources: [BloomPhotoSource.personal, BloomPhotoSource.art],
+      );
+      expect(art.usesScheduledPlan, isTrue);
+      await preferences.cacheLocal(art);
+      final cached = await preferences.readLocal();
+      expect(cached.mode, BloomDisplayMode.recommendation);
+      expect(cached.sources, contains(BloomPhotoSource.art));
+      expect(cached.usesScheduledPlan, isTrue);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getBool('bloom.scheduled_plan'), isTrue);
+      await preferences.cacheLocal(
+        art.copyWith(sources: [BloomPhotoSource.personal]),
+      );
+      expect(prefs.getBool('bloom.scheduled_plan'), isFalse);
+      expect(
+        (await preferences.readLocal()).mode,
+        BloomDisplayMode.recommendation,
+      );
+    },
+  );
   test('cacheLocal writes the four keys the native widgets read', () async {
     SharedPreferences.setMockInitialValues(<String, Object>{});
     final preferences = DisplayPreferences();
@@ -263,7 +290,10 @@ void _sourcesTests() {
       // ⚠️ 服务器登记了四个，但只有 personal 能真正取出照片。
       // UI 若把 art/news/widget 也放出去，用户设完相框毫无变化 ——
       // 就是"设了没反应"。所以这里必须比 values 窄。
-      expect(BloomPhotoSource.implemented, [BloomPhotoSource.personal]);
+      expect(BloomPhotoSource.implemented, [
+        BloomPhotoSource.personal,
+        BloomPhotoSource.art,
+      ]);
       expect(
         BloomPhotoSource.implemented.length,
         lessThan(BloomPhotoSource.values.length),
@@ -273,7 +303,7 @@ void _sourcesTests() {
 
     test('label 与 wire 是两回事：label 可改，wire 不可改', () {
       expect(BloomPhotoSource.personal.label, '我的照片');
-      expect(BloomPhotoSource.art.label, '名画');
+      expect(BloomPhotoSource.art.label, '艺术作品');
       // wire 是小写协议值，永远不要翻译。
       for (final s in BloomPhotoSource.values) {
         expect(s.wire, s.wire.toLowerCase());
@@ -288,10 +318,13 @@ void _sourceWireTests() {
       expect(bloomSourcesToWire([BloomPhotoSource.personal]), [
         {'name': 'personal', 'weight': 1},
       ]);
-      expect(bloomSourcesToWire([BloomPhotoSource.personal, BloomPhotoSource.art]), [
-        {'name': 'personal', 'weight': 1},
-        {'name': 'art', 'weight': 1},
-      ]);
+      expect(
+        bloomSourcesToWire([BloomPhotoSource.personal, BloomPhotoSource.art]),
+        [
+          {'name': 'personal', 'weight': 1},
+          {'name': 'art', 'weight': 1},
+        ],
+      );
     });
 
     test('空列表转出来是空 —— 调用方据此决定【不发送】', () {
@@ -302,18 +335,27 @@ void _sourceWireTests() {
     });
 
     test('解析服务器回显：对象、纯字符串、混合三种都认', () {
-      expect(bloomSourcesFromWire([
-        {'name': 'personal', 'weight': 1},
-      ]), [BloomPhotoSource.personal]);
+      expect(
+        bloomSourcesFromWire([
+          {'name': 'personal', 'weight': 1},
+        ]),
+        [BloomPhotoSource.personal],
+      );
       expect(bloomSourcesFromWire(['art']), [BloomPhotoSource.art]);
-      expect(bloomSourcesFromWire([
-        'personal',
-        {'name': 'art', 'weight': 2},
-      ]), [BloomPhotoSource.personal, BloomPhotoSource.art]);
+      expect(
+        bloomSourcesFromWire([
+          'personal',
+          {'name': 'art', 'weight': 2},
+        ]),
+        [BloomPhotoSource.personal, BloomPhotoSource.art],
+      );
       // id 是另一种叫法，服务器两种都可能回。
-      expect(bloomSourcesFromWire([
-        {'id': 'widget'},
-      ]), [BloomPhotoSource.widget]);
+      expect(
+        bloomSourcesFromWire([
+          {'id': 'widget'},
+        ]),
+        [BloomPhotoSource.widget],
+      );
     });
 
     test('解析：认不出来的名字跳过，不崩、不清空', () {
@@ -332,7 +374,12 @@ void _sourceWireTests() {
     });
 
     test('解析：非列表输入一律当空，不抛异常', () {
-      for (final bad in [null, 'personal', 42, {'name': 'personal'}]) {
+      for (final bad in [
+        null,
+        'personal',
+        42,
+        {'name': 'personal'},
+      ]) {
         expect(bloomSourcesFromWire(bad), isEmpty, reason: '$bad');
       }
     });

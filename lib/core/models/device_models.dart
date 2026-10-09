@@ -100,6 +100,8 @@ class CarouselItemContent {
     this.capturedDateText,
     this.locationText,
     this.photoOrientation,
+    this.sourceName = 'personal',
+    this.artwork = const {},
   });
 
   final int itemId;
@@ -115,6 +117,8 @@ class CarouselItemContent {
   final String? capturedDateText;
   final String? locationText;
   final String? photoOrientation;
+  final String sourceName;
+  final Map<String, dynamic> artwork;
 
   factory CarouselItemContent.fromJson(Map<String, dynamic> json) {
     final caption = json['caption'] as Map<String, dynamic>? ?? const {};
@@ -128,6 +132,10 @@ class CarouselItemContent {
       capturedDateText: json['captured_date_text'] as String?,
       locationText: json['location_text'] as String?,
       photoOrientation: json['photo_orientation'] as String?,
+      sourceName: json['source_name'] as String? ?? 'personal',
+      artwork: Map<String, dynamic>.from(
+        json['content_snapshot'] as Map? ?? const {},
+      ),
     );
   }
 
@@ -140,6 +148,8 @@ class CarouselItemContent {
     capturedDateText: capturedDateText,
     locationText: locationText,
     photoOrientation: photoOrientation,
+    sourceName: sourceName,
+    artwork: artwork,
   );
 }
 
@@ -195,14 +205,12 @@ class CarouselPlanEnvelope {
         planId: (json['plan_id'] as num).toInt(),
         currentItemId: (json['current_item_id'] as num).toInt(),
         nextCheckAt: DateTime.parse(json['next_check_at'] as String),
-        items:
-            (json['items'] as List<dynamic>)
-                .map(
-                  (value) => CarouselItemContent.fromJson(
-                    value as Map<String, dynamic>,
-                  ),
-                )
-                .toList(growable: false),
+        items: (json['items'] as List<dynamic>)
+            .map(
+              (value) =>
+                  CarouselItemContent.fromJson(value as Map<String, dynamic>),
+            )
+            .toList(growable: false),
         hasMore: json['has_more'] as bool? ?? false,
         settingsHash: json['settings_hash'] as String?,
         localDate: json['local_date'] as String?,
@@ -223,6 +231,8 @@ class DailyContent {
     this.capturedDateText,
     this.locationText,
     this.photoOrientation,
+    this.sourceName = 'personal',
+    this.artwork = const {},
   });
 
   final String date;
@@ -234,6 +244,8 @@ class DailyContent {
   final String? capturedDateText;
   final String? locationText;
   final String? photoOrientation;
+  final String sourceName;
+  final Map<String, dynamic> artwork;
 
   factory DailyContent.fromJson(Map<String, dynamic> json) {
     final widgets = ((json['widgets'] as Map<String, dynamic>?) ?? const {})
@@ -256,6 +268,10 @@ class DailyContent {
       capturedDateText: json['captured_date_text'] as String?,
       locationText: json['location_text'] as String?,
       photoOrientation: json['photo_orientation'] as String?,
+      sourceName: json['source_name'] as String? ?? 'personal',
+      artwork: Map<String, dynamic>.from(
+        json['content_snapshot'] as Map? ?? const {},
+      ),
     );
   }
 }
@@ -271,6 +287,7 @@ class DeviceCarouselSettings {
     required this.intervalMinutes,
     this.mode,
     this.sources = const <String>[],
+    this.sourceWeights = const <String, double>{},
     this.dailySlotCount,
     this.settingsHash,
     this.updatedAt,
@@ -289,7 +306,6 @@ class DeviceCarouselSettings {
   /// The retired spelling of [modeRecommend], used only by the local mirror on
   /// installs that predate the rename. Read-only: never write this value again.
   static const modeRecommendLegacy = 'recommendation';
-
 
   final String timezone;
   final String activeStart;
@@ -310,6 +326,7 @@ class DeviceCarouselSettings {
   /// 而不是在这里被悄悄丢掉 —— 丢掉会让用户看到"我选的来源没了"。
   /// 界面侧再用 BloomPhotoSource.fromWire 去认。
   final List<String> sources;
+  final Map<String, double> sourceWeights;
 
   /// Photos the server scheduled for one day (`daily_slot_count`).
   ///
@@ -369,10 +386,16 @@ class DeviceCarouselSettings {
         // 与请求侧"两种写法都吃"保持一致。
         final List<dynamic> raw => <String>[
           for (final entry in raw)
-            if (_sourceNameOf(entry) case final String name when name.isNotEmpty)
+            if (_sourceNameOf(entry) case final String name
+                when name.isNotEmpty)
               name,
         ],
         _ => const <String>[],
+      },
+      sourceWeights: {
+        for (final entry in (json['sources'] as List? ?? []))
+          if (entry is Map && _sourceNameOf(entry) != null)
+            _sourceNameOf(entry)!: (entry['weight'] as num?)?.toDouble() ?? 1,
       },
       dailySlotCount: rawSlots != null && rawSlots > 0 ? rawSlots : null,
       settingsHash: json['settings_hash'] as String?,
@@ -555,9 +578,10 @@ class UserDevice {
       lastSeenAt: _parseDateTime(json['last_seen_at']),
       boundAt: _parseDateTime(json['bound_at']),
       boundUserCount: (json['bound_user_count'] as num?)?.toInt() ?? 1,
-      settings: settings is Map<String, dynamic>
-          ? UserDeviceSettings.fromJson(settings)
-          : null,
+      settings:
+          settings is Map<String, dynamic>
+              ? UserDeviceSettings.fromJson(settings)
+              : null,
     );
   }
 }

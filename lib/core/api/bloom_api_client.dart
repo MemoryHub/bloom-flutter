@@ -181,17 +181,15 @@ class BloomApiClient {
 
   /// One page of the day's carousel stream.
   ///
-  /// [afterItemId] is the server's **paging cursor** — `after_item_id`, which
-  /// has been in the API all along (`ge=1`) and which this app never sent. That
-  /// omission is the whole "翻来覆去就那么两三张" bug: every request started at
-  /// index 0 and got the same first four photos back. The batch size itself
-  /// cannot be raised (`le=4` server-side), so the day is walked four at a time
-  /// by handing back the last id each round.
+  /// [afterItemId] pages descriptors, not downloaded pictures. Modern hosts
+  /// report their real cache and claim each picture through /prepare. The
+  /// server accepts up to 200 descriptors; plan_client handles older limits.
   Future<CarouselPlanEnvelope> carouselPlan(
     DeviceCredentials credentials,
     BloomDisplaySettings settings, {
     int batchLimit = 4,
     int? afterItemId,
+    List<int>? cachedItemIds,
   }) async {
     final response = await _client
         .post(
@@ -208,16 +206,37 @@ class BloomApiClient {
             'active_start': settings.activeStart,
             'active_end': settings.activeEnd,
             'interval_minutes': settings.intervalMinutes,
-            // 上限 4 原本是相框固件的照片缓存深度，与计划元数据无关。手机端
-            // 需要一次拿全天计划，因此不再按 4 截断；若服务端尚未放开上限，
-            // 响应里的 has_more 会让调用方自行循环补齐。
+            // 四条是相框的元数据批次；手机取整天栅格，但只预存四张未来图。
             'batch_limit': batchLimit.clamp(1, 200),
             if (afterItemId != null) 'after_item_id': afterItemId,
+            if (cachedItemIds != null) 'cached_item_ids': cachedItemIds,
           }),
         )
         .timeout(_requestTimeout);
     _ensure(response, 200);
     return CarouselPlanEnvelope.fromJson(_json(response));
+  }
+
+  Future<CarouselItemContent> prepareCarouselItem(
+    DeviceCredentials credentials,
+    int itemId,
+  ) async {
+    final response = await _client
+        .post(
+          _uri(
+            '/api/frame/devices/${Uri.encodeComponent(credentials.deviceId)}/carousel/prepare',
+          ),
+          headers: {
+            ..._headers(credentials.deviceToken),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'item_id': itemId}),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return CarouselItemContent.fromJson(
+      _json(response)['item'] as Map<String, dynamic>,
+    );
   }
 
   Future<http.Response> carouselPhoto(
@@ -309,17 +328,22 @@ class BloomApiClient {
   Future<DeviceCarouselSettingsEnvelope> getDeviceSettings(
     DeviceCredentials credentials, {
     required String target,
+    String? deviceId,
   }) async {
     final response = await _client
         .post(
           _uri(
-            '/api/frame/devices/${Uri.encodeComponent(credentials.deviceId)}/carousel/settings/get',
+            '/api/frame/devices/${Uri.encodeComponent(deviceId ?? credentials.deviceId)}/carousel/settings/get',
           ),
           headers: {
             ..._headers(credentials.deviceToken),
             'Content-Type': 'application/json',
           },
-          body: jsonEncode({'target': target}),
+          body: jsonEncode({
+            'target': target,
+            if (deviceId != null && deviceId != credentials.deviceId)
+              'caller_device_id': credentials.deviceId,
+          }),
         )
         .timeout(_requestTimeout);
     _ensure(response, 200);
@@ -351,11 +375,12 @@ class BloomApiClient {
     required String callerDeviceId,
     String? mode,
     List<Map<String, Object?>>? sources,
+    String? deviceId,
   }) async {
     final response = await _client
         .post(
           _uri(
-            '/api/frame/devices/${Uri.encodeComponent(credentials.deviceId)}/carousel/settings/set',
+            '/api/frame/devices/${Uri.encodeComponent(deviceId ?? credentials.deviceId)}/carousel/settings/set',
           ),
           headers: {
             ..._headers(credentials.deviceToken),
@@ -407,6 +432,80 @@ class BloomApiClient {
   // 会话用 Authorization: Bearer，与设备令牌（X-Frame-Token）并存。
   // 刻意分成两套头而不是合并成一个：合并之后任何一处调用都可能悄悄带上
   // 另一个身份，而"登录后小组件不再更新"这类症状极难定位。
+
+  Future<Map<String, dynamic>> discoverCollections({int offset = 0}) async {
+    final response = await _client
+        .get(_uri('/api/frame/discover/collections', {'offset': '$offset'}))
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return _json(response);
+  }
+
+  Future<Map<String, dynamic>> discoverCollection(
+    String id, {
+    int offset = 0,
+  }) async {
+    final response = await _client
+        .get(
+          _uri('/api/frame/discover/collections/${Uri.encodeComponent(id)}', {
+            'offset': '$offset',
+          }),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return _json(response);
+  }
+
+  Future<Map<String, dynamic>> discoverArtwork(String id) async {
+    final response = await _client
+        .get(_uri('/api/frame/discover/artworks/${Uri.encodeComponent(id)}'))
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return _json(response);
+  }
+
+  Future<Map<String, dynamic>> contentSelections(
+    String token,
+    String deviceId,
+  ) async {
+    final response = await _client
+        .get(
+          _uri(
+            '/api/frame/devices/${Uri.encodeComponent(deviceId)}/content-selections',
+          ),
+          headers: _userHeaders(token),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return _json(response);
+  }
+
+  Future<Map<String, dynamic>> changeContentSelection(
+    String token,
+    String deviceId, {
+    required String kind,
+    required String referenceId,
+    required bool selected,
+  }) async {
+    final response = await _client
+        .patch(
+          _uri(
+            '/api/frame/devices/${Uri.encodeComponent(deviceId)}/content-selections',
+          ),
+          headers: {..._userHeaders(token), 'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'kind': kind,
+            'reference_id': referenceId,
+            'selected': selected,
+          }),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return _json(response);
+  }
+
+  String discoverImageUrl(String path) =>
+      Uri.parse(baseUrl).resolve(path).toString();
 
   Map<String, String> _userHeaders(String userToken) => {
     'Authorization': 'Bearer $userToken',
