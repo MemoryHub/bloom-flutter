@@ -20,6 +20,7 @@ import '../../platform/widget_bridge.dart';
 import '../api/bloom_api_client.dart';
 import '../models/device_models.dart';
 import '../storage/display_preferences.dart';
+import '../storage/content_sync_epoch.dart';
 import 'carousel_rules.dart';
 import 'carousel_state.dart';
 import 'photo_store.dart';
@@ -40,6 +41,7 @@ class CarouselTickOutcome {
     this.generationChanged = false,
     this.note,
     this.plan,
+    this.epoch,
   });
 
   /// 是否成功取回计划（false 表示没网或服务端不可达）。
@@ -69,6 +71,7 @@ class CarouselTickOutcome {
   /// 它跟着结局一起返回，是为了让 [CarouselEngine.prefetchAhead] 能**接着用同一份
   /// 计划**去备未来格子 —— 否则预取就得再拉一次全天计划，白白多一趟网络。
   final FullPlan? plan;
+  final ContentSyncEpoch? epoch;
 
   @override
   String toString() =>
@@ -144,6 +147,7 @@ class CarouselEngine {
         settings: settings,
         writer: writer,
         plan: plan,
+        epoch: outcome.epoch,
       );
     }
     return outcome;
@@ -163,11 +167,13 @@ class CarouselEngine {
     required DeviceCredentials credentials,
     required BloomDisplaySettings settings,
     required String writer,
+    ContentSyncEpoch? syncEpoch,
   }) async {
     final dir = await sharedDirectory();
     final store = CarouselStateStore(directory: dir);
-    final before = await store.read();
+    final epoch = syncEpoch ?? await ContentSyncEpoch.capture(dir);
     final nowMs = _clock().millisecondsSinceEpoch;
+    final before = _withDueCurrent(await store.read(), nowMs);
 
     // ---- ① 对表 ----
     FullPlan? plan;
@@ -207,6 +213,7 @@ class CarouselEngine {
     if (planFetched) {
       try {
         await store.mutate(
+          canCommit: epoch.isCurrent,
           writer: writer,
           incomingPlan: plan.identity,
           update:
@@ -251,6 +258,7 @@ class CarouselEngine {
               attempted: attempted,
               stats: stats,
               nowMs: nowMs,
+              canPrepare: epoch.isCurrent,
             );
 
     // 当前格取不到时，向服务端申请替补——只替换这一格，栅格不动。
@@ -263,6 +271,7 @@ class CarouselEngine {
         slot: slotNow,
         nowMs: nowMs,
         photos: photos,
+        canPrepare: epoch.isCurrent,
       );
       if (replacement != null) {
         substitutedContent = replacement;
@@ -307,9 +316,11 @@ class CarouselEngine {
     // 两端原生侧只按 `currentEntryFromTimeline`（date_ms 不晚于此刻的最后一条）
     // 查表，不再各自做选取决策。没有照片的格子不进表——宁可不切换，也不切到
     // 一张空图。
+    final readyIds = await _readyTimelineIds(dir, grid, photos, plan);
     final timeline = <TimelineEntry>[
+      ...await _fallbackEntries(dir, before, nowMs, readyIds, grid, plan),
       for (final slot in grid)
-        if (photoFor(photos, slot.itemId) != null &&
+        if (readyIds.contains(slot.itemId) &&
             plan?.contentFor(slot.itemId) != null)
           _timelineEntry(
             dir: dir,
@@ -326,6 +337,7 @@ class CarouselEngine {
     CarouselState? committed;
     try {
       committed = await store.mutate(
+        canCommit: epoch.isCurrent,
         writer: writer,
         incomingPlan: plan?.identity ?? before.plan,
         update: (current) {
@@ -398,13 +410,14 @@ class CarouselEngine {
       generationChanged: generationChanged,
       note: planError,
       plan: plan,
+      epoch: epoch,
     );
   }
 
   /// **未来格子的预取 —— 单独一轮，不挡界面。**
   ///
   /// 关键路径（[tickCurrent]）已经把当前格提交并通知原生；这里接着备未来若干格，
-  /// 备完再提交一次（时间线因此多出几个到点可直接上屏的条目）。
+  /// 每张就绪即提交，后续下载中断不会丢掉已可到点上屏的条目。
   ///
   /// 为什么这件事必须做，而不能"等它变成当前格再下"：
   ///
@@ -426,30 +439,137 @@ class CarouselEngine {
     required BloomDisplaySettings settings,
     required String writer,
     required FullPlan plan,
+    ContentSyncEpoch? epoch,
   }) async {
     try {
       final dir = await sharedDirectory();
       final store = CarouselStateStore(directory: dir);
+      final session = epoch ?? await ContentSyncEpoch.capture(dir);
+      if (!await session.isCurrent()) return;
       // ⭐ 必须重新读一次状态：上面那次提交刚写过它（当前格 + 时间线 + 清理），
       //    拿旧快照继续会把已删的照片又算进来。
-      final before = await store.read();
       final nowMs = _clock().millisecondsSinceEpoch;
+      final before = _withDueCurrent(await store.read(), nowMs);
 
       final grid = plan.grid;
-      final slotNow = currentSlot(grid, nowMs);
       final upcoming = upcomingSlots(grid, nowMs);
-      final resolution = resolveNextSlot(
-        gridMs: [for (final slot in grid) slot.slotAtMs],
-        nowMs: nowMs,
-        tomorrowFirstMs: plan.serverNextCheckMs ?? before.nextSlotAtMs,
-      );
 
       final photos = [...before.photos];
       final attempted = <int>{};
       final stats = CarouselPrepareStats();
 
+      // Publish each complete photo before starting another network request.
+      // A killed foreground app must not strand already prepared slots outside
+      // the shared timeline while the rest of its batch is still downloading.
+      Future<void> publishPrepared() async {
+        if (!await session.isCurrent()) return;
+        final nowMs = _clock().millisecondsSinceEpoch;
+        final before = _withDueCurrent(await store.read(), nowMs);
+        final slotNow = currentSlot(grid, nowMs);
+        final resolution = resolveNextSlot(
+          gridMs: [for (final slot in grid) slot.slotAtMs],
+          nowMs: nowMs,
+          tomorrowFirstMs: plan.serverNextCheckMs ?? before.nextSlotAtMs,
+        );
+        // 显示项判定与关键路径同一条规则：**宁可不切换，也不切到一张空图。**
+        // 时间在这期间可能已经跨到下一格，若那一格的照片没备好，就仍然停在
+        // `before.currentItemId`。
+        final slotNowPhoto =
+            slotNow == null ? null : photoFor(photos, slotNow.itemId);
+        final displayedItemId =
+            slotNowPhoto == null ? before.currentItemId : slotNow!.itemId;
+        final previousItemId =
+            before.currentItemId != displayedItemId
+                ? before.currentItemId
+                : before.previousItemId;
+        final upcomingIds = [for (final slot in upcoming) slot.itemId];
+        final generationChanged = isNewGeneration(before.plan, plan.identity);
+
+        final readyIds = await _readyTimelineIds(dir, grid, photos, plan);
+        final timeline = <TimelineEntry>[
+          ...await _fallbackEntries(dir, before, nowMs, readyIds, grid, plan),
+          for (final slot in grid)
+            if (readyIds.contains(slot.itemId) &&
+                plan.contentFor(slot.itemId) != null)
+              _timelineEntry(
+                dir: dir,
+                slot: slot,
+                photo: photoFor(photos, slot.itemId)!,
+                content: plan.contentFor(slot.itemId)!,
+              ),
+        ]..sort((a, b) => a.dateMs.compareTo(b.dateMs));
+
+        final removed = <PhotoEntry>[];
+        CarouselState? committed;
+        try {
+          committed = await store.mutate(
+            canCommit: session.isCurrent,
+            writer: writer,
+            incomingPlan: plan.identity,
+            update: (current) {
+              final kept = retainPhotos(
+                mode:
+                    generationChanged
+                        ? RetentionMode.generation
+                        : RetentionMode.normal,
+                photos: photos,
+                currentItemId: displayedItemId,
+                previousItemId: previousItemId,
+                nextItemIds: upcomingIds,
+                newGrid: grid,
+              );
+              final keptPaths = {for (final photo in kept) photo.path};
+              removed
+                ..clear()
+                ..addAll(
+                  photos.where((photo) => !keptPaths.contains(photo.path)),
+                );
+
+              return current.copyWith(
+                grid: grid,
+                currentSlotAtMs: slotNow?.slotAtMs ?? before.currentSlotAtMs,
+                currentItemId: displayedItemId,
+                currentPhotoPath: slotNowPhoto?.path,
+                previousItemId: previousItemId,
+                previousPhotoPath: photoFor(kept, previousItemId)?.path,
+                nextSlotAtMs: resolution?.atMs,
+                nextSlotSource: NextSlotSource.plan,
+                photos: kept,
+                timelineEntries: timeline,
+                clearNextSlot: resolution == null,
+              );
+            },
+            onCommitted: (state) async {
+              // 时间可能已经跨到下一格，而那一格的照片刚好在预取里备好了 ——
+              // 那就顺手把「当前项」也推进过去，别等下一次 tick。
+              if (slotNowPhoto != null && displayedItemId != null) {
+                await _photoStore.publishCurrent(dir, displayedItemId);
+              }
+              await _writeProjection(
+                dir: dir,
+                state: state,
+                content: plan.contentFor(state.currentItemId),
+                planFetched: true,
+              );
+              await store.deletePhotos(removed);
+            },
+          );
+        } catch (error) {
+          debugPrint('[BloomCarousel] prefetch commit failed: $error');
+        }
+
+        if (committed != null) {
+          try {
+            await bridge.refresh();
+          } catch (error) {
+            debugPrint('[BloomCarousel] prefetch refresh failed: $error');
+          }
+        }
+      }
+
       final failedPreloads = <Slot>[];
       for (final slot in upcoming) {
+        if (!await session.isCurrent()) return;
         final ready = await _prepareSlot(
           dir: dir,
           plan: plan,
@@ -460,13 +580,17 @@ class CarouselEngine {
           attempted: attempted,
           stats: stats,
           nowMs: nowMs,
+          canPrepare: session.isCurrent,
         );
-        if (!ready && plan.contentFor(slot.itemId) != null) {
+        if (ready) {
+          await publishPrepared();
+        } else if (plan.contentFor(slot.itemId) != null) {
           failedPreloads.add(slot);
         }
       }
 
       for (final slot in failedPreloads) {
+        if (!await session.isCurrent()) return;
         final replacement = await _trySubstitute(
           credentials: credentials,
           planId: plan.identity.planId,
@@ -474,108 +598,20 @@ class CarouselEngine {
           slot: slot,
           nowMs: nowMs,
           photos: photos,
+          canPrepare: session.isCurrent,
         );
         if (replacement != null) {
           plan.contentById[slot.itemId] = replacement;
           stats.prepared++;
           if (stats.unavailable > 0) stats.unavailable--;
+          await publishPrepared();
         }
       }
 
-      // 显示项判定与关键路径同一条规则：**宁可不切换，也不切到一张空图。**
-      // 时间在这期间可能已经跨到下一格，若那一格的照片没备好，就仍然停在
-      // `before.currentItemId`。
-      final slotNowPhoto =
-          slotNow == null ? null : photoFor(photos, slotNow.itemId);
-      final displayedItemId =
-          slotNowPhoto == null ? before.currentItemId : slotNow!.itemId;
-      final previousItemId =
-          before.currentItemId != displayedItemId
-              ? before.currentItemId
-              : before.previousItemId;
-      final upcomingIds = [for (final slot in upcoming) slot.itemId];
-      final generationChanged = isNewGeneration(before.plan, plan.identity);
-
-      final timeline = <TimelineEntry>[
-        for (final slot in grid)
-          if (photoFor(photos, slot.itemId) != null &&
-              plan.contentFor(slot.itemId) != null)
-            _timelineEntry(
-              dir: dir,
-              slot: slot,
-              photo: photoFor(photos, slot.itemId)!,
-              content: plan.contentFor(slot.itemId)!,
-            ),
-      ]..sort((a, b) => a.dateMs.compareTo(b.dateMs));
-
-      final removed = <PhotoEntry>[];
-      CarouselState? committed;
-      try {
-        committed = await store.mutate(
-          writer: writer,
-          incomingPlan: plan.identity,
-          update: (current) {
-            final kept = retainPhotos(
-              mode:
-                  generationChanged
-                      ? RetentionMode.generation
-                      : RetentionMode.normal,
-              photos: photos,
-              currentItemId: displayedItemId,
-              previousItemId: previousItemId,
-              nextItemIds: upcomingIds,
-              newGrid: grid,
-            );
-            final keptPaths = {for (final photo in kept) photo.path};
-            removed
-              ..clear()
-              ..addAll(
-                photos.where((photo) => !keptPaths.contains(photo.path)),
-              );
-
-            return current.copyWith(
-              grid: grid,
-              currentSlotAtMs: slotNow?.slotAtMs ?? before.currentSlotAtMs,
-              currentItemId: displayedItemId,
-              currentPhotoPath: slotNowPhoto?.path,
-              previousItemId: previousItemId,
-              previousPhotoPath: photoFor(kept, previousItemId)?.path,
-              nextSlotAtMs: resolution?.atMs,
-              nextSlotSource: NextSlotSource.plan,
-              photos: kept,
-              timelineEntries: timeline,
-              clearNextSlot: resolution == null,
-            );
-          },
-          onCommitted: (state) async {
-            // 时间可能已经跨到下一格，而那一格的照片刚好在预取里备好了 ——
-            // 那就顺手把「当前项」也推进过去，别等下一次 tick。
-            if (slotNowPhoto != null && displayedItemId != null) {
-              await _photoStore.publishCurrent(dir, displayedItemId);
-            }
-            await _writeProjection(
-              dir: dir,
-              state: state,
-              content: plan.contentFor(state.currentItemId),
-              planFetched: true,
-            );
-            await store.deletePhotos(removed);
-          },
-        );
-      } catch (error) {
-        debugPrint('[BloomCarousel] prefetch commit failed: $error');
-      }
-
-      if (committed != null) {
-        try {
-          await bridge.refresh();
-        } catch (error) {
-          debugPrint('[BloomCarousel] prefetch refresh failed: $error');
-        }
-      }
+      await publishPrepared();
       debugPrint(
         '[BloomCarousel] prefetch done prepared=${stats.prepared} '
-        'unavailable=${stats.unavailable} entries=${timeline.length}',
+        'unavailable=${stats.unavailable} entries=${(await store.read()).timelineEntries.length}',
       );
     } catch (error) {
       // 预取是"尽力而为"：它失败不该影响任何人，更不该变成 unhandled error。
@@ -597,7 +633,9 @@ class CarouselEngine {
     required Set<int> attempted,
     required CarouselPrepareStats stats,
     required int nowMs,
+    required Future<bool> Function() canPrepare,
   }) async {
+    if (!await canPrepare()) return false;
     final existing = photoFor(photos, slot.itemId);
     if (existing != null) {
       final descriptor = plan?.contentFor(slot.itemId);
@@ -607,6 +645,7 @@ class CarouselEngine {
           item: descriptor,
           credentials: credentials,
           etag: existing.etag,
+          canPrepare: canPrepare,
         );
         if (result.isReady) {
           // A cached entry may still reference the legacy server-rendered file.
@@ -647,6 +686,7 @@ class CarouselEngine {
       item: content,
       credentials: credentials,
       etag: photoFor(before, slot.itemId)?.etag,
+      canPrepare: canPrepare,
     );
     if (!result.isReady) {
       stats.unavailable++;
@@ -656,6 +696,75 @@ class CarouselEngine {
     photos.removeWhere((photo) => photo.itemId == slot.itemId);
     photos.add(result.photo!.toEntry(nowMs));
     return true;
+  }
+
+  Future<Set<int>> _readyTimelineIds(
+    Directory dir,
+    List<Slot> grid,
+    List<PhotoEntry> photos,
+    FullPlan? plan,
+  ) async {
+    final ready = <int>{};
+    for (final slot in grid) {
+      final photo = photoFor(photos, slot.itemId);
+      final content = plan?.contentFor(slot.itemId);
+      if (photo != null &&
+          content != null &&
+          photo.assetId == content.assetId &&
+          await _photoStore.isReadyFor(dir, content)) {
+        ready.add(slot.itemId);
+      }
+    }
+    return ready;
+  }
+
+  CarouselState _withDueCurrent(CarouselState state, int nowMs) {
+    final due = currentEntryFromTimeline(state.timelineEntries, nowMs);
+    if (due == null) return state;
+    return state.copyWith(
+      currentItemId: due.itemId,
+      currentPhotoPath: due.portraitPath,
+      currentSlotAtMs: due.dateMs,
+      previousItemId:
+          state.currentItemId != due.itemId
+              ? state.currentItemId
+              : state.previousItemId,
+    );
+  }
+
+  /// Keep the last successful photo when a new day's first download fails.
+  /// Offline ticks must preserve already baked future slots as well: without
+  /// descriptors they cannot rebuild the timeline, but the cached one is valid.
+  Future<List<TimelineEntry>> _fallbackEntries(
+    Directory dir,
+    CarouselState before,
+    int nowMs,
+    Set<int> replaced,
+    List<Slot> grid,
+    FullPlan? plan,
+  ) async {
+    final keep = <TimelineEntry>[];
+    final due = currentEntryFromTimeline(before.timelineEntries, nowMs);
+    for (final entry in before.timelineEntries) {
+      if (replaced.contains(entry.itemId)) continue;
+      if (plan != null &&
+          entry.itemId != due?.itemId &&
+          entry.itemId != before.previousItemId) {
+        continue;
+      }
+      if (plan == null &&
+          !grid.any((s) => s.itemId == entry.itemId) &&
+          entry.itemId != due?.itemId &&
+          entry.itemId != before.previousItemId) {
+        continue;
+      }
+      if (entry.originalPath.isNotEmpty &&
+          await File(entry.originalPath).exists() &&
+          await CarouselPhotoStore.isReady(dir, entry.itemId)) {
+        keep.add(entry);
+      }
+    }
+    return keep;
   }
 
   /// 把一个已就绪的格子写成时间线条目。
@@ -715,31 +824,25 @@ class CarouselEngine {
     required Slot slot,
     required int nowMs,
     required List<PhotoEntry> photos,
+    required Future<bool> Function() canPrepare,
   }) async {
-    if (planId <= 0) return null;
+    if (planId <= 0 || !await canPrepare()) return null;
     try {
       final replacement = await api.substituteCarouselItem(
         credentials,
         planId: planId,
         itemId: slot.itemId,
       );
-      // 该 item 的 asset 已被服务端替换，本地按 item_id 命名的旧文件必须清掉，
-      // 否则会继续显示原来那张坏照片。
-      for (final file in [
-        CarouselPhotoStore.originalFile(dir, slot.itemId),
-        CarouselPhotoStore.renderedFile(dir, 'portrait', slot.itemId),
-        CarouselPhotoStore.renderedFile(dir, 'square', slot.itemId),
-        CarouselPhotoStore.renderedFile(dir, 'largeSquare', slot.itemId),
-      ]) {
-        try {
-          if (await file.exists()) await file.delete();
-        } catch (_) {}
-      }
+      if (!await canPrepare()) return null;
+      // prepare validates the asset marker under its file lock and rebuilds
+      // when the replacement changes identity. Do not delete another writer's
+      // files outside that lock.
       photos.removeWhere((photo) => photo.itemId == slot.itemId);
       final result = await _photoStore.prepare(
         dir: dir,
         item: replacement,
         credentials: credentials,
+        canPrepare: canPrepare,
       );
       if (!result.isReady) return null;
       photos.add(result.photo!.toEntry(nowMs));
@@ -776,6 +879,7 @@ class CarouselEngine {
       }
 
       raw['mode'] = 'carousel';
+      raw['pipeline'] = 'carousel';
       raw['next_slot_at_ms'] = state.nextSlotAtMs;
       raw['next_slot_source'] = state.nextSlotSource.wire;
       raw['current_status'] = state.status.wire;

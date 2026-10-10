@@ -1,7 +1,9 @@
 import 'dart:convert';
+import 'dart:async';
 import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
 import '../models/auth_models.dart';
 import '../models/device_models.dart';
 import '../storage/display_preferences.dart';
@@ -13,6 +15,18 @@ class BloomApiException implements Exception {
   final String message;
   @override
   String toString() => 'BloomApiException($statusCode, $code): $message';
+}
+
+class PhotoUploadCancellation {
+  final _completion = Completer<void>();
+  Future<void> get signal => _completion.future;
+  bool get isCancelled => _completion.isCompleted;
+  bool timedOut = false;
+  void cancel({bool timeout = false}) {
+    if (isCancelled) return;
+    timedOut = timeout;
+    _completion.complete();
+  }
 }
 
 class BloomApiClient {
@@ -507,6 +521,145 @@ class BloomApiClient {
   String discoverImageUrl(String path) =>
       Uri.parse(baseUrl).resolve(path).toString();
 
+  Future<Map<String, dynamic>> userRequest(
+    String token,
+    String path, {
+    String method = 'GET',
+    Map<String, Object?>? body,
+    String? deviceToken,
+    Map<String, String>? query,
+  }) async {
+    final request = http.Request(
+      method,
+      _uri('/api/frame/users/me/$path', query),
+    );
+    request.headers.addAll({
+      ..._userHeaders(token),
+      'Content-Type': 'application/json',
+      if (deviceToken != null) 'X-Frame-Token': deviceToken,
+    });
+    if (body != null) request.body = jsonEncode(body);
+    final response = await http.Response.fromStream(
+      await _client.send(request).timeout(_requestTimeout),
+    );
+    _ensure(response, 200);
+    return _json(response);
+  }
+
+  Future<Uint8List> photoThumbnail(String token, String assetId) async {
+    final response = await _client
+        .get(
+          _uri('/api/frame/users/me/photos/$assetId/thumbnail'),
+          headers: _userHeaders(token),
+        )
+        .timeout(_photoRequestTimeout);
+    _ensure(response, 200);
+    return response.bodyBytes;
+  }
+
+  Future<Map<String, dynamic>> uploadLibraryPhoto(
+    String token,
+    XFile file, {
+    required void Function(double) onProgress,
+    PhotoUploadCancellation? cancellation,
+  }) async {
+    final control = cancellation ?? PhotoUploadCancellation();
+    Timer? idleTimer;
+    void touch() {
+      idleTimer?.cancel();
+      idleTimer = Timer(
+        const Duration(seconds: 90),
+        () => control.cancel(timeout: true),
+      );
+    }
+
+    touch();
+    final totalTimer = Timer(
+      const Duration(minutes: 10),
+      () => control.cancel(timeout: true),
+    );
+    Future<Map<String, dynamic>> send() async {
+      final length = await file.length();
+      final modified = await file.lastModified();
+      if (control.isCancelled) throw http.RequestAbortedException();
+      var sent = 0;
+      final request = _PhotoUploadRequest(
+        _uri('/api/frame/users/me/photos/upload', {
+          'filename': file.name,
+          'modified_at': modified.toUtc().toIso8601String(),
+        }),
+        length,
+        file.openRead().map((chunk) {
+          if (control.isCancelled) throw http.RequestAbortedException();
+          touch();
+          sent += chunk.length;
+          onProgress(length == 0 ? 0 : sent / length);
+          return chunk;
+        }),
+        abortTrigger: control.signal,
+      );
+      request.headers.addAll({
+        ..._userHeaders(token),
+        'Content-Type': 'application/octet-stream',
+      });
+      final response = await http.Response.fromStream(
+        await _client.send(request),
+      );
+      _ensure(response, 200);
+      return _json(response);
+    }
+
+    try {
+      return await Future.any([
+        send(),
+        control.signal.then<Map<String, dynamic>>(
+          (_) =>
+              throw BloomApiException(
+                0,
+                control.timedOut ? 'upload_timeout' : 'upload_cancelled',
+                control.timedOut ? '上传长时间没有进展，请检查网络后重试' : '上传已取消',
+              ),
+        ),
+      ]);
+    } on http.RequestAbortedException {
+      throw BloomApiException(
+        0,
+        control.timedOut ? 'upload_timeout' : 'upload_cancelled',
+        control.timedOut ? '上传长时间没有进展，请检查网络后重试' : '上传已取消',
+      );
+    } finally {
+      idleTimer?.cancel();
+      totalTimer.cancel();
+    }
+  }
+
+  Future<Uint8List> photoPreview(String token, String assetId) async {
+    final response = await _client
+        .get(
+          _uri('/api/frame/users/me/photos/$assetId/preview'),
+          headers: _userHeaders(token),
+        )
+        .timeout(_photoRequestTimeout);
+    _ensure(response, 200);
+    return response.bodyBytes;
+  }
+
+  Future<Map<String, dynamic>> revisePhotoAnalysis(
+    String token,
+    String assetId,
+    String instruction,
+  ) async {
+    final response = await _client
+        .post(
+          _uri('/api/frame/assets/$assetId/analysis/revise'),
+          headers: {..._userHeaders(token), 'Content-Type': 'application/json'},
+          body: jsonEncode({'instruction': instruction}),
+        )
+        .timeout(const Duration(seconds: 90));
+    _ensure(response, 200);
+    return _json(response);
+  }
+
   Map<String, String> _userHeaders(String userToken) => {
     'Authorization': 'Bearer $userToken',
     'Accept': 'application/json',
@@ -610,9 +763,20 @@ class BloomApiClient {
   }
 
   /// 服务端只吊销这一个会话；其他设备上的登录不受影响。
-  Future<void> logoutAccount(String userToken) async {
+  Future<void> logoutAccount(
+    String userToken, {
+    DeviceCredentials? device,
+  }) async {
     final response = await _client
-        .post(_uri('/api/frame/auth/logout'), headers: _userHeaders(userToken))
+        .post(
+          _uri('/api/frame/auth/logout'),
+          headers: {
+            ..._userHeaders(userToken),
+            'Content-Type': 'application/json',
+            if (device != null) 'X-Frame-Token': device.deviceToken,
+          },
+          body: jsonEncode({if (device != null) 'device_id': device.deviceId}),
+        )
         .timeout(_requestTimeout);
     // 204 是正常结果；另外把 401 也当成成功 —— token 本来就无效时，
     // 本地登出必须照样完成，否则用户会卡在"退不出去"的状态里。
@@ -636,7 +800,7 @@ class BloomApiClient {
   }
 
   Map<String, dynamic> _json(http.Response response) =>
-      jsonDecode(response.body) as Map<String, dynamic>;
+      jsonDecode(utf8.decode(response.bodyBytes)) as Map<String, dynamic>;
   void _ensure(http.Response response, int expected, [int? second]) {
     // **Every call, with its status, on one line.**
     //
@@ -686,5 +850,20 @@ class BloomApiClient {
       return parts.isEmpty ? null : parts.join('; ');
     }
     return detail;
+  }
+}
+
+class _PhotoUploadRequest extends http.BaseRequest with http.Abortable {
+  _PhotoUploadRequest(Uri uri, int length, this._stream, {this.abortTrigger})
+    : super('POST', uri) {
+    contentLength = length;
+  }
+  final Stream<List<int>> _stream;
+  @override
+  final Future<void>? abortTrigger;
+  @override
+  http.ByteStream finalize() {
+    super.finalize();
+    return http.ByteStream(_stream);
   }
 }

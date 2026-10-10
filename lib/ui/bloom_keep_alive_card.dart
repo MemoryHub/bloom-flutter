@@ -163,7 +163,7 @@ class _BloomKeepAliveCardState extends State<BloomKeepAliveCard>
   }
 
   Widget _row(KeepAliveItem item) {
-    final revealed = _revealedSteps.contains(item.id);
+    final revealed = _revealedSteps.contains(item.id) || item.needsAck;
     // 读不到状态、且用户已经去看过设置页：给一个「我已开启」收尾，
     // 否则这一项会永远停在「待开启」。
     final askConfirm = item.needsAck && _visited.contains(item.id);

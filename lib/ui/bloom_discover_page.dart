@@ -785,7 +785,9 @@ class BloomExhibitionArtwork extends StatelessWidget {
     super.key,
     required this.api,
     required this.work,
+    this.imageBuilder,
   });
+  final Widget Function(double height)? imageBuilder;
   final BloomApiClient api;
   final Map<String, dynamic> work;
   @override
@@ -836,11 +838,13 @@ class BloomExhibitionArtwork extends StatelessWidget {
                   child: Container(
                     padding: const EdgeInsets.all(1.5),
                     color: const Color(0xffbbb6a9),
-                    child: GalleryImage(
-                      api: api,
-                      path: work['image_url'] as String,
-                      height: height,
-                    ),
+                    child:
+                        imageBuilder?.call(height) ??
+                        GalleryImage(
+                          api: api,
+                          path: work['image_url'] as String,
+                          height: height,
+                        ),
                   ),
                 ),
               ),

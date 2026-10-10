@@ -13,6 +13,7 @@
     <queries>
         <package android:name="com.miui.securitycenter"/>
     </queries>
+    <uses-permission android:name="android.permission.CAMERA" />
     <application
         android:label="bloom"
         android:name="${applicationName}"

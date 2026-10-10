@@ -196,7 +196,7 @@ class _BloomAuthPageState extends State<BloomAuthPage> {
       case 'account_disabled':
         return '账号已被停用，请联系我们';
       case 'account_not_provisioned':
-        return '正在准备你的相册，请稍后重试';
+        return '正在准备你的图库，请稍后重试';
       default:
         final message = error.message.trim();
         if (message.isNotEmpty && message != '请求失败') return message;

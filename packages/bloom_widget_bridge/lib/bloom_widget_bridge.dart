@@ -34,6 +34,9 @@ class BloomWidgetBridgePlatform {
     'mode': mode,
   });
 
+  static Future<void> resetAccountContent() =>
+      _channel.invokeMethod<void>('resetAccountContent');
+
   static Future<void> refresh() =>
       _channel.invokeMethod<void>('refreshWidgets');
 

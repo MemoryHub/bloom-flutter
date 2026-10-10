@@ -1,6 +1,7 @@
 package com.bloom.bloom
 
 import com.bloom.widget_bridge.BloomCarouselState
+import com.bloom.widget_bridge.BloomCarouselAlarms
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -21,6 +22,29 @@ import java.io.File
  * Dart 的 tick 引擎独占。安卓只实现 `current_from_entries` 这一条规则。
  */
 class CarouselVectorsTest {
+
+    @Test
+    fun `下一格已完整准备则到点后补货 缺图仍提前准备`() {
+        val now = 1_000_000L
+        val next = now + 15 * 60_000L
+        assertEquals(next + 60_000L, BloomCarouselAlarms.refillAt(now, next, true))
+        assertEquals(next - 180_000L, BloomCarouselAlarms.refillAt(now, next, false))
+        assertEquals(next + 60_000L, BloomCarouselAlarms.refillAt(next - 30_000L, next, true))
+        assertEquals(next + 30_000L, BloomCarouselAlarms.refillAt(next - 30_000L, next, false))
+        val dir = java.nio.file.Files.createTempDirectory("bloom-refill-test-").toFile()
+        try {
+            val entry = JSONObject().put("date_ms", next)
+            val state = JSONObject().put("timeline_entries", JSONArray().put(entry))
+            val file = File(dir, "ready.photo").apply { writeBytes(byteArrayOf(1)) }
+            listOf("original_path", "portrait_path", "square_path", "large_square_path").forEach { entry.put(it, file.absolutePath) }
+            assertTrue(BloomCarouselAlarms.slotPrepared(state, next))
+            assertEquals(false, BloomCarouselAlarms.slotPrepared(state, next + 60_000L))
+            file.delete()
+            assertEquals(false, BloomCarouselAlarms.slotPrepared(state, next))
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
 
     private fun vectors(): JSONObject {
         // JVM 单测的工作目录是模块目录 android/app。

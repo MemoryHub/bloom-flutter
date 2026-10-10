@@ -114,7 +114,7 @@ void main() {
     expect(find.text('发现测试内容'), findsOneWidget);
     await tapTab(tester, '照片');
     expect(tabIndex(tester), 2);
-    expect(find.text('照片库即将上线'), findsOneWidget);
+    expect(find.text('这里还没有照片'), findsOneWidget);
   });
 
   testWidgets('默认进入首页，首页显示照片卡片', (tester) async {
@@ -174,25 +174,25 @@ void main() {
     await tapTab(tester, '照片');
 
     expect(tabIndex(tester), 2);
-    expect(find.text('照片库即将上线'), findsOneWidget);
+    expect(find.text('这里还没有照片'), findsOneWidget);
     // Nothing from the deleted playback page may be reachable again.
     expect(find.text('播放'), findsNothing);
     expect(find.text('调整时间与频率'), findsNothing);
     expect(find.text('立即下一张'), findsNothing);
   });
 
-  testWidgets('点「设备」→ 设备列表', (tester) async {
+  testWidgets('点「设备」→ 设备列表，未绑定时不虚构相框', (tester) async {
     await tester.pumpWidget(home());
     await settle(tester);
 
     await tapTab(tester, '设备');
 
     expect(tabIndex(tester), 3);
-    expect(find.text('E-Ink'), findsOneWidget);
+    expect(find.text('E-Ink'), findsNothing);
     // Each device is a tile: a small top line (type · state) over a large name.
     // See bloom_device_pages_test.
     // type == name, so the tile's meta line is only the live state
-    expect(find.text('离线'), findsOneWidget);
+    expect(find.text('手机小组件'), findsOneWidget);
     // 添加设备 is a bare ＋ in the header corner now, not a word in the list.
     expect(find.text('添加设备'), findsNothing);
     expect(find.byKey(const ValueKey('bloom-add-device')), findsOneWidget);

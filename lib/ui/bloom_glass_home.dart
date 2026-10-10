@@ -212,6 +212,8 @@ class BloomGlassHome extends StatelessWidget {
   const BloomGlassHome({
     super.key,
     required this.loading,
+    this.hasAssets,
+    this.contentError,
     required this.nextLoading,
     required this.selectedTab,
     required this.settings,
@@ -231,6 +233,7 @@ class BloomGlassHome extends StatelessWidget {
     this.accountBusy = false,
     this.credentials,
     this.discoverPage,
+    this.photoLibraryPage,
     this.portrait,
     this.originalPhotoPath,
     this.content,
@@ -241,10 +244,13 @@ class BloomGlassHome extends StatelessWidget {
   });
 
   final bool loading;
+  final bool? hasAssets;
+  final String? contentError;
 
   final bool nextLoading;
   final int selectedTab;
   final Widget? discoverPage;
+  final Widget? photoLibraryPage;
   final DeviceCredentials? credentials;
   final CachedWidgetImage? portrait;
   final String? originalPhotoPath;
@@ -583,7 +589,6 @@ class BloomGlassHome extends StatelessWidget {
     //
     // 现在无论有没有设备身份都渲染正常界面；**内容由登录状态决定**，每个页面
     // 自己挡住（见各页的未登录分支）。
-    if (loading) return const _BindingCheckExperience();
     return _buildBound(context);
   }
 
@@ -606,7 +611,16 @@ class BloomGlassHome extends StatelessWidget {
         //    没有这一行】—— 明明 main.dart 已经为推荐模式算好了下一格
         //    （推荐没有服务端计划戳，它的节奏由固定作息给出），却在这一层被
         //    丢掉。两种模式都有下一次更新，这个条件本身就是错的。
-        nextSlotText: widgetEnabled ? nextSlotText(settings, nextSlotAt) : null,
+        nextSlotText:
+            widgetEnabled && hasAssets != false && account?.immichReady == true
+                ? nextSlotText(settings, nextSlotAt)
+                : null,
+        loading: loading,
+        hasAssets: hasAssets,
+        contentError: contentError,
+        onRetry: onRefresh,
+        onOpenPhotos: () => onTabChanged(2),
+        onOpenDiscover: () => onTabChanged(1),
         originalPhotoPath: originalPhotoPath,
         portraitPath:
             portrait?.recommendationId == content?.recommendationId
@@ -615,14 +629,24 @@ class BloomGlassHome extends StatelessWidget {
         content: content,
         date: date,
         mode: settings.mode,
-        devices: devices,
+        devices:
+            devices
+                .where(
+                  (device) =>
+                      device.isLocal || device.isFrame && device.canManage,
+                )
+                .toList(),
         selectedDeviceId: selectedDeviceId,
         onDeviceChanged: onDeviceChanged,
         account: account,
         onSignIn: onAccountTap,
       ),
       discoverPage ?? const SizedBox.shrink(),
-      _PhotoLibraryPlaceholderPage(account: account, onSignIn: onAccountTap),
+      photoLibraryPage ??
+          _PhotoLibraryPlaceholderPage(
+            account: account,
+            onSignIn: onAccountTap,
+          ),
       BloomDeviceListPage(
         devices: devices,
         widgetEnabled: widgetEnabled,
@@ -1150,6 +1174,12 @@ class _PaperGrainPainter extends CustomPainter {
 class _PhotoPage extends StatelessWidget {
   const _PhotoPage({
     required this.nextSlotText,
+    required this.loading,
+    required this.hasAssets,
+    required this.contentError,
+    required this.onRetry,
+    required this.onOpenPhotos,
+    required this.onOpenDiscover,
     required this.originalPhotoPath,
     this.portraitPath,
     required this.content,
@@ -1163,6 +1193,12 @@ class _PhotoPage extends StatelessWidget {
   });
 
   final String? nextSlotText;
+  final bool loading;
+  final bool? hasAssets;
+  final String? contentError;
+  final VoidCallback onRetry;
+  final VoidCallback onOpenPhotos;
+  final VoidCallback onOpenDiscover;
 
   final String? originalPhotoPath;
   final String? portraitPath;
@@ -1195,6 +1231,7 @@ class _PhotoPage extends StatelessWidget {
       // The sheet is bottom-anchored, but a tall one (or a landscape cutout) can
       // still reach the top insets — let the framework keep it clear.
       useSafeArea: true,
+      isScrollControlled: true,
       backgroundColor: BloomInk.panel,
       barrierColor: const Color(0x99000000),
       shape: const RoundedRectangleBorder(
@@ -1222,30 +1259,46 @@ class _PhotoPage extends StatelessWidget {
                     ),
                   ),
                 ),
-                for (final device in devices)
-                  ListTile(
-                    key: ValueKey('bloom-device-option-${device.deviceId}'),
-                    leading: Icon(
-                      device.isFrame
-                          ? Icons.devices_rounded
-                          : Icons.phone_iphone_rounded,
-                      size: 19,
-                      color: BloomInk.textMuted,
+                Flexible(
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxHeight: MediaQuery.sizeOf(context).height * .65,
                     ),
-                    title: Text(device.name, style: BloomType.rowTitle),
-                    subtitle: Text(
-                      '${device.typeLabel} · ${device.presenceLabel}',
-                      style: BloomType.meta,
+                    child: ListView.builder(
+                      key: const ValueKey('bloom-device-picker-list'),
+                      shrinkWrap: true,
+                      itemCount: devices.length,
+                      itemBuilder: (context, index) {
+                        final device = devices[index];
+                        return ListTile(
+                          key: ValueKey(
+                            'bloom-device-option-${device.deviceId}',
+                          ),
+                          leading: Icon(
+                            device.isFrame
+                                ? Icons.devices_rounded
+                                : Icons.phone_iphone_rounded,
+                            size: 19,
+                            color: BloomInk.textMuted,
+                          ),
+                          title: Text(device.name, style: BloomType.rowTitle),
+                          subtitle: Text(
+                            '${device.typeLabel} · ${device.presenceLabel}',
+                            style: BloomType.meta,
+                          ),
+                          trailing:
+                              device.deviceId == selectedDeviceId
+                                  ? const Icon(
+                                    Icons.check_rounded,
+                                    color: BloomInk.accent,
+                                  )
+                                  : null,
+                          onTap: () => Navigator.pop(context, device.deviceId),
+                        );
+                      },
                     ),
-                    trailing:
-                        device.deviceId == selectedDeviceId
-                            ? const Icon(
-                              Icons.check_rounded,
-                              color: BloomInk.accent,
-                            )
-                            : null,
-                    onTap: () => Navigator.pop(context, device.deviceId),
                   ),
+                ),
                 const SizedBox(height: 12),
               ],
             ),
@@ -1420,7 +1473,8 @@ class _PhotoPage extends StatelessWidget {
                               BloomDeviceSwitch(
                                 key: const ValueKey('bloom-device-switcher'),
                                 deviceName: selected?.name ?? '手机小组件',
-                                label: remoteSelected ? 'E-Ink' : '小组件',
+                                label:
+                                    selected?.isFrame == true ? 'E-Ink' : '小组件',
                                 onTap:
                                     devices.length > 1
                                         ? () => _pickDevice(context)
@@ -1459,9 +1513,21 @@ class _PhotoPage extends StatelessWidget {
                                   remoteSelected
                                       ? _RemoteDeviceCard(
                                         deviceName: selected.name,
+                                        isFrame: selected.isFrame,
                                       )
                                       : !hasPhoto
-                                      ? const _PhotoLoadingCard()
+                                      ? (loading &&
+                                              account!.immichReady &&
+                                              hasAssets != false
+                                          ? const _PhotoLoadingCard()
+                                          : _PhotoStartCard(
+                                            account: account!,
+                                            error: contentError,
+                                            hasAssets: hasAssets,
+                                            onRetry: onRetry,
+                                            onOpenPhotos: onOpenPhotos,
+                                            onOpenDiscover: onOpenDiscover,
+                                          ))
                                       : _LetterPhotoCard(
                                         key: const ValueKey(
                                           'bloom-letter-card',
@@ -1608,12 +1674,21 @@ class _PhotoLibraryPlaceholderPage extends StatelessWidget {
                 account == null
                     ? BloomSignInPrompt(
                       key: const ValueKey('bloom-photos-signed-out'),
-                      illustration: const _EmptyFrameIllustration(),
-                      title: '照片库即将上线',
-                      message: '以后可以在这里回看每天推荐过的照片。',
+                      illustration: const BloomEmptyFrameIllustration(),
+                      title: '登录后查看你的照片',
+                      message: '在这里回看照片，把回忆带到你的设备上。',
                       onSignIn: onSignIn,
                     )
-                    : const _PhotoLibraryComingSoon(),
+                    : const Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          BloomEmptyFrameIllustration(),
+                          SizedBox(height: 22),
+                          Text('这里还没有照片', style: BloomType.rowTitle),
+                        ],
+                      ),
+                    ),
           ),
         ),
       ],
@@ -1625,8 +1700,8 @@ class _PhotoLibraryPlaceholderPage extends StatelessWidget {
 ///
 /// 单独抽出来是为了让**未登录与已登录两种状态共用同一张图**：登录前后只差
 /// 一个按钮，图不该跟着变。
-class _EmptyFrameIllustration extends StatelessWidget {
-  const _EmptyFrameIllustration();
+class BloomEmptyFrameIllustration extends StatelessWidget {
+  const BloomEmptyFrameIllustration({super.key});
 
   @override
   Widget build(BuildContext context) => Container(
@@ -1657,27 +1732,6 @@ class _EmptyFrameIllustration extends StatelessWidget {
 }
 
 /// 已登录时的照片页。功能还没做，所以仍然是"即将上线"。
-class _PhotoLibraryComingSoon extends StatelessWidget {
-  const _PhotoLibraryComingSoon();
-
-  @override
-  Widget build(BuildContext context) => const Center(
-    child: Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        _EmptyFrameIllustration(),
-        SizedBox(height: 22),
-        Text('照片库即将上线', style: BloomType.rowTitle),
-        SizedBox(height: 8),
-        Text(
-          '以后可以在这里回看每天推荐过的照片。',
-          textAlign: TextAlign.center,
-          style: BloomType.body,
-        ),
-      ],
-    ),
-  );
-}
 
 /// 切换器指向相框时显示的卡片。
 ///
@@ -1690,9 +1744,10 @@ class _PhotoLibraryComingSoon extends StatelessWidget {
 /// `devices_share_user` 授权，同一账号下的设备可互操作），**看不到照片**。
 /// 留着一句永远兑现不了的承诺，比不写更糟。
 class _RemoteDeviceCard extends StatelessWidget {
-  const _RemoteDeviceCard({required this.deviceName});
+  const _RemoteDeviceCard({required this.deviceName, required this.isFrame});
 
   final String deviceName;
+  final bool isFrame;
 
   @override
   Widget build(BuildContext context) => Center(
@@ -1708,14 +1763,14 @@ class _RemoteDeviceCard extends StatelessWidget {
             color: BloomInk.textMuted,
           ),
           const SizedBox(height: 12),
-          const Text(
-            '照片只显示在相框自己的屏幕上',
+          Text(
+            isFrame ? '照片显示在这台相框上' : '照片显示在这台手机的小组件上',
             textAlign: TextAlign.center,
             style: BloomType.rowTitle,
           ),
           const SizedBox(height: 8),
           Text(
-            '“$deviceName”是一台独立设备，它的照片不会同步到手机。'
+            '当前选择的是“$deviceName”。本机首页暂时无法预览它正在显示的照片。'
             '你可以在设备设置里调整它的刷新节奏与内容来源。',
             textAlign: TextAlign.center,
             style: BloomType.body,
@@ -2074,79 +2129,6 @@ class _LetterPhotoFallback extends StatelessWidget {
     color: Color(0xffD8D2C7),
     child: Center(
       child: Icon(Icons.photo_outlined, color: Color(0xff817A70), size: 36),
-    ),
-  );
-}
-
-class _BindingCheckExperience extends StatelessWidget {
-  const _BindingCheckExperience();
-
-  @override
-  Widget build(BuildContext context) => Material(
-    color: Colors.transparent,
-    child: BloomAtmosphere(
-      child: SafeArea(
-        minimum: const EdgeInsets.all(24),
-        child: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // The wordmark is the only serif on a splash, and the only place
-              // the app shouts: everything below it is a label.
-              const Text(
-                'Bloom',
-                style: TextStyle(
-                  color: BloomInk.text,
-                  fontSize: 34,
-                  height: 1.15,
-                  fontWeight: FontWeight.w600,
-                  fontFamily: BloomType.serifFamily,
-                  fontFamilyFallback: BloomType.serifFallback,
-                ),
-              ),
-              const SizedBox(height: 9),
-              const Text('把记忆留在每天看得见的地方', style: BloomType.body),
-              const SizedBox(height: 30),
-              BloomPanel(
-                lifted: true,
-                padding: const EdgeInsets.symmetric(horizontal: 22),
-                child: const SizedBox(
-                  width: 286,
-                  height: 108,
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: [
-                      SizedBox(
-                        width: 27,
-                        height: 27,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2.2,
-                          color: BloomInk.accent,
-                        ),
-                      ),
-                      SizedBox(width: 17),
-                      Expanded(
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text('正在连接 Bloom', style: BloomType.rowTitle),
-                            SizedBox(height: 7),
-                            // 原来写的是"正在确认设备绑定状态…"。绑定已经不在
-                            // 启动路径上了（它发生在登录时），这句话只会让人
-                            // 以为 App 又在检查什么配对状态。
-                            Text('正在同步你的相框…', style: BloomType.meta),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
     ),
   );
 }
@@ -2876,6 +2858,77 @@ class BloomIconButton extends StatelessWidget {
               : Icon(icon, size: 17, color: BloomInk.text),
     ),
   );
+}
+
+class _PhotoStartCard extends StatelessWidget {
+  const _PhotoStartCard({
+    required this.account,
+    required this.error,
+    required this.hasAssets,
+    required this.onRetry,
+    required this.onOpenPhotos,
+    required this.onOpenDiscover,
+  });
+  final AccountInfo account;
+  final String? error;
+  final bool? hasAssets;
+  final VoidCallback onRetry;
+  final VoidCallback onOpenPhotos;
+  final VoidCallback onOpenDiscover;
+
+  @override
+  Widget build(BuildContext context) {
+    final preparing = !account.immichReady;
+    final failed = error != null || account.provisionFailed;
+    final empty = !preparing && !failed && hasAssets == false;
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const BloomEmptyFrameIllustration(),
+            const SizedBox(height: 22),
+            Text(
+              empty
+                  ? '还没有可展示的照片'
+                  : failed
+                  ? '暂时无法获取照片'
+                  : preparing
+                  ? '正在准备你的图库'
+                  : '准备好你的第一张照片',
+              textAlign: TextAlign.center,
+              style: BloomType.rowTitle,
+            ),
+            const SizedBox(height: 10),
+            Text(
+              empty
+                  ? '上传自己的照片，或在发现里选择艺术作品。'
+                  : failed
+                  ? (error ?? '图库暂未准备完成，请稍后重试。')
+                  : preparing
+                  ? '账号已注册成功，准备完成后会自动继续。'
+                  : '稍后重试，已有照片会继续保留。',
+              textAlign: TextAlign.center,
+              style: BloomType.body,
+            ),
+            const SizedBox(height: 22),
+            BloomPrimaryButton(
+              label: empty ? '去上传照片' : '重试',
+              onPressed: empty ? onOpenPhotos : onRetry,
+            ),
+            if (empty) ...[
+              const SizedBox(height: 12),
+              TextButton(
+                onPressed: onOpenDiscover,
+                child: const Text('选择艺术作品', style: BloomType.meta),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _PhotoLoadingCard extends StatefulWidget {

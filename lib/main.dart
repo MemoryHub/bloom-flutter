@@ -13,9 +13,14 @@ import 'core/models/device_models.dart';
 import 'core/storage/daily_content_repository.dart';
 import 'core/storage/device_identity_repository.dart';
 import 'core/storage/display_preferences.dart';
+import 'core/storage/content_sync_epoch.dart';
 import 'platform/widget_bridge.dart';
 import 'ui/bloom_auth_pages.dart';
 import 'ui/bloom_device_pages.dart';
+import 'ui/bloom_photo_library_page.dart';
+import 'ui/bloom_device_sharing_page.dart';
+import 'ui/bloom_confirmation_dialog.dart';
+import 'package:bloom_widget_bridge/bloom_widget_bridge.dart';
 import 'ui/bloom_glass_home.dart';
 import 'ui/bloom_discover_page.dart';
 
@@ -132,13 +137,20 @@ class _BloomHomePageState extends State<BloomHomePage>
   /// Fires exactly when the next slot begins.
   Timer? _slotWake;
   Timer? _followNative;
+  Timer? _deviceListWatch;
+  Timer? _accountReadyRetry;
+  int _accountRetryAttempt = 0;
+  bool _accountRefreshInFlight = false;
+  bool? _hasAssets;
+  String? _contentError;
   DeviceCredentials? _credentials;
   CachedWidgetImage? _portrait;
   DailyContent? _content;
   String? _originalPhotoPath;
   int? _nextSlotAt;
   bool _loadInFlight = false;
-  DateTime? _loadStartedAt;
+  bool _loadPending = false;
+  int _settingsRevision = 0;
   DateTime? _pausedAt;
   String? _date;
   String? _message;
@@ -158,38 +170,55 @@ class _BloomHomePageState extends State<BloomHomePage>
 
   /// F1 账号状态。
   ///
-  /// [_account] 为 null 表示未登录。登录与否**不影响**小组件换图 ——
-  /// 那条路径走设备令牌，与账号无关，所以这里从不阻止 `_load()`。
+  /// [_account] 为 null 表示未登录；退出会清除取图凭据，
+  /// 首页不发内容请求，小组件清除旧账号画面和预存时间线。
   AccountInfo? _account;
 
-  /// 登录后从服务端取回的真实绑定关系（服务端模型，转成 [BloomDevice] 由
-  /// `bloomDevicesFromRemote` 负责）。空列表时设备页回退到硬编码列表，
-  /// 这样未登录和"登录了但还没绑定任何设备"都不会让页面变成一片空白。
+  /// 登录后从服务端取回的设备归属关系。相册成员不进入这个列表；
+  /// 请求尚未返回时，仅用本机作为占位。
   List<UserDevice> _remoteDevices = const [];
+  String? _devicesLoadingToken;
+  int _devicesRequestGeneration = 0;
 
   bool _accountBusy = false;
+  bool _signOutConfirming = false;
 
   @override
   void initState() {
     super.initState();
+    _deviceListWatch = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (mounted && _pausedAt == null && _selectedTab == 3) {
+        unawaited(_loadRemoteDevices());
+      }
+    });
     // **Follow the widget continuously.** The app read the native current item only
     // while it ran a sync, so between syncs the widget could advance while the card
     // stayed behind — the "widget and app show different photos" symptom. Re-reading
     // it every 20 s while the page is alive removes the gap by construction.
     _followNative = Timer.periodic(const Duration(seconds: 20), (_) async {
-      if (!mounted || _loading) return;
+      if (!mounted || _loading || !_auth.isSignedIn) return;
+      final revision = _settingsRevision;
       final repository = DailyContentRepository(api: _api);
       await repository.drainWidgetTimelineLog();
+      if (!mounted || revision != _settingsRevision) return;
       final nextAt =
-          _displaySettings.usesScheduledPlan
+          _displaySettings.mode == BloomDisplayMode.carousel
               ? await repository.nextSlotAtMillis()
               : _nextRecommendSlotMs(_displaySettings);
-      if (mounted && nextAt != null && nextAt != _nextSlotAt) {
+      if (!mounted || revision != _settingsRevision) return;
+      if (nextAt != null && nextAt != _nextSlotAt) {
         setState(() => _nextSlotAt = nextAt);
+        unawaited(_armNextSlotWake());
       }
-      final native = await repository.nativeContent();
+      final expectedMode =
+          _displaySettings.usesScheduledPlan ? 'carousel' : 'recommend';
+      final native = await repository.nativeContent(expectedMode: expectedMode);
       if (!mounted || native == null) return;
-      if (native.recommendationId == _content?.recommendationId) return;
+      if (native.recommendationId == _content?.recommendationId &&
+          _hasAssets != false &&
+          _contentError == null) {
+        return;
+      }
       // ⚠️ **照片要跟着动，不能只换文案。** 原来这里只 setState 了 `_content`
       //    （文案），照片仍是上一张 —— 而 [Repository.photoPathFor] 按 id 取
       //    路径这件事本来就是为「照片与文案同源」做的。只换文案正好把这条
@@ -197,17 +226,27 @@ class _BloomHomePageState extends State<BloomHomePage>
       //    冷启动时这个定时器以前被 `_loading` 挡着（一轮 sync 要 60 秒），
       //    现在本机那张会先被画上去，`_loading` 提前转 false，它就会真的跑 ——
       //    所以这里必须把路径一起换掉。
-      final path = await repository.photoPathFor(native.recommendationId);
-      if (!mounted || path == null) return;
+      final path = await repository.photoPathFor(
+        native.recommendationId,
+        mode: expectedMode,
+      );
+      if (!mounted || revision != _settingsRevision || path == null) return;
       final portrait = await repository.cached('portrait');
       setState(() {
         _content = native;
+        // Background sync can receive a contributor's first photo while the
+        // foreground still remembers the device's earlier empty-library status.
+        // Adopt readiness with the verified local image, not only its pixels.
+        _hasAssets = true;
+        _paired = true;
+        _contentError = null;
         _originalPhotoPath = path;
         _portrait =
             portrait?.recommendationId == native.recommendationId
                 ? portrait
                 : null;
       });
+      unawaited(_armNextSlotWake());
     });
     WidgetsBinding.instance.addObserver(this);
     _startSlotWatch();
@@ -237,6 +276,16 @@ class _BloomHomePageState extends State<BloomHomePage>
     _slotWatch?.cancel();
     _slotWatch = Timer.periodic(const Duration(seconds: 30), (_) async {
       if (!mounted || _loading || !_widgetEnabled) return;
+      // A new device has no grid to be behind. While it is open, recheck an
+      // empty library so another account's first contribution becomes visible
+      // without requiring the owner to restart the app.
+      if (_hasAssets == false &&
+          _pausedAt == null &&
+          _auth.isSignedIn &&
+          _account?.immichReady == true) {
+        await _load(showSpinner: false);
+        return;
+      }
       // **Only the fallback it was always described as.** The one-shot timer
       // above wakes exactly at `next_slot_at_ms`; polling on top of it made the
       // app re-sync every 30 seconds for as long as the page was on screen, and
@@ -267,22 +316,22 @@ class _BloomHomePageState extends State<BloomHomePage>
   /// when the file is missing, the slot is in the past, or the write raced the
   /// read — it is no longer the mechanism.
   Future<void> _armNextSlotWake() async {
+    _slotWake?.cancel();
     // ⚠️ 推荐的下一格**不在** `next_slot_at_ms` 里（那是轮播的戳，推荐路径不写）。
     //    在推荐模式下读它只会拿到上一轮轮播留下的过期值，于是这次唤醒要么永远
     //    不响、要么在错误的时刻响。两边用同一个来源：推荐按固定作息算。
     final at =
-        !_displaySettings.usesScheduledPlan
+        _displaySettings.mode != BloomDisplayMode.carousel
             ? _nextRecommendSlotMs(_displaySettings)
             : await DailyContentRepository(api: _api).nextSlotAtMillis();
     if (!mounted || at == null) return;
     final delay = at - DateTime.now().millisecondsSinceEpoch;
     if (delay <= 0) return;
-    _slotWake?.cancel();
     _slotWake = Timer(Duration(milliseconds: delay + 1500), () async {
       if (!mounted || !_widgetEnabled) return;
       // Advance the label from the local grid before a network/photo sync.
       final nextAt =
-          _displaySettings.usesScheduledPlan
+          _displaySettings.mode == BloomDisplayMode.carousel
               ? await DailyContentRepository(api: _api).nextSlotAtMillis()
               : _nextRecommendSlotMs(_displaySettings);
       if (mounted && nextAt != null) setState(() => _nextSlotAt = nextAt);
@@ -293,7 +342,7 @@ class _BloomHomePageState extends State<BloomHomePage>
 
   /// 推荐模式的下一次更新时间。
   ///
-  /// 推荐【没有服务端计划戳】—— 那是轮播的概念。它的节奏由固定作息给出:
+  /// 推荐也使用共享计划，但首页的下一时点按推荐作息计算，避免沿用旧轮播戳。
   /// 在 06:00–22:00 之间每 12 小时落一格，所以是 06:00 与 18:00，窗口结束
   /// 之后就是明天 06:00。这样推荐模式下首页也有「下次更新」。
   static int? _nextRecommendSlotMs(BloomDisplaySettings settings) {
@@ -332,6 +381,8 @@ class _BloomHomePageState extends State<BloomHomePage>
 
   @override
   void dispose() {
+    _accountReadyRetry?.cancel();
+    _deviceListWatch?.cancel();
     _followNative?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _slotWake?.cancel();
@@ -362,14 +413,21 @@ class _BloomHomePageState extends State<BloomHomePage>
   /// 让它离开"正在准备设备标识…"。两个都只是"我们已经证明过自己在显示照片"
   /// 的推论 —— 随后真实的 `/status` 仍然可以把它们改回去（未配对、无素材）。
   Future<void> _paintLocalContent() async {
+    final revision = _settingsRevision;
     final repository = DailyContentRepository(api: _api);
     CachedWidgetImage? portrait;
     DailyContent? content;
     String? photoPath;
     try {
       final native = await WidgetBridge().readCurrentState();
-      if (native != null) {
-        final path = await repository.photoPathFor(native.recommendationId);
+      final expectedMode =
+          _displaySettings.usesScheduledPlan ? 'carousel' : 'recommend';
+      if (native != null &&
+          (native.mode == null || native.mode == expectedMode)) {
+        final path = await repository.photoPathFor(
+          native.recommendationId,
+          mode: native.mode,
+        );
         if (path != null && await File(path).exists()) {
           photoPath = path;
           content = await repository.contentForNative(native);
@@ -397,12 +455,12 @@ class _BloomHomePageState extends State<BloomHomePage>
         // 什么都没有（第一次安装 / 缓存被清）：交给下面正常的联网路径。
       }
     }
-    if (photoPath == null || !mounted) return;
+    if (photoPath == null || !mounted || revision != _settingsRevision) return;
     final nextAt =
-        _displaySettings.usesScheduledPlan
+        _displaySettings.mode == BloomDisplayMode.carousel
             ? await repository.nextSlotAtMillis()
             : _nextRecommendSlotMs(_displaySettings);
-    if (!mounted) return;
+    if (!mounted || revision != _settingsRevision) return;
     debugPrint(
       '[BloomUI] local-first show id=${content?.recommendationId} '
       'photo=$photoPath',
@@ -423,18 +481,11 @@ class _BloomHomePageState extends State<BloomHomePage>
     // all ask within the same second, and a second sync would only race the
     // first for the same files (and double the refill's network cost).
     if (_loadInFlight) {
-      final started = _loadStartedAt;
-      if (started != null &&
-          DateTime.now().difference(started) < const Duration(seconds: 60)) {
-        return;
-      }
-      // **A stuck load must not freeze every later refresh.** A download can
-      // outlive its own timeout, and the guard is only there to stop two *live*
-      // syncs racing for the same files — so once the holder is this old, let the
-      // new one through.
+      _loadPending = true;
+      return;
     }
     _loadInFlight = true;
-    _loadStartedAt = DateTime.now();
+    final settingsRevision = _settingsRevision;
     if (showSpinner && mounted) setState(() => _loading = true);
     try {
       // **未登录：不 initialize、不请求、不落任何东西。**
@@ -457,6 +508,17 @@ class _BloomHomePageState extends State<BloomHomePage>
         });
         return;
       }
+      if (_account?.immichReady != true || !await _identity.hasServerToken()) {
+        await _refreshAccount();
+        if (!mounted || settingsRevision != _settingsRevision) return;
+        if (_account?.immichReady != true ||
+            !await _identity.hasServerToken()) {
+          setState(() => _loading = false);
+          _scheduleAccountReadyRetry();
+          return;
+        }
+      }
+      if (mounted) setState(() => _contentError = null);
       // 可重新赋值：服务端认领设备后会下发新令牌，401 分支要用新令牌重试。
       var credentials = await _identity.initialize();
       // Device identity is local state and must remain visible even when the
@@ -464,14 +526,8 @@ class _BloomHomePageState extends State<BloomHomePage>
       if (mounted) {
         setState(() => _credentials = credentials);
       }
-      // Local-only, and deliberately *not* `read()`: the mirror
-      // (`bloom.display_mode` + the three `bloom.carousel_*` keys) is the phone
-      // widget's own record, and a server read here would (a) write the frame's
-      // `eink` schedule into it, changing the phone widget's cadence, and
-      // (b) put a network round trip in front of the first frame even though
-      // the photo page shows no settings at all. `readLocal()` touches neither
-      // the network nor the mirror and still gives the photo page the phone's
-      // own mode, which picks the carousel/recommendation sync path.
+      // Paint using this phone's local mirror first; then read its complete
+      // mobile settings. Never use the selected physical frame's eink schedule.
       final displaySettingsFuture = _displayPreferences.readLocal();
       // **The master switch, ahead of every request.** With the widget switched
       // off the app must not read a single byte from the server — the user's
@@ -508,7 +564,9 @@ class _BloomHomePageState extends State<BloomHomePage>
       //    「下次更新」**只有保存过设置之后才会出现**，冷启动永远没有那一行。
       //    下面同步路径里那一处赋值只是复核（设置可能刚被改过），不是唯一来源。
       final localSettings = await displaySettingsFuture;
-      if (!localSettings.usesScheduledPlan && mounted) {
+      if (!mounted || settingsRevision != _settingsRevision) return;
+      setState(() => _displaySettings = localSettings);
+      if (localSettings.mode != BloomDisplayMode.carousel && mounted) {
         setState(() => _nextSlotAt = _nextRecommendSlotMs(localSettings));
       }
       // ⭐ **本机已有的那张，先画上去 —— 在任何网络请求之前。**
@@ -527,6 +585,29 @@ class _BloomHomePageState extends State<BloomHomePage>
         const Duration(milliseconds: 600),
         onTimeout: () => debugPrint('[BloomUI] local-first paint timed out'),
       );
+      // Read this phone's complete settings after painting its local photo.
+      // Mode alone cannot detect a changed window, cadence or art selection.
+      var displaySettings =
+          await _displayPreferences.readServer(
+            credentials: credentials,
+            target: BloomApiClient.settingsTargetMobile,
+            api: _api,
+          ) ??
+          localSettings;
+      if (!mounted || settingsRevision != _settingsRevision) return;
+      await _displayPreferences.cacheLocal(displaySettings);
+      if (!mounted || settingsRevision != _settingsRevision) return;
+      setState(() {
+        _displaySettings = displaySettings;
+        if (ContentSyncEpoch.settingsKey(displaySettings) !=
+            ContentSyncEpoch.settingsKey(localSettings)) {
+          _nextSlotAt =
+              displaySettings.mode == BloomDisplayMode.carousel
+                  ? null
+                  : _nextRecommendSlotMs(displaySettings);
+        }
+      });
+      await configureBackgroundSync(displaySettings);
       DeviceStatus? status;
       // **不再走 `register()`。** 那是账号出现之前的机制：它靠激活码授权，
       // 建出来的是一台"未配对"设备，于是 App 又把用户送回"设备 ID + 激活码"
@@ -539,13 +620,24 @@ class _BloomHomePageState extends State<BloomHomePage>
         status = await _api.status(credentials);
       } on BloomApiException catch (error) {
         if (error.statusCode == 401 &&
-            error.code == 'device_authentication_required') {
-          await _ensureDeviceClaimed();
+            (error.code == 'device_authentication_required' ||
+                error.code == 'invalid_device_token')) {
+          if (!await _ensureDeviceClaimed(forceRefresh: true)) rethrow;
           final refreshed = await _identity.read();
           if (refreshed == null) rethrow;
           credentials = refreshed;
           if (mounted) setState(() => _credentials = refreshed);
           status = await _api.status(refreshed);
+          displaySettings =
+              await _displayPreferences.readServer(
+                credentials: refreshed,
+                target: BloomApiClient.settingsTargetMobile,
+                api: _api,
+              ) ??
+              displaySettings;
+          if (!mounted || settingsRevision != _settingsRevision) return;
+          await _displayPreferences.cacheLocal(displaySettings);
+          await configureBackgroundSync(displaySettings);
         } else {
           rethrow;
         }
@@ -559,7 +651,7 @@ class _BloomHomePageState extends State<BloomHomePage>
       String? message;
       WidgetCurrentState? nativeState;
       var nativeStateApplied = false;
-      var displaySettings = await displaySettingsFuture;
+      if (!mounted || settingsRevision != _settingsRevision) return;
       // **The server's own answer wins, and the mirror is made to agree.**
       //
       // `/status` carries the mode the server wants this device in on every
@@ -632,12 +724,11 @@ class _BloomHomePageState extends State<BloomHomePage>
           final nativeBeforePortrait = nativeBeforeSync?.portraitPath;
           final nativeBeforeIsCurrent =
               nativeBeforeSync != null &&
+              displaySettings.usesScheduledPlan &&
               nativeBeforeSync.mode == 'carousel' &&
               nativeBeforePortrait != null &&
               await File(nativeBeforePortrait).exists() &&
-              (cachedBeforeSync == null ||
-                  nativeBeforeSync.recommendationId >=
-                      cachedBeforeSync.recommendationId);
+              nativeBeforeSync.mode == 'carousel';
           final nativeBeforeOriginal = await repository.photoPathFor(
             nativeBeforeSync?.recommendationId,
           );
@@ -681,16 +772,11 @@ class _BloomHomePageState extends State<BloomHomePage>
               // so this path catches it just as early.
               unawaited(_watchNextSlot(repository));
             }
-            // ⚠️ 推荐走它自己的算法路径，不与轮播共用引擎（见
-            //    background_sync.dart 的说明）。
-            content =
-                displaySettings.usesScheduledPlan
-                    ? await repository.syncCarousel(
-                      credentials,
-                      displaySettings,
-                      foreground: true,
-                    )
-                    : await repository.sync(credentials);
+            content = await repository.syncCarousel(
+              credentials,
+              displaySettings,
+              foreground: true,
+            );
           } catch (error, stack) {
             // **Never swallow this silently again.** The user-visible notice
             // ("正在显示上一张") is the *only* thing this catch produced, so a
@@ -706,6 +792,7 @@ class _BloomHomePageState extends State<BloomHomePage>
           // mode while Flutter is not running. Read their shared current item
           // before presenting the page so the app never rolls back to its
           // older daily.json snapshot.
+          if (!mounted || settingsRevision != _settingsRevision) return;
           final native = await WidgetBridge().readCurrentState();
           nativeState = native;
           // **The item's own immutable copy wins over the path the native state
@@ -717,16 +804,17 @@ class _BloomHomePageState extends State<BloomHomePage>
           final nativePhoto =
               native == null
                   ? null
-                  : await repository.photoPathFor(native.recommendationId);
+                  : await repository.photoPathFor(
+                    native.recommendationId,
+                    mode: native.mode,
+                  );
           final nativePhotoExists =
               nativePhoto != null && await File(nativePhoto).exists();
           final expectedMode =
               displaySettings.usesScheduledPlan ? 'carousel' : 'recommend';
-          final networkId = content?.recommendationId ?? 0;
           if (native != null &&
               nativePhotoExists &&
-              (native.mode == null || native.mode == expectedMode) &&
-              native.recommendationId >= networkId) {
+              (native.mode == null || native.mode == expectedMode)) {
             content = await repository.contentForNative(
               native,
               fallback: content,
@@ -764,7 +852,7 @@ class _BloomHomePageState extends State<BloomHomePage>
           //    推荐的节奏由固定作息唯一决定（06:00–22:00 / 12 小时 → 06:00、18:00），
           //    所以这里直接按作息算，冷启动和保存后走同一个来源。
           nextSlotAt =
-              !displaySettings.usesScheduledPlan
+              displaySettings.mode != BloomDisplayMode.carousel
                   ? _nextRecommendSlotMs(displaySettings)
                   : await repository.nextSlotAtMillis();
           debugPrint(
@@ -794,6 +882,7 @@ class _BloomHomePageState extends State<BloomHomePage>
                   : await repository.cached('largeSquare');
           date = content?.date;
           await _evictOriginalPhoto(originalPhotoPath);
+          if (!mounted || settingsRevision != _settingsRevision) return;
           if (portrait != null &&
               portrait.recommendationId == content?.recommendationId &&
               originalPhotoPath != null) {
@@ -820,7 +909,7 @@ class _BloomHomePageState extends State<BloomHomePage>
             );
           }
         } else {
-          message = '已经绑定，照片准备好后会自动显示。';
+          message = null;
         }
       } else {
         // 设备还没挂到账号的 Immich 用户名下 —— 注册之后 provisioning 还没跑完
@@ -829,13 +918,15 @@ class _BloomHomePageState extends State<BloomHomePage>
         // **不再启动配对轮询**：归属现在由登录决定，没有需要用户参与的"配对"
         // 这回事了。每 5 秒问一次服务器只是白耗电；下一次 `_load`（回到前台、
         // 或用户下拉刷新）自然会重试。
-        message = '正在准备你的相册，稍后就能看到照片。';
+        message = '正在准备你的图库，稍后就能看到照片。';
       }
 
       if (!mounted) return;
+      if (settingsRevision != _settingsRevision) return;
       await _evictPreviewImages([portrait]);
       if (!mounted) return;
       await _precacheIncoming(originalPhotoPath);
+      if (!mounted || settingsRevision != _settingsRevision) return;
       // 提到闭包外面：`status` 在 try/catch 里会被重新赋值，所以在闭包里读它
       // 拿不到流分析的类型收窄（会报"接收者可能是 null"）。
       final isPaired = status.paired;
@@ -850,7 +941,8 @@ class _BloomHomePageState extends State<BloomHomePage>
           _content = content;
           _originalPhotoPath = originalPhotoPath;
         }
-        _nextSlotAt = nextSlotAt ?? _nextSlotAt;
+        _hasAssets = status!.hasAssets;
+        _nextSlotAt = _hasAssets == false ? null : nextSlotAt ?? _nextSlotAt;
         _date = date ?? _date;
         _message = message;
         _displaySettings = displaySettings;
@@ -860,8 +952,9 @@ class _BloomHomePageState extends State<BloomHomePage>
         _scheduleMessageClear();
       }
     } catch (error) {
-      if (!mounted) return;
+      if (!mounted || settingsRevision != _settingsRevision) return;
       setState(() {
+        _contentError = '暂时无法获取照片，请检查网络后重试。';
         _message =
             error is BloomApiException
                 ? '服务器请求失败（${error.statusCode}），已有照片会继续保留。'
@@ -871,6 +964,13 @@ class _BloomHomePageState extends State<BloomHomePage>
       _scheduleMessageClear();
     } finally {
       _loadInFlight = false;
+      if (mounted) {
+        await _armNextSlotWake();
+        if (_loadPending) {
+          _loadPending = false;
+          unawaited(_load(showSpinner: false));
+        }
+      }
     }
   }
 
@@ -895,19 +995,14 @@ class _BloomHomePageState extends State<BloomHomePage>
     // `_load` is already running), and a blink shorter than this is the
     // notification shade, not a return.
     if (away == null || away < const Duration(seconds: 5)) return;
+    unawaited(_loadRemoteDevices());
     unawaited(_load(showSpinner: false));
   }
 
   /// Devices the photo page switcher and the "设备" tab list.
   ///
-  /// 登录后优先用服务端的真实绑定关系（`GET /users/me/devices`，F1 之后
-  /// 它是真的了）；未登录、或登录了但服务端一条绑定都没有时，回退到
-  /// 硬编码的那两条。
-  ///
-  /// **为什么保留回退而不是直接用空列表**：硬编码那份包含相框，而相框今天
-  /// 确实绑定着用户的 Immich 账号。直接换成真实列表会让"刚注册、还没绑定"
-  /// 的用户看到一个空设备页 —— 而他昨天还能看到相框。宁可多显示一条已知的
-  /// 真实设备，也不要让页面凭空变空。
+  /// 服务端按设备归属返回列表。请求尚未完成时仅回退到本机，
+  /// 不推断相框归属，也不把相册成员的手机显示为自己的设备。
   List<BloomDevice> get _devices {
     if (_remoteDevices.isNotEmpty) {
       return bloomDevicesFromRemote(
@@ -932,23 +1027,57 @@ class _BloomHomePageState extends State<BloomHomePage>
     await _auth.load();
     if (!mounted) return;
     setState(() => _account = _auth.account);
-    // 会话是本地读出来的、很快；拿到之后 `_load` 才知道该不该联网。
-    unawaited(_load(showSpinner: false));
+    if (_account != null) await _prepareAccountCache(_account!.id);
+    if (_account?.immichReady == true && await _identity.hasServerToken()) {
+      final revision = _settingsRevision;
+      final local = await _displayPreferences.readLocal();
+      if (!mounted || revision != _settingsRevision) return;
+      setState(() => _displaySettings = local);
+      await _paintLocalContent().timeout(
+        const Duration(milliseconds: 600),
+        onTimeout: () {},
+      );
+    }
     if (_auth.isSignedIn) {
       await _refreshAccount();
     }
+    if (mounted) unawaited(_load(showSpinner: false));
+  }
+
+  void _scheduleAccountReadyRetry() {
+    if (_accountReadyRetry?.isActive == true || _accountRetryAttempt >= 5) {
+      return;
+    }
+    final token = _auth.token;
+    final delay = [2, 4, 8, 16, 30][_accountRetryAttempt++];
+    _accountReadyRetry = Timer(Duration(seconds: delay), () async {
+      if (!mounted || token != _auth.token || _pausedAt != null) return;
+      await _refreshAccount();
+      if (mounted && token == _auth.token) await _load(showSpinner: false);
+    });
   }
 
   Future<void> _refreshAccount() async {
-    final account = await _auth.refresh();
-    if (!mounted) return;
-    setState(() => _account = account);
-    if (account == null) return;
-    if (account.immichReady) {
-      // 先把"这台手机属于这个账号"落实，再列设备 —— 顺序反了的话，列表里
-      // 会短暂缺掉本机那一台。
-      await _ensureDeviceClaimed();
-      await _loadRemoteDevices();
+    if (_accountRefreshInFlight) return;
+    _accountRefreshInFlight = true;
+    final token = _auth.token;
+    try {
+      final account = await _auth.refresh();
+      if (!mounted || (token != _auth.token && _auth.token != null)) return;
+      setState(() => _account = account);
+      if (account == null) {
+        if (token != null && _auth.token == null) await _clearAccountContent();
+        return;
+      }
+      if (account.immichReady && await _ensureDeviceClaimed()) {
+        _accountReadyRetry?.cancel();
+        _accountRetryAttempt = 0;
+        await _loadRemoteDevices();
+      } else {
+        _scheduleAccountReadyRetry();
+      }
+    } finally {
+      _accountRefreshInFlight = false;
     }
   }
 
@@ -957,10 +1086,13 @@ class _BloomHomePageState extends State<BloomHomePage>
   /// 名字用**平台**而不是机型：拿机型要加依赖或写原生代码，而服务端的
   /// `claim_device_for_account` 只在**首次插入**时采用这个名字（之后在库里
   /// 改过的名字不会被重新登录覆盖），所以它的作用仅仅是让新设备不至于无名。
-  DeviceClaim _claimFor(DeviceCredentials credentials) => DeviceClaim(
-    deviceId: credentials.deviceId,
-    name: Platform.isIOS ? 'iPhone' : 'Android 手机',
-  );
+  Future<DeviceClaim> _claimFor(DeviceCredentials credentials) async =>
+      DeviceClaim(
+        deviceId: credentials.deviceId,
+        name: Platform.isIOS ? 'iPhone' : 'Android 手机',
+        claimSecret: await _identity.installClaimSecret(),
+        previousDeviceToken: credentials.deviceToken,
+      );
 
   /// 确保这台设备已经在服务端认领过，并保存服务端下发的设备令牌。
   ///
@@ -970,33 +1102,56 @@ class _BloomHomePageState extends State<BloomHomePage>
   ///
   /// 认领失败一律不阻断登录：相册还在准备中是 409，属于"等一会儿再来"，
   /// 不是错误。
-  Future<void> _ensureDeviceClaimed() async {
-    if (!_auth.isSignedIn) return;
+  Future<bool> _ensureDeviceClaimed({bool forceRefresh = false}) async {
+    if (!_auth.isSignedIn || _account?.immichReady != true) return false;
+    final session = _auth.token;
     // ⚠️ 不能直接用 `_credentials`：**登出会把它一起清掉**，所以"登出→再登录"
     //    这条路上它一定是 null，而那样这个函数会在第一行就返回，设备永远认领
     //    不上（表现为登录成功但设备列表里没有本机）。
     //    本机身份是谁并不重要 —— 随机生成一个新的也行，认领的是"这台机器"。
     final credentials = _credentials ?? await _identity.initialize();
-    if (!mounted) return;
+    if (!mounted || session != _auth.token) return false;
     if (_credentials == null) {
       setState(() => _credentials = credentials);
     }
-    if (await _identity.hasServerToken()) return;
     try {
-      final claimed = await _auth.claimDevice(_claimFor(credentials));
+      if (!forceRefresh && await _identity.hasServerToken()) {
+        if (session != _auth.token) return false;
+        try {
+          await _api.userRequest(
+            _auth.token!,
+            'devices/${credentials.deviceId}/confirm-owner',
+            method: 'POST',
+            deviceToken: credentials.deviceToken,
+            body: {'claim_secret': await _identity.installClaimSecret()},
+          );
+          return session == _auth.token;
+        } on BloomApiException catch (error) {
+          if (error.statusCode != 401 && error.statusCode != 403) rethrow;
+        }
+      }
+
+      final claimed = await _auth.claimDevice(await _claimFor(credentials));
+      if (session != _auth.token) return false;
       await _identity.saveIssued(
         deviceId: claimed.deviceId,
         deviceToken: claimed.deviceToken,
       );
+      if (session != _auth.token) {
+        await _identity.clear();
+        return false;
+      }
       final updated = await _identity.read();
       if (updated != null && mounted) {
         setState(() => _credentials = updated);
       }
+      return updated != null && session == _auth.token;
     } on BloomApiException catch (error) {
       debugPrint('[BloomAuth] 设备认领未完成：${error.code ?? error.statusCode}');
     } catch (error) {
       debugPrint('[BloomAuth] 设备认领异常：$error');
     }
+    return false;
   }
 
   /// 取回当前账号绑定的设备。失败时静默保留旧列表 —— 设备列表是展示信息，
@@ -1007,20 +1162,66 @@ class _BloomHomePageState extends State<BloomHomePage>
       if (mounted) setState(() => _remoteDevices = const []);
       return;
     }
-    setState(() => _accountBusy = true);
+    if (_devicesLoadingToken == token) return;
+    _devicesLoadingToken = token;
+    final generation = ++_devicesRequestGeneration;
     try {
       final devices = await _api.listMyDevices(token);
-      if (!mounted) return;
+      if (!mounted ||
+          token != _auth.token ||
+          generation != _devicesRequestGeneration) {
+        return;
+      }
       setState(() => _remoteDevices = devices);
     } catch (_) {
       // 保留既有列表。
     } finally {
-      if (mounted) setState(() => _accountBusy = false);
+      if (generation == _devicesRequestGeneration) _devicesLoadingToken = null;
+    }
+  }
+
+  Future<void> _prepareAccountCache(
+    String accountId, {
+    bool signingIn = false,
+  }) async {
+    final previous = await _identity.cachedAccountOwner();
+    if (previous != accountId && (previous != null || signingIn)) {
+      await _clearAccountContent();
+    }
+    await _identity.saveAccountOwner(accountId);
+  }
+
+  Future<void> _clearAccountContent() async {
+    _accountReadyRetry?.cancel();
+    _accountRetryAttempt = 0;
+    _settingsRevision++;
+    _devicesRequestGeneration++;
+    _devicesLoadingToken = null;
+    _slotWake?.cancel();
+    await _identity.clear();
+    await disableBackgroundSync();
+    final path = await BloomWidgetBridgePlatform.cacheDirectory();
+    if (path != null) await ContentSyncEpoch.resetAccount(Directory(path));
+    await BloomWidgetBridgePlatform.resetAccountContent();
+    if (mounted) {
+      setState(() {
+        _content = null;
+        _hasAssets = null;
+        _contentError = null;
+        _portrait = null;
+        _originalPhotoPath = null;
+        _credentials = null;
+        _nextSlotAt = null;
+        _remoteDevices = const [];
+        _photoDeviceId = null;
+      });
     }
   }
 
   Future<void> _openAuth() async {
-    final credentials = _credentials;
+    final credentials = _credentials ?? await _identity.initialize();
+    final claim = await _claimFor(credentials);
+    if (!mounted) return;
     final result = await Navigator.of(context).push<AuthResult>(
       MaterialPageRoute(
         builder:
@@ -1028,13 +1229,15 @@ class _BloomHomePageState extends State<BloomHomePage>
               auth: _auth,
               // 登录时顺带上报本机，服务端据此把这台手机认领到账号下 ——
               // 这就是"激活码"那套机制的替代品。
-              device: credentials == null ? null : _claimFor(credentials),
+              device: claim,
               onCancel: () => Navigator.of(context).pop(),
               onSignedIn: (value) => Navigator.of(context).pop(value),
             ),
       ),
     );
     if (!mounted || result == null) return;
+    await _prepareAccountCache(result.account.id, signingIn: true);
+    if (!mounted) return;
     setState(() => _account = result.account);
     // 登录响应里可能已经带着服务端下发的设备令牌（相册已就绪的账号）。
     final claimed = result.device;
@@ -1068,11 +1271,22 @@ class _BloomHomePageState extends State<BloomHomePage>
   }
 
   Future<void> _signOut() async {
+    if (_accountBusy || _signOutConfirming) return;
+    _signOutConfirming = true;
+    final confirmed = await confirmBloomAction(
+      context,
+      title: '退出登录？',
+      message: '这台手机的小组件将清除照片并显示请登录。设备归属和播放设置会保留，其他设备继续正常更新。',
+      confirmLabel: '退出登录',
+    );
+    _signOutConfirming = false;
+    if (!confirmed || !mounted) return;
     setState(() => _accountBusy = true);
-    await _auth.signOut();
-    // **设备令牌一起丢掉。** 这是"登出即冻结"的全部实现：本机再也没有能取图
-    // 的凭证，小组件停在最后一张；不需要改任何原生代码。
-    await _identity.clear();
+    final credentials = _credentials ?? await _identity.read();
+    final logout = _auth.signOut(device: credentials);
+    // 退出先停止本机缓存播放及补货，远端退出请求不阻塞隐私清理。
+    await _clearAccountContent();
+    await logout;
     if (!mounted) return;
     setState(() {
       _account = null;
@@ -1091,7 +1305,10 @@ class _BloomHomePageState extends State<BloomHomePage>
     final selected = _photoDeviceId;
     if (selected != null) {
       for (final device in devices) {
-        if (device.deviceId == selected) return device;
+        if (device.deviceId == selected &&
+            (device.isLocal || device.isFrame && device.canManage)) {
+          return device;
+        }
       }
     }
     for (final device in devices) {
@@ -1106,13 +1323,43 @@ class _BloomHomePageState extends State<BloomHomePage>
     setState(() => _photoDeviceId = deviceId);
   }
 
-  void _showAddDeviceNotice() {
-    HapticFeedback.lightImpact();
-    _notify('扫码配对即将支持');
+  Future<void> _showAddDeviceNotice() async {
+    if (_auth.token == null) {
+      await _openAuth();
+      return;
+    }
+    final paired = await joinBloomDevice(context, _api, _auth.token!);
+    if (paired) {
+      await _loadRemoteDevices();
+      _notify('已向设备提供你的图库');
+    }
+  }
+
+  Future<void> _deviceContentChanged() async {
+    await _loadRemoteDevices();
+    if (mounted) unawaited(_load(showSpinner: false));
   }
 
   Future<void> _openDeviceDetail(BloomDevice device) async {
+    if (!device.canManage) {
+      final token = _auth.token;
+      if (token == null) return;
+      final left = await Navigator.push<bool>(
+        context,
+        MaterialPageRoute(
+          builder:
+              (_) => BloomJoinedDevicePage(
+                api: _api,
+                token: token,
+                device: device,
+              ),
+        ),
+      );
+      if (left == true) await _deviceContentChanged();
+      return;
+    }
     final credentials = _credentials;
+    final accountToken = _auth.token;
     await BloomDeviceDetailPage.open(
       context,
       device: device,
@@ -1126,11 +1373,25 @@ class _BloomHomePageState extends State<BloomHomePage>
       // The page paints the same photo the home page does, so its glass has
       // something to refract.
       photoPath: _originalPhotoPath,
-      onModeChanged: (settings) => _applyModeChange(device, settings),
-      onSaved: (settings) => _applySavedSettings(device, settings),
-      // **The link that was missing.** The detail page has always called this
-      // callback when the switch moves; nobody was listening, because this route
-      // was opened without it.
+      onSaved: (settings) {
+        if (_auth.token != accountToken ||
+            _credentials?.deviceToken != credentials?.deviceToken) {
+          return;
+        }
+        _applySavedSettings(device, settings);
+      },
+      onUnbind:
+          device.isFrame && _auth.token != null
+              ? () async {
+                await _api.userRequest(
+                  _auth.token!,
+                  'devices/${device.deviceId}',
+                  method: 'DELETE',
+                );
+                if (mounted) setState(() => _photoDeviceId = null);
+                await _loadRemoteDevices();
+              }
+              : null,
       onWidgetEnabledChanged:
           (enabled) => setState(() => _widgetEnabled = enabled),
     );
@@ -1146,87 +1407,16 @@ class _BloomHomePageState extends State<BloomHomePage>
   void _applySavedSettings(BloomDevice device, BloomDisplaySettings settings) {
     if (!mounted || !device.isLocal) return;
     setState(() => _displaySettings = settings);
-    // ⭐ 保存之后必须让取图链路【重跑一次】。
-    //
-    // 为什么: 服务器的 mode 与作息改完之后，「下一次更新时间」和「小组件该
-    // 显示哪张」都变了，但这两个东西【只在下一次 syncCarousel 落地时才更新】。
-    // 原来这里只 setState 了 _displaySettings —— 于是首页的「下次更新」文案、
-    // Android/iOS 小组件读到的共享状态，全都停在上一份计划上，
-    // 用户要【杀死 App 重进】才会好。这正是那个症状的根因。
-    unawaited(_resyncCarouselAfterSave(settings));
-  }
-
-  /// 保存设置后立刻重跑一次 carousel 同步，并刷新首页的「下次更新」。
-  ///
-  /// 失败不能影响保存结果 —— 设置已经写进服务器了，重同步只是让界面和
-  /// 小组件跟上；拉不到就等下一次后台同步，不该弹错误。
-  Future<void> _resyncCarouselAfterSave(BloomDisplaySettings settings) async {
-    final credentials = _credentials;
-    if (credentials == null) return;
-    final repository = DailyContentRepository(api: _api);
-    try {
-      if (settings.usesScheduledPlan) {
-        await repository.syncCarousel(
-          credentials,
-          settings,
-          // foreground: 用前台写入者身份，这样后台任务拿到的是最新计划，
-          // 也能顺带把 iOS 小组件要读的共享状态重写一遍。
-          foreground: true,
-        );
-        final at = await repository.nextSlotAtMillis();
-        if (!mounted) return;
-        setState(() => _nextSlotAt = at);
-        debugPrint(
-          '[BloomUI] resynced (carousel) after save: next=${at ?? 'none'}',
-        );
-      } else {
-        await repository.sync(credentials);
-        if (!mounted) return;
-        setState(() => _nextSlotAt = _nextRecommendSlotMs(settings));
-        debugPrint('[BloomUI] resynced (recommend) after save');
-      }
-      // ⭐ 最后一步：让原生小组件【立刻重载】。
-      //
-      // 少了这一步就会出现用户报的那个现象: App 里的文案已经换成新的了，
-      // 照片却还是上一张（桌面小组件也还是上一张）—— 因为 App 的照片取自
-      // 原生小组件状态，而那个状态要等小组件自己按时间线刷新才更新，
-      // 推荐模式下那是【按天】的，所以会一直停在旧图上。
-      // 文案来自 Flutter 缓存、照片来自原生状态，两个源不同步，就"对不上"了。
-      await WidgetBridge().refresh();
-    } catch (error) {
-      debugPrint('[BloomUI] resync after save failed (ignored): $error');
-    }
-  }
-
-  /// A mode change made **on a device's own detail page**.
-  ///
-  /// This is the bug the user kept reporting: it used to take no device and
-  /// carry no guard, so changing the mode on the **frame's** page adopted the
-  /// frame's `eink` record into this phone's shared slot — the phone's home page
-  /// then said 推荐 while the phone's own page said 轮播, and switching the
-  /// device picker back to 手机小组件 showed the frame's mode. Its sibling
-  /// [_applySavedSettings] has had exactly this guard (and the comment above it)
-  /// all along; this one was simply missed.
-  Future<void> _applyModeChange(
-    BloomDevice device,
-    BloomDisplaySettings settings,
-  ) async {
-    if (!mounted || !device.isLocal) return;
-    // **Probes for the "I pressed 保存 and nothing happened" chain.**
-    //
-    // A save is supposed to end with a fresh sync, which is what re-arms the
-    // native alarm chain for the new window. When that did not visibly happen
-    // there was no way to tell *which* link broke: the save handler, the reload,
-    // or the sync inside it. These three lines name each link.
-    debugPrint(
-      '[BloomSave] saved: mode=${settings.mode.name} '
-      'window=${settings.activeStart}-${settings.activeEnd} '
-      'interval=${settings.intervalMinutes}',
+    _settingsRevision++;
+    _slotWake?.cancel();
+    setState(
+      () =>
+          _nextSlotAt =
+              settings.mode == BloomDisplayMode.carousel
+                  ? null
+                  : _nextRecommendSlotMs(settings),
     );
-    setState(() => _displaySettings = settings);
-    // Re-run the load so the photo page shows the newly selected mode's photo.
-    await _load(showSpinner: false);
-    debugPrint('[BloomSave] reload finished (alarms should be re-armed)');
+    unawaited(_load(showSpinner: false));
   }
 
   Future<void> _nextCarouselPhoto() async {
@@ -1234,7 +1424,11 @@ class _BloomHomePageState extends State<BloomHomePage>
     if (credentials == null || _loading || _nextLoading) {
       return;
     }
+    final revision = _settingsRevision;
+    final settings = _displaySettings;
+    if (!settings.usesScheduledPlan) return;
     await HapticFeedback.lightImpact();
+    if (!mounted || revision != _settingsRevision) return;
     setState(() => _nextLoading = true);
     try {
       final repository = DailyContentRepository(api: _api);
@@ -1245,9 +1439,10 @@ class _BloomHomePageState extends State<BloomHomePage>
       unawaited(_watchNextSlot(repository));
       final content = await repository.syncCarousel(
         credentials,
-        _displaySettings,
+        settings,
         next: true,
       );
+      if (!mounted || revision != _settingsRevision) return;
       final portrait = await repository.cached('portrait');
       final square = await repository.cached('square');
       final largeSquare = await repository.cached('largeSquare');
@@ -1256,6 +1451,7 @@ class _BloomHomePageState extends State<BloomHomePage>
       );
       await _evictOriginalPhoto(originalPhotoPath);
       await _evictPreviewImages([portrait, square, largeSquare]);
+      if (!mounted || revision != _settingsRevision) return;
       if (portrait != null) {
         await WidgetBridge().update(
           portraitPath: portrait.path,
@@ -1272,7 +1468,7 @@ class _BloomHomePageState extends State<BloomHomePage>
         );
       }
       await _precacheIncoming(originalPhotoPath);
-      if (!mounted) return;
+      if (!mounted || revision != _settingsRevision) return;
       setState(() {
         if (originalPhotoPath != null) {
           _portrait =
@@ -1287,7 +1483,9 @@ class _BloomHomePageState extends State<BloomHomePage>
       await HapticFeedback.mediumImpact();
       _notify('已切换到下一张。');
     } catch (_) {
-      _notify('下一张获取失败，请稍后重试。');
+      if (mounted && revision == _settingsRevision) {
+        _notify('下一张获取失败，请稍后重试。');
+      }
     } finally {
       if (mounted) setState(() => _nextLoading = false);
     }
@@ -1327,6 +1525,7 @@ class _BloomHomePageState extends State<BloomHomePage>
   }
 
   void _changeTab(int index) {
+    if (index == 3) unawaited(_loadRemoteDevices());
     if (_selectedTab == index) return;
     HapticFeedback.selectionClick();
     setState(() => _selectedTab = index);
@@ -1361,11 +1560,17 @@ class _BloomHomePageState extends State<BloomHomePage>
     // after the plan response (measured), but a sync can run 13-50 s behind photo
     // downloads; a 15x400 ms window expired long before the value landed, so the label
     // only appeared when the whole load finished. Poll for the length of a slow run.
-    for (var i = 0; i < 100 && mounted; i++) {
+    final revision = _settingsRevision;
+    for (var i = 0; i < 100 && mounted && revision == _settingsRevision; i++) {
       await Future<void>.delayed(const Duration(milliseconds: 500));
       if (!mounted) return;
       final at = await repository.nextSlotAtMillis();
-      if (!mounted || at == null || at == _nextSlotAt) continue;
+      if (!mounted || revision != _settingsRevision) return;
+      if (_displaySettings.mode != BloomDisplayMode.carousel ||
+          at == null ||
+          at == _nextSlotAt) {
+        continue;
+      }
       setState(() => _nextSlotAt = at);
     }
   }
@@ -1389,6 +1594,8 @@ class _BloomHomePageState extends State<BloomHomePage>
   @override
   Widget build(BuildContext context) => BloomGlassHome(
     loading: _loading,
+    hasAssets: _hasAssets,
+    contentError: _contentError,
     nextLoading: _nextLoading,
     discoverPage: BloomDiscoverPage(
       api: _api,
@@ -1398,15 +1605,26 @@ class _BloomHomePageState extends State<BloomHomePage>
         token: () => _auth.token,
         frames:
             () => [
-              for (final d in bloomDevicesFromRemote(_remoteDevices))
+              for (final d in bloomDevicesFromRemote(
+                _remoteDevices,
+              ).where((d) => d.canManage))
                 GalleryFrame(d.deviceId, d.name, isMobile: !d.isFrame),
             ],
       ),
       frames: [
-        for (final d in bloomDevicesFromRemote(_remoteDevices))
+        for (final d in bloomDevicesFromRemote(
+          _remoteDevices,
+        ).where((d) => d.canManage))
           GalleryFrame(d.deviceId, d.name, isMobile: !d.isFrame),
       ],
       onSignIn: _openAuth,
+    ),
+    photoLibraryPage: BloomPhotoLibraryPage(
+      ready: _account?.immichReady == true,
+      api: _api,
+      token: _auth.token,
+      onSignIn: _openAuth,
+      onChanged: _deviceContentChanged,
     ),
     selectedTab: _selectedTab,
     credentials: _credentials,
@@ -1423,7 +1641,10 @@ class _BloomHomePageState extends State<BloomHomePage>
         (enabled) => setState(() => _widgetEnabled = enabled),
     selectedDeviceId: _photoDevice?.deviceId,
     onTabChanged: _changeTab,
-    onRefresh: _load,
+    onRefresh: () async {
+      _accountRetryAttempt = 0;
+      await _load();
+    },
     onNext: _nextCarouselPhoto,
     onDeviceChanged: _changePhotoDevice,
     onOpenDevice: _openDeviceDetail,

@@ -48,6 +48,29 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 directory.mkdirs()
                 result.success(directory.absolutePath)
             }
+            "resetAccountContent" -> {
+                BloomCarouselAlarms.cancelAll(context)
+                context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE).edit().clear().putBoolean("accountSignedOut", true).commit()
+                val manager = AppWidgetManager.getInstance(context)
+                listOf("BloomPortraitWidgetProvider" to "widget_portrait", "BloomSquareWidgetProvider" to "widget_square", "BloomLargeSquareWidgetProvider" to "widget_large_square").forEach { (provider, layout) ->
+                    val component = ComponentName(context.packageName, "${context.packageName}.$provider")
+                    val ids = manager.getAppWidgetIds(component)
+                    if (ids.isNotEmpty()) {
+                        val layoutId = context.resources.getIdentifier(layout, "layout", context.packageName)
+                        val views = android.widget.RemoteViews(context.packageName, layoutId)
+                        views.setTextViewText(context.resources.getIdentifier("widget_placeholder", "id", context.packageName), "请登录 Bloom")
+                        val launch = context.packageManager.getLaunchIntentForPackage(context.packageName)
+                        if (launch != null) {
+                            val click = android.app.PendingIntent.getActivity(context, 1001, launch, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE)
+                            views.setOnClickPendingIntent(context.resources.getIdentifier("widget_root", "id", context.packageName), click)
+                        }
+                        manager.updateAppWidget(ids, views)
+                        context.sendBroadcast(Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE).setComponent(component)
+                            .putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, ids).putExtra("bloomAccountReset", true))
+                    }
+                }
+                result.success(null)
+            }
             "updateWidgetCache" -> {
                 val arguments = call.arguments as? Map<*, *>
                 val prefs = context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
@@ -92,6 +115,30 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             }
             "readCurrentWidgetState" -> {
                 val prefs = context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
+                // Read the same due timeline entry as the provider. AlarmManager
+                // may be late; its preference projection is not a second clock.
+                val due = if (prefs.getString("mode", null) != "recommend") {
+                    BloomCarouselState.currentEntry(context, System.currentTimeMillis())?.takeIf {
+                        File(it.optString("original_path", "")).isFile &&
+                            File(it.optString("portrait_path", "")).isFile
+                    }
+                } else null
+                if (due != null) {
+                    fun text(key: String): String? = if (due.isNull(key)) null else due.optString(key, null)
+                    result.success(mapOf(
+                        "recommendationId" to due.optInt("item_id", 0),
+                        "mode" to "carousel", "date" to text("date"),
+                        "originalPhotoPath" to text("original_path"),
+                        "portraitPath" to text("portrait_path"),
+                        "squarePath" to text("square_path"),
+                        "largeSquarePath" to text("large_square_path"),
+                        "captionZh" to text("caption_zh"), "captionEn" to text("caption_en"),
+                        "capturedDateText" to text("captured_date_text"),
+                        "locationText" to text("location_text"),
+                        "updatedAtMillis" to due.optLong("date_ms", 0L),
+                    ))
+                    return
+                }
                 val id = prefs.getInt("recommendationId", 0)
                 if (id < 1) {
                     result.success(null)
@@ -130,7 +177,12 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             // iOS 上则必须做 —— 那边的 WidgetKit 扩展是独立进程、自己去拉
             // `/carousel/plan`，只认 App Group 里的令牌。这里保留同名方法是为了
             // 让 Dart 侧不必按平台分支。
-            "writeDeviceCredentials" -> result.success(null)
+            "writeDeviceCredentials" -> {
+                val token = call.argument<String>("deviceToken")
+                context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE).edit()
+                    .putBoolean("accountSignedOut", token.isNullOrEmpty()).commit()
+                result.success(null)
+            }
             // 后台保活自检：哪些开关还没开，以及怎么去开。列表本身由原生按机型
             // 与系统版本推导，Dart 侧只负责渲染，不认识任何版本号。
             "keepAliveStatus" -> {
@@ -172,21 +224,9 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         } catch (error: Exception) {
             Log.w(TAG, "Unable to rearm carousel alarms", error)
         }
-        // **只在画面真的会变时才刷新 provider。**
-        //
-        // 每次 tick 都会走到这里，而一次换图前后会有好几次 tick（对表、预取、替补、
-        // 提交），再加上闹钟在「格子前 3 分钟」的重排，一个整点能刷四五遍——观感就是
-        // 小组件连闪三四次（实测小米14 在 :27/:28 和整点都会闪）。
-        //
-        // 判据用「当前格 + 它所处的格子时刻」：这两项没变，画出来的东西就一样，
-        // 没有任何理由重绘。**注意不能用 `revision`**——它每次提交都递增，那样等于
-        // 没有去重。
-        val state = BloomCarouselState.read(context)
-        val stamp = "${state?.optInt("current_item_id", 0)}@${state?.optLong("current_slot_at_ms", 0L)}"
-        val prefs = context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
-        if (prefs.getString("lastPushedWidgetStamp", null) == stamp) return
-        prefs.edit().putString("lastPushedWidgetStamp", stamp).apply()
-
+        // The provider deduplicates actual image bytes and size per widget.
+        // A current-pointer stamp misses recommendation changes and cannot
+        // suppress the independent refill-alarm/provider refresh paths.
         val manager = AppWidgetManager.getInstance(context)
         listOf("BloomPortraitWidgetProvider", "BloomSquareWidgetProvider", "BloomLargeSquareWidgetProvider").forEach { className ->
             val component = ComponentName(context.packageName, "${context.packageName}.$className")
@@ -196,6 +236,7 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE)
                         .setComponent(component)
                         .putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, ids)
+                        .putExtra("bloomContentOnly", true)
                 )
             }
         }

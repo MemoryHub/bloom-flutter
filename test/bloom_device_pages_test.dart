@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:bloom/core/api/bloom_api_client.dart';
@@ -205,10 +206,12 @@ void main() {
       String type = 'eink',
       DateTime? lastSeen,
       int? intervalMinutes,
+      bool playbackPaused = false,
     }) => UserDevice(
       deviceId: id,
       deviceType: type,
       enabled: true,
+      playbackPaused: playbackPaused,
       lastSeenAt: lastSeen,
       settings:
           intervalMinutes == null
@@ -247,6 +250,20 @@ void main() {
       );
 
       expect(devices[0].isOnline, isFalse);
+      expect(devices[1].isOnline, isTrue);
+    });
+
+    test('另一台手机退出后即使刚取过图也显示离线', () {
+      final devices = bloomDevicesFromRemote([
+        remote(
+          id: 'signed-out-phone',
+          type: 'mobile',
+          lastSeen: DateTime.now(),
+          playbackPaused: true,
+        ),
+        remote(id: 'active-phone', type: 'mobile', lastSeen: DateTime.now()),
+      ]);
+      expect(devices[0].presenceLabel, '离线');
       expect(devices[1].isOnline, isTrue);
     });
 
@@ -289,15 +306,26 @@ void main() {
     });
   });
 
+  test('设备列表兜底不添加未绑定的相框', () {
+    expect(bloomDevices(credentials: null), isEmpty);
+    final devices = bloomDevices(credentials: credentials);
+    expect(devices, hasLength(1));
+    expect(devices.single.isLocal, isTrue);
+    expect(devices.any((d) => d.isFrame), isFalse);
+  });
+
   group('设备列表', () {
-    testWidgets('渲染写死的相框，点击后进入详情页', (tester) async {
+    testWidgets('渲染已绑定的相框，点击后进入详情页', (tester) async {
       SharedPreferences.setMockInitialValues(<String, Object>{});
       final preferences = DisplayPreferences(
         api: BloomApiClient(
           client: MockClient((_) async => http.Response('{}', 200)),
         ),
       );
-      final devices = bloomDevices(credentials: credentials, localOnline: true);
+      final devices = [
+        ...bloomDevices(credentials: credentials, localOnline: true),
+        bloomBundledFrame,
+      ];
 
       await tester.pumpWidget(
         MaterialApp(
@@ -360,7 +388,10 @@ void main() {
         MaterialApp(
           home: BloomDeviceListPage(
             account: fakeAccount(),
-            devices: bloomDevices(credentials: credentials, localOnline: true),
+            devices: [
+              ...bloomDevices(credentials: credentials, localOnline: true),
+              bloomBundledFrame,
+            ],
             onOpenDevice: (_) {},
             onAddDevice: () {},
           ),
@@ -390,7 +421,10 @@ void main() {
         MaterialApp(
           home: BloomDeviceListPage(
             account: fakeAccount(),
-            devices: bloomDevices(credentials: credentials, localOnline: true),
+            devices: [
+              ...bloomDevices(credentials: credentials, localOnline: true),
+              bloomBundledFrame,
+            ],
             onOpenDevice: (_) {},
             onAddDevice: () => taps++,
           ),
@@ -1167,6 +1201,40 @@ void main() {
       expect(prefs.getString('bloom.display_mode'), 'recommend');
     });
 
+    testWidgets('保存后立即离开详情，镜像完成仍通知首页新模式', (tester) async {
+      useTallWindow(tester);
+      SharedPreferences.setMockInitialValues(Map<String, Object>.from(mirror));
+      final requests = <http.Request>[];
+      final mirrorDone = Completer<void>();
+      final saved = <BloomDisplaySettings>[];
+      final preferences = DisplayPreferences(
+        api: BloomApiClient(
+          client: settingsServer(requests: requests, mode: 'carousel'),
+        ),
+      );
+      await tester.pumpWidget(
+        detail(
+          credentials: credentials,
+          preferences: preferences,
+          device: localDevice(),
+          onMirrored: (_) => mirrorDone.future,
+          onSaved: saved.add,
+        ),
+      );
+      await settle(tester);
+      await tester.tap(find.byKey(const ValueKey('bloom-mode-recommend')));
+      await settle(tester);
+      expect(writes(requests), hasLength(1));
+      expect(saved, isEmpty);
+      await tester.pumpWidget(const SizedBox.shrink());
+      mirrorDone.complete();
+      await settle(tester);
+      expect(saved, hasLength(1));
+      expect(saved.single.mode, BloomDisplayMode.recommendation);
+      expect(saved.single.intervalMinutes, recommendIntervalMinutes);
+      expect(tester.takeException(), isNull);
+    });
+
     testWidgets('档位改动留在草稿里；点模式则立即把两者一起提交（服务器不会拿到新模式的旧档位）', (tester) async {
       useTallWindow(tester);
       SharedPreferences.setMockInitialValues(Map<String, Object>.from(mirror));
@@ -1337,7 +1405,7 @@ void main() {
   });
 
   group('首页启动', () {
-    testWidgets('_load() 不发 settings/get 请求（本地镜像不外流，也不被覆盖）', (tester) async {
+    testWidgets('_load() 只读取本机 mobile 设置，不读取相框 eink 设置', (tester) async {
       SharedPreferences.setMockInitialValues(<String, Object>{
         'bloom.device_id': credentials.deviceId,
         'bloom.identity_version': 2,
@@ -1390,8 +1458,14 @@ void main() {
       // exactly what used to write the frame's schedule into the phone
       // widget's local mirror.
       expect(
-        requests.where((request) => request.url.path.contains('settings')),
-        isEmpty,
+        requests
+            .where((request) => request.url.path.endsWith('/settings/get'))
+            .every(
+              (request) =>
+                  jsonDecode(request.body)['target'] == 'mobile' &&
+                  request.url.path.contains(credentials.deviceId),
+            ),
+        isTrue,
       );
       // And the mirror is still whatever it was before the launch.
       final prefs = await SharedPreferences.getInstance();
@@ -1464,8 +1538,14 @@ void main() {
       // And it cost nothing: the mode rides on the /status call the app already
       // makes, so there is still no settings round trip from this page.
       expect(
-        requests.where((request) => request.url.path.contains('settings')),
-        isEmpty,
+        requests
+            .where((request) => request.url.path.endsWith('/settings/get'))
+            .every(
+              (request) =>
+                  jsonDecode(request.body)['target'] == 'mobile' &&
+                  request.url.path.contains(credentials.deviceId),
+            ),
+        isTrue,
       );
       // The home page now states what the device page states.
       expect(find.text('轮播模式'), findsWidgets);
@@ -1541,7 +1621,15 @@ void main() {
   group('首页设备切换', () {
     testWidgets('默认显示本机照片，切到相框时不假装能取到它的照片', (tester) async {
       SharedPreferences.setMockInitialValues(<String, Object>{});
-      final devices = bloomDevices(credentials: credentials, localOnline: true);
+      final devices = [
+        ...bloomDevices(credentials: credentials, localOnline: true),
+        bloomBundledFrame,
+        const BloomDevice(
+          deviceId: 'grandpa-phone',
+          name: '爷爷',
+          type: 'mobile',
+        ),
+      ];
       final frame = devices.firstWhere((device) => device.isFrame);
       var selectedId = devices.firstWhere((device) => device.isLocal).deviceId;
 
@@ -1577,7 +1665,7 @@ void main() {
       await settle(tester);
 
       // The switcher starts on this phone, so no placeholder is shown.
-      expect(find.text('照片只显示在相框自己的屏幕上'), findsNothing);
+      expect(find.text('照片显示在这台相框上'), findsNothing);
 
       await tester.tap(find.byKey(const ValueKey('bloom-device-switcher')));
       await settle(tester);
@@ -1593,8 +1681,16 @@ void main() {
       // **依然兑现不了**：相框的照片由 `/carousel/plan` 提供，而它认的是相框
       // 自己的设备令牌，用户会话解不开（服务端也没有对应的用户会话取图接口）。
       // 所以文案改成了实话，这条断言跟着改 —— 它守的是"不许承诺做不到的事"。
-      expect(find.text('照片只显示在相框自己的屏幕上'), findsOneWidget);
+      expect(find.text('照片显示在这台相框上'), findsOneWidget);
       expect(find.text('登录后可查看此设备的照片'), findsNothing);
+
+      await tester.tap(find.byKey(const ValueKey('bloom-device-switcher')));
+      await settle(tester);
+      expect(
+        find.byKey(const ValueKey('bloom-device-option-grandpa-phone')),
+        findsNothing,
+      );
+      expect(selectedId, frame.deviceId);
     });
   });
 }

@@ -76,9 +76,13 @@ class DeviceClaim {
     this.timezone = 'Asia/Shanghai',
     this.language = 'zh-CN',
     this.screenProfile = 'default',
+    this.claimSecret,
+    this.previousDeviceToken,
   });
 
   final String deviceId;
+  final String? claimSecret;
+  final String? previousDeviceToken;
 
   /// 设备名。**只在服务端首次插入时生效** —— 之后在库里改过的名字不会被
   /// 重新登录覆盖（以前会，于是四台设备全叫"Bloom 手机"）。
@@ -90,6 +94,9 @@ class DeviceClaim {
 
   Map<String, Object?> toJson() => {
     'device_id': deviceId,
+    if (claimSecret != null) 'claim_secret': claimSecret,
+    if (previousDeviceToken != null)
+      'previous_device_token': previousDeviceToken,
     if (name != null && name!.trim().isNotEmpty) 'name': name!.trim(),
     'timezone': timezone,
     'language': language,

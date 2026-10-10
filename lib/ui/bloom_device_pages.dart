@@ -14,12 +14,9 @@ import 'bloom_glass_home.dart';
 import 'bloom_keep_alive_card.dart';
 import 'bloom_sign_in_prompt.dart';
 import 'bloom_discover_page.dart';
+import 'bloom_device_sharing_page.dart';
 
-/// One row of the F3 device list.
-///
-/// The list is **hardcoded** for now: `BloomApiClient.listMyDevices()` needs a
-/// user session (F1) and throws [UnsupportedError] without one, so nothing
-/// here calls it.
+/// 已确认归属的设备在界面中的展示记录。
 class BloomDevice {
   const BloomDevice({
     required this.deviceId,
@@ -27,6 +24,7 @@ class BloomDevice {
     required this.type,
     this.isLocal = false,
     this.isOnline,
+    this.canManage = true,
   });
 
   final String deviceId;
@@ -38,6 +36,7 @@ class BloomDevice {
   /// True for the device whose token this app actually holds. Only that device
   /// gives the app access to photos.
   final bool isLocal;
+  final bool canManage;
 
   /// `null` when the app cannot learn the state: there is no `last_seen_at`
   /// for the frame without a user session. Rendered as `—`, never guessed.
@@ -87,16 +86,7 @@ const bloomBundledFrame = BloomDevice(
   type: BloomApiClient.settingsTargetEink,
 );
 
-/// The devices the UI shows: this phone first (the only device whose photos
-/// the app can load), then the frame.
-///
-/// **Hard-coded, and it is the biggest known gap in the product.** The server
-/// can list a signed-in user's devices, but that call needs a user session (F1)
-/// which the app does not have yet — so this list is a constant, and the
-/// presence of the frame is `null` (rendered `—`, never guessed).
-///
-/// F1 之后它退居为**未登录时的兜底**：登录了就改用
-/// [bloomDevicesFromRemote] 返回的真实绑定关系。
+/// 网络未返回时只展示本机，配对的相框由服务端提供。
 List<BloomDevice> bloomDevices({
   required DeviceCredentials? credentials,
   bool? localOnline,
@@ -109,7 +99,6 @@ List<BloomDevice> bloomDevices({
       isLocal: true,
       isOnline: localOnline,
     ),
-  bloomBundledFrame,
 ];
 
 /// 把服务端的设备记录转成界面用的 [BloomDevice]。
@@ -132,6 +121,7 @@ List<BloomDevice> bloomDevicesFromRemote(
                 ? device.name!.trim()
                 : (device.isFrame ? 'E-Ink' : '手机小组件'),
         type: device.deviceType,
+        canManage: device.canManage,
         isLocal: isLocal,
         // 本机小组件的开关状态只对本机有效。家庭里另一台手机也是
         // device_type=mobile，套用本机的开关会把它显示成错误的离线。
@@ -151,6 +141,7 @@ List<BloomDevice> bloomDevicesFromRemote(
 /// 服务端从未上报过 `last_seen_at` 时返回 null —— 界面渲染成"离线"，
 /// 而不是编一个状态出来。
 bool? _onlineFrom(UserDevice device) {
+  if (device.playbackPaused) return false;
   final seen = device.lastSeenAt;
   if (seen == null) return null;
   final interval = device.settings?.intervalMinutes ?? 60;
@@ -173,7 +164,7 @@ bool? _onlineFrom(UserDevice device) {
 /// The two depths carry different meanings, which is what keeps it from being
 /// decoration: raised is *a device that exists*, hollow is *a place a device
 /// could go*.
-class BloomDeviceListPage extends StatelessWidget {
+class BloomDeviceListPage extends StatefulWidget {
   const BloomDeviceListPage({
     super.key,
     required this.devices,
@@ -204,6 +195,20 @@ class BloomDeviceListPage extends StatelessWidget {
   /// 登录态正在变化（例如正在取设备列表），期间禁用账号操作，避免重复点击。
   final bool accountBusy;
 
+  @override
+  State<BloomDeviceListPage> createState() => _BloomDeviceListPageState();
+}
+
+class _BloomDeviceListPageState extends State<BloomDeviceListPage> {
+  bool _joined = false;
+  List<BloomDevice> get devices =>
+      widget.devices.where((d) => d.canManage != _joined).toList();
+  AccountInfo? get account => widget.account;
+  VoidCallback? get onAccountTap => widget.onAccountTap;
+  bool get accountBusy => widget.accountBusy;
+  VoidCallback get onAddDevice => widget.onAddDevice;
+  ValueChanged<BloomDevice> get onOpenDevice => widget.onOpenDevice;
+  bool get widgetEnabled => widget.widgetEnabled;
   @override
   Widget build(BuildContext context) {
     // 未登录：整页换成登录提示。
@@ -282,6 +287,32 @@ class BloomDeviceListPage extends StatelessWidget {
             ),
           ),
           const SizedBox(height: BloomPageTitle.contentGap),
+          Row(
+            children: [
+              for (final joined in [false, true])
+                Expanded(
+                  child: TextButton(
+                    onPressed: () => setState(() => _joined = joined),
+                    style: TextButton.styleFrom(
+                      backgroundColor:
+                          joined == _joined
+                              ? BloomInk.panel
+                              : Colors.transparent,
+                    ),
+                    child: Text(
+                      joined ? '我加入的' : '我的设备',
+                      style: BloomType.labelStrong.copyWith(
+                        color:
+                            joined == _joined
+                                ? BloomInk.text
+                                : BloomInk.textMuted,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 16),
           // An empty list is a designed state, not an absence: one glyph, one
           // sentence, one button, centred in the space the tiles would have used.
           if (devices.isEmpty) ...[
@@ -293,7 +324,7 @@ class BloomDeviceListPage extends StatelessWidget {
             ),
             const SizedBox(height: 14),
             Text(
-              '还没有添加设备',
+              _joined ? '还没有加入其他人的设备' : '还没有添加设备',
               textAlign: TextAlign.center,
               style: BloomType.body.copyWith(color: BloomInk.textMuted),
             ),
@@ -552,9 +583,11 @@ class BloomDeviceDetailPage extends StatefulWidget {
     this.onMirrored,
     this.photoPath,
     this.onWidgetEnabledChanged,
+    this.onUnbind,
   });
 
   final BloomDevice device;
+  final Future<void> Function()? onUnbind;
   final DisplayPreferences preferences;
 
   /// The values the page renders until its own server read answers, and the
@@ -612,6 +645,7 @@ class BloomDeviceDetailPage extends StatefulWidget {
     Future<void> Function(BloomDisplaySettings settings)? onMirrored,
     String? photoPath,
     ValueChanged<bool>? onWidgetEnabledChanged,
+    Future<void> Function()? onUnbind,
   }) => Navigator.of(context).push<void>(
     MaterialPageRoute(
       builder:
@@ -627,6 +661,7 @@ class BloomDeviceDetailPage extends StatefulWidget {
             onMirrored: onMirrored,
             photoPath: photoPath,
             onWidgetEnabledChanged: onWidgetEnabledChanged,
+            onUnbind: onUnbind,
           ),
     ),
   );
@@ -719,7 +754,8 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
   /// keys) is read directly by the Android/iOS widgets and belongs to this
   /// phone, so the `eink` record must neither be written to it nor have its
   /// display mode changed from here.
-  bool get _ownsLocalMirror => _target == BloomApiClient.settingsTargetMobile;
+  bool get _ownsLocalMirror =>
+      widget.device.isLocal && _target == BloomApiClient.settingsTargetMobile;
 
   /// The mode the server is known to hold, for telling "selected but not saved
   /// yet" apart from "already stored".
@@ -959,6 +995,9 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
           );
         } catch (_) {}
       }
+      // A completed save still belongs to the home page after this route closes.
+      widget.onSaved?.call(saved);
+      if (saved.mode != previousMode) widget.onModeChanged?.call(saved);
       if (!mounted) return;
       setState(() {
         _draft = saved;
@@ -986,8 +1025,6 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
       });
       _showToast(_successMessage(result));
       unawaited(HapticFeedback.mediumImpact());
-      widget.onSaved?.call(saved);
-      if (saved.mode != previousMode) widget.onModeChanged?.call(saved);
     } on BloomApiException catch (error) {
       if (mounted) _showToast(_describeApiError(error), isError: true);
     } catch (_) {
@@ -1395,9 +1432,6 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
   }
 
   @override
-  @override
-  @override
-  @override
   Widget build(BuildContext context) {
     // The frame's mode is a server read-out (its firmware ignores it), so it
     // shows what the server holds; the phone's is the live edit.
@@ -1475,6 +1509,33 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
                     selected: _displaySources,
                     onToggle: _saving ? null : _toggleSource,
                   ),
+                  if (widget.userToken != null && !widget.device.isFrame)
+                    BloomPanel(
+                      child: ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text('设备二维码', style: BloomType.rowTitle),
+                        subtitle: const Text(
+                          '接收家人的个人图库',
+                          style: BloomType.meta,
+                        ),
+                        trailing: const Icon(
+                          Icons.qr_code_rounded,
+                          color: BloomInk.textMuted,
+                        ),
+                        onTap:
+                            () => Navigator.push(
+                              context,
+                              MaterialPageRoute<void>(
+                                builder:
+                                    (_) => BloomDeviceSharingPage(
+                                      api: BloomApiClient(),
+                                      token: widget.userToken!,
+                                      device: widget.device,
+                                    ),
+                              ),
+                            ),
+                      ),
+                    ),
                   if (widget.userToken != null)
                     BloomPanel(
                       child: ListTile(
@@ -1504,6 +1565,51 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
                 ],
                 const SizedBox(height: 28),
                 _deviceInfo(),
+                if (widget.device.isFrame && widget.onUnbind != null)
+                  TextButton(
+                    onPressed:
+                        _saving
+                            ? null
+                            : () async {
+                              final yes = await showDialog<bool>(
+                                context: context,
+                                builder:
+                                    (context) => AlertDialog(
+                                      title: const Text('解除相框绑定？'),
+                                      content: const Text(
+                                        '相框将从你的设备中移除，照片原文件保留。重新使用时需要配对。',
+                                      ),
+                                      actions: [
+                                        TextButton(
+                                          onPressed:
+                                              () =>
+                                                  Navigator.pop(context, false),
+                                          child: const Text('取消'),
+                                        ),
+                                        FilledButton(
+                                          onPressed:
+                                              () =>
+                                                  Navigator.pop(context, true),
+                                          child: const Text('解除绑定'),
+                                        ),
+                                      ],
+                                    ),
+                              );
+                              if (yes != true) return;
+                              setState(() => _saving = true);
+                              try {
+                                await widget.onUnbind!();
+                                if (context.mounted) Navigator.pop(context);
+                              } catch (_) {
+                                if (mounted) {
+                                  _showToast('解除绑定未完成，请稍后重试', isError: true);
+                                }
+                              } finally {
+                                if (mounted) setState(() => _saving = false);
+                              }
+                            },
+                    child: const Text('解除绑定'),
+                  ),
               ],
             ),
             if (showSave)

@@ -4,19 +4,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/device_models.dart';
 import 'package:bloom_widget_bridge/bloom_widget_bridge.dart';
 
-/// 本机设备身份（设备 ID + 设备令牌）。
-///
-/// ⚠️ **这里曾经要求身份跨重装"稳定"**：iOS 走 Keychain、Android 走
-/// ANDROID_ID，为此还需要一个必须在启动后 **2 秒内**装上的平台通道
-/// （`com.bloom/widget`）。那个竞态就是"全新安装首次启动卡在设备 ID +
-/// 激活码页、杀掉重开就好"的成因 —— 首次启动慢，通道没装上，设备身份拿不到。
-///
-/// 设备归属改由**登录**决定之后，稳定性就不再是需求了：重装后换一个新的设备
-/// ID，登录一次就重新绑到同一个账号（服务端 `claim_device_for_account`）。
-/// 所以这里回到最朴素的做法：**本机随机生成、本机保存**。
-///
-/// 那条平台通道仍然存在，但它现在只服务于显示偏好、缓存目录和小组件状态，
-/// 不再决定"这台机器是谁"。
+/// 本机 ID 与服务端令牌分别保存。原生稳定身份优先用于跨登录认领，
+/// 临时通道失败时保留本地安全存储的认领凭据，不改变设备 ID。
 class DeviceIdentityRepository {
   DeviceIdentityRepository({
     SharedPreferences? preferences,
@@ -117,6 +106,11 @@ class DeviceIdentityRepository {
     if (existingId != credentials.deviceId || needsToken) {
       await save(credentials);
     }
+    // A failed platform-channel mirror must heal on the next launch. Only a
+    // server-issued token is eligible; never publish a locally made placeholder.
+    if (!needsToken && await hasServerToken()) {
+      await _mirror(credentials.deviceId, credentials.deviceToken);
+    }
     return credentials;
   }
 
@@ -128,6 +122,25 @@ class DeviceIdentityRepository {
       // 平台通道还没装上、或原生侧拒绝了。退回随机，启动照常。
       return null;
     }
+  }
+
+  Future<String?> cachedAccountOwner() async =>
+      (await _prefs).getString('bloom.photo_account_owner');
+  Future<void> saveAccountOwner(String accountId) async =>
+      (await _prefs).setString('bloom.photo_account_owner', accountId);
+
+  Future<String> installClaimSecret() async {
+    const key = 'bloom.install_claim_secret';
+    final saved =
+        await (_readToken?.call(key) ?? _secureStorage.read(key: key));
+    if (saved != null && saved.length >= 32) return saved;
+    final stable = await _stableCredentials();
+    final secret = stable?['deviceToken'];
+    final value =
+        secret != null && secret.length >= 32 ? secret : _randomHex(32);
+    await (_writeToken?.call(key, value) ??
+        _secureStorage.write(key: key, value: value));
+    return value;
   }
 
   /// 保存本机身份。
@@ -168,14 +181,12 @@ class DeviceIdentityRepository {
 
   /// 保存服务端下发的设备令牌，并镜像给原生侧。
   ///
-  /// **镜像只在这里发生**（以及 [clear] 里的抹除）。见 [save] 的说明。
+  /// 首次镜像在这里发生，后续 [initialize] 会用已下发令牌修复镜像。
   Future<void> saveIssued({
     required String deviceId,
     required String deviceToken,
   }) async {
-    await save(
-      DeviceCredentials(deviceId: deviceId, deviceToken: deviceToken),
-    );
+    await save(DeviceCredentials(deviceId: deviceId, deviceToken: deviceToken));
     await (await _prefs).setBool(_serverTokenKey, true);
     // 小组件（iOS 上是独立进程）只认原生共享存储里的令牌，不读 Dart 的
     // SharedPreferences —— 漏掉这一步，App 里一切正常而小组件静静地不再更新。

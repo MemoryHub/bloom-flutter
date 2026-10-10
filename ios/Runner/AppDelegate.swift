@@ -4,6 +4,7 @@ import Security
 import UIKit
 import WidgetKit
 import workmanager
+import CryptoKit
 
 @main
 @objc class AppDelegate: FlutterAppDelegate {
@@ -123,14 +124,27 @@ import workmanager
   private static let widgetStampKey = "lastPushedWidgetStamp"
 
   private static func currentEntryStamp() -> String {
-    guard let state = BloomSharedState.load(),
-          let entry = BloomCarouselRule.currentEntry(
-            BloomSharedState.timelineEntries(state),
-            nowMillis: Date().timeIntervalSince1970 * 1000
-          ) else { return "0@0" }
-    let id = (entry["item_id"] as? NSNumber)?.intValue ?? 0
-    let at = (entry["date_ms"] as? NSNumber)?.int64Value ?? 0
-    return "\(id)@\(at)"
+    let defaults = UserDefaults(suiteName: bloomAppGroup)
+    let state = BloomSharedState.load()
+    let entries = BloomSharedState.timelineEntries(state)
+    let snapshot: [String: Any] = [
+      "mode": defaults?.string(forKey: "bloom.display_mode") ?? "recommend",
+      "plan": state?["plan"] ?? NSNull(),
+      "timeline": entries,
+      "daily": BloomSharedState.cacheDirectory().flatMap {
+        BloomSharedState.readJSON($0.appendingPathComponent("daily.json"))
+      } ?? [:],
+    ]
+    let data = (try? JSONSerialization.data(withJSONObject: snapshot, options: [.sortedKeys])) ?? Data()
+    return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+  }
+
+  private static func reloadWidgetsIfChanged() {
+    let stamp = currentEntryStamp()
+    if UserDefaults.standard.string(forKey: widgetStampKey) != stamp {
+      UserDefaults.standard.set(stamp, forKey: widgetStampKey)
+      WidgetCenter.shared.reloadAllTimelines()
+    }
   }
 
   /// **把后台周期任务登记到 iOS。** 这是 iOS 与安卓同构的那一半。
@@ -335,10 +349,18 @@ import workmanager
         }
         let directory = container.appendingPathComponent("widget-cache", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: directory.path)
         result(directory.path)
       case "updateWidgetCache":
         if let arguments = call.arguments as? [String: Any],
            let defaults = UserDefaults(suiteName: Self.bloomAppGroup) {
+          if arguments["mode"] as? String == "carousel",
+             let due = BloomCarouselRule.currentEntry(BloomSharedState.timelineEntries(BloomSharedState.load()), nowMillis: Date().timeIntervalSince1970 * 1000),
+             (due["item_id"] as? NSNumber)?.intValue != (arguments["recommendationId"] as? NSNumber)?.intValue {
+            Self.reloadWidgetsIfChanged()
+            result(nil)
+            return
+          }
           // Flutter encodes Dart null values as NSNull in a method-channel
           // map. UserDefaults cannot store NSNull and aborts the process on
           // iOS 18, so optional widget metadata must be set or removed.
@@ -376,13 +398,7 @@ import workmanager
           // manifest before asking WidgetKit to create the new timeline.
           defaults.synchronize()
         }
-        WidgetCenter.shared.reloadAllTimelines()
-        // Immediately after installation WidgetKit can still be registering
-        // the new extension/timeline. A single delayed retry avoids leaving
-        // the first snapshot stale until the user's next manual action.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-          WidgetCenter.shared.reloadAllTimelines()
-        }
+        Self.reloadWidgetsIfChanged()
         result(nil)
       case "refreshWidgets":
         // **只在画面真的会变时才请小组件重绘。**
@@ -395,12 +411,9 @@ import workmanager
         // 上一次烘焙的旧时间线上（显示「花开得正好，你也刚好在看我」，而该条目
         // 已经不在时间线里了）。这不是"数据没前进"，是"重绘没生效"。
         //
-        // 判据与安卓侧完全一致：`current_item_id@current_slot_at_ms` 变了才重绘。
-        let stamp = Self.currentEntryStamp()
-        if UserDefaults.standard.string(forKey: Self.widgetStampKey) != stamp {
-          UserDefaults.standard.set(stamp, forKey: Self.widgetStampKey)
-          WidgetCenter.shared.reloadAllTimelines()
-        }
+        // Compare the shared content fingerprint, including newly cached
+        // future entries, so a spent timeline can be replenished.
+        Self.reloadWidgetsIfChanged()
         result(nil)
       case "scheduleCarousel":
         // **Retired.** The host app used to push a baked entry list here, which
@@ -410,8 +423,8 @@ import workmanager
         // wall.
         //
         // The authoritative plan now travels through the shared state file
-        // (`carousel-state.json`, written by the single Dart writer and read by
-        // the extension through `BloomSharedState`). The method name is kept so
+        // (`carousel-state.json`, updated under the shared writer lease and
+        // read by the extension through `BloomSharedState`). The method name is kept so
         // an older client calling it does not crash; it simply reloads the
         // timelines and lets the extension read the shared state.
         WidgetCenter.shared.reloadAllTimelines()
@@ -429,12 +442,22 @@ import workmanager
         result(Self.currentWidgetState())
       case "stableDeviceCredentials":
         let credentials = Self.stableDeviceCredentials()
-        if let credentials,
-           let defaults = UserDefaults(suiteName: Self.bloomAppGroup) {
-          defaults.set(credentials["deviceId"], forKey: "bloom.device_id")
-          defaults.set(credentials["deviceToken"], forKey: "bloom.device_token")
-        }
+        // A restored identity may still carry the pre-login placeholder token.
+        // Only writeDeviceCredentials may publish server-issued credentials.
         result(credentials)
+      case "resetAccountContent":
+        if let defaults = UserDefaults(suiteName: Self.bloomAppGroup) {
+          defaults.set(true, forKey: "bloom.signed_out")
+          for key in ["portraitPath", "squarePath", "largeSquarePath", "widgetCurrentOriginalPhotoPath",
+                      "widgetCurrentPortraitPath", "widgetCurrentSquarePath", "widgetCurrentLargeSquarePath",
+                      "recommendationId", "date", "captionZh", "captionEn", "capturedDateText", "locationText",
+                      "widgetCurrentItemId", "widgetTimeline", "scheduledCarouselPlanId"] {
+            defaults.removeObject(forKey: key)
+          }
+          defaults.synchronize()
+        }
+        WidgetCenter.shared.reloadAllTimelines()
+        result(nil)
       case "writeDeviceCredentials":
         // 把 Dart 侧保存的设备身份镜像进 App Group —— 小组件扩展是独立进程，
         // 它只认这里的 `bloom.device_id` / `bloom.device_token`。
@@ -453,16 +476,22 @@ import workmanager
           ))
           return
         }
+        let credentialsChanged = defaults.string(forKey: "bloom.device_id") != deviceId ||
+          defaults.string(forKey: "bloom.device_token") != (deviceToken.isEmpty ? nil : deviceToken)
         if deviceToken.isEmpty {
           // 登出：把令牌抹掉，小组件因此取不到新图（"登出即冻结"）。
           // 设备 ID 留着无所谓，没有令牌它就什么都拉不到。
           defaults.removeObject(forKey: "bloom.device_token")
+          defaults.set(true, forKey: "bloom.signed_out")
         } else {
+          defaults.set(false, forKey: "bloom.signed_out")
           defaults.set(deviceId, forKey: "bloom.device_id")
           defaults.set(deviceToken, forKey: "bloom.device_token")
+          _ = Self.keychainWrite(deviceId, account: "device-id")
+          _ = Self.keychainWrite(deviceToken, account: "device-token")
         }
         defaults.synchronize()
-        WidgetCenter.shared.reloadAllTimelines()
+        if credentialsChanged { WidgetCenter.shared.reloadAllTimelines() }
         result(nil)
       case "readDisplayPreferences":
         let defaults = UserDefaults(suiteName: Self.bloomAppGroup)
@@ -487,6 +516,7 @@ import workmanager
         defaults.set(arguments["intervalMinutes"], forKey: "bloom.carousel_interval_minutes")
         defaults.set(arguments["activeStart"], forKey: "bloom.carousel_active_start")
         defaults.set(arguments["activeEnd"], forKey: "bloom.carousel_active_end")
+        defaults.synchronize()
         result(nil)
       default:
         result(FlutterMethodNotImplemented)

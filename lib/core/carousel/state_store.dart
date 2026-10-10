@@ -15,6 +15,7 @@ library;
 
 import 'dart:convert';
 import 'dart:io';
+import 'dart:async';
 
 import 'carousel_rules.dart';
 import 'carousel_state.dart';
@@ -28,6 +29,7 @@ class CarouselLock {
   CarouselLock(this.path);
 
   final String path;
+  String? _owner;
 
   static const Duration defaultStaleAfter = Duration(seconds: 90);
 
@@ -36,10 +38,8 @@ class CarouselLock {
     for (var attempt = 0; attempt < 2; attempt++) {
       try {
         await file.create(exclusive: true);
-        await file.writeAsString(
-          '${DateTime.now().millisecondsSinceEpoch}',
-          flush: true,
-        );
+        _owner = '$pid:${DateTime.now().microsecondsSinceEpoch}';
+        await file.writeAsString(_owner!, flush: true);
         return true;
       } on FileSystemException {
         // 已存在：可能是别人持有，也可能是一次异常退出留下的残留。
@@ -58,8 +58,17 @@ class CarouselLock {
   Future<void> release() async {
     try {
       final file = File(path);
-      if (await file.exists()) await file.delete();
+      if (await isHeld()) await file.delete();
     } catch (_) {}
+    _owner = null;
+  }
+
+  Future<bool> isHeld() async {
+    try {
+      return _owner != null && await File(path).readAsString() == _owner;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<bool> _isStale(File file, Duration staleAfter) async {
@@ -70,6 +79,40 @@ class CarouselLock {
       // 读不到状态（刚被释放）时按残留处理，交由下一轮重试。
       return true;
     }
+  }
+}
+
+/// Serializes whole refill batches across Flutter isolates and the iOS widget
+/// extension. The short state lock still guards every atomic publication.
+class CarouselSyncLease {
+  CarouselSyncLease._(this.lock) {
+    _heartbeat = Timer.periodic(const Duration(seconds: 15), (_) {
+      try {
+        final file = File(lock.path);
+        if (file.readAsStringSync() == lock._owner) {
+          file.setLastModifiedSync(DateTime.now());
+        }
+      } catch (_) {}
+    });
+  }
+
+  final CarouselLock lock;
+  late final Timer _heartbeat;
+  Future<bool> isHeld() => lock.isHeld();
+
+  static Future<CarouselSyncLease?> acquire(Directory dir) async {
+    final lock = CarouselLock('${dir.path}/carousel-sync.lock');
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while (!await lock.acquire()) {
+      if (DateTime.now().isAfter(deadline)) return null;
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    return CarouselSyncLease._(lock);
+  }
+
+  Future<void> release() async {
+    _heartbeat.cancel();
+    await lock.release();
   }
 }
 
@@ -112,11 +155,13 @@ class CarouselStateStore {
     required PlanIdentity? incomingPlan,
     required CarouselState Function(CarouselState current) update,
     Future<void> Function(CarouselState committed)? onCommitted,
+    Future<bool> Function()? canCommit,
     Duration staleAfter = CarouselLock.defaultStaleAfter,
   }) async {
     final lock = CarouselLock(lockFile.path);
     if (!await lock.acquire(staleAfter: staleAfter)) return null;
     try {
+      if (canCommit != null && !await canCommit()) return null;
       final current = await read();
       final proposed = update(current);
 
@@ -138,6 +183,84 @@ class CarouselStateStore {
       await _writeAtomic(committed);
       if (onCommitted != null) await onCommitted(committed);
       return committed;
+    } finally {
+      await lock.release();
+    }
+  }
+
+  Future<void> resetAccount({required Future<void> Function() onReset}) async {
+    final lock = CarouselLock(lockFile.path);
+    for (var i = 0; !await lock.acquire(); i++) {
+      if (i >= 100) throw StateError('carousel state is busy');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    try {
+      final state = await read();
+      await _writeAtomic(
+        CarouselState.fromJson({'revision': state.revision + 1}),
+      );
+      await onReset();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  Future<void> invalidatePlan({Future<void> Function()? onInvalidated}) async {
+    final lock = CarouselLock(lockFile.path);
+    for (var i = 0; !await lock.acquire(); i++) {
+      if (i >= 100) throw StateError('carousel state is busy');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    try {
+      final state = await read();
+      final raw = state.toJson();
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final past =
+          state.timelineEntries.where((e) => e.dateMs <= now).toList()
+            ..sort((a, b) => a.dateMs.compareTo(b.dateMs));
+      final fallback = past.length > 2 ? past.sublist(past.length - 2) : past;
+      raw['plan'] = null;
+      raw['grid'] = [];
+      // Invalidate future slots, while keeping already displayed entries as
+      // an explicit shared offline fallback for the new settings/day.
+      raw['timeline_entries'] = [for (final e in fallback) e.toJson()];
+      if (fallback.isNotEmpty) {
+        raw['current_item_id'] = fallback.last.itemId;
+        raw['current_photo_path'] = fallback.last.portraitPath;
+        raw['current_slot_at_ms'] = fallback.last.dateMs;
+      }
+      final retainedIds = {
+        for (final entry in fallback) entry.itemId,
+        if (fallback.isEmpty && state.currentItemId != null)
+          state.currentItemId!,
+      };
+      raw['photos'] = [
+        for (final photo in state.photos)
+          if (retainedIds.contains(photo.itemId)) photo.toJson(),
+      ];
+      raw['previous_item_id'] =
+          fallback.length > 1 ? fallback.first.itemId : null;
+      raw['next_slot_at_ms'] = null;
+      raw['revision'] = ((raw['revision'] as num?)?.toInt() ?? 0) + 1;
+      await _writeAtomic(CarouselState.fromJson(raw));
+      if (onInvalidated != null) await onInvalidated();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  Future<void> writeGuarded({
+    required Future<bool> Function() canWrite,
+    required Future<void> Function() write,
+  }) async {
+    final lock = CarouselLock(lockFile.path);
+    for (var i = 0; !await lock.acquire(); i++) {
+      if (i >= 100) throw StateError('content state is busy');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    try {
+      if (!await canWrite()) throw StateError('content sync superseded');
+      await write();
     } finally {
       await lock.release();
     }

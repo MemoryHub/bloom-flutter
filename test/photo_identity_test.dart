@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:convert';
 import 'dart:ui' as ui;
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -40,6 +41,14 @@ void main() {
       expect(await repository.photoPathFor(2), isNull);
       final correct = File('${dir.path}/carousel-original-2.photo');
       await correct.writeAsBytes([2]);
+      expect(
+        await repository.photoPathFor(2),
+        isNull,
+        reason: 'unbound legacy bytes cannot prove asset identity',
+      );
+      await File(
+        '${dir.path}/mobile-original-2.json',
+      ).writeAsString(jsonEncode({'asset': 'a2', 'source': 'personal'}));
       expect(await repository.photoPathFor(2), correct.path);
     },
   );

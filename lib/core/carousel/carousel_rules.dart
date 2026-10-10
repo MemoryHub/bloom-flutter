@@ -172,7 +172,15 @@ List<PhotoEntry> retainPhotos({
         nextItemIds: nextItemIds,
       );
     case RetentionMode.generation:
-      return retainAcrossGeneration(photos: photos, newGrid: newGrid);
+      final keep = {
+        for (final slot in newGrid) slot.itemId,
+        if (currentItemId != null) currentItemId,
+        if (previousItemId != null) previousItemId,
+      };
+      return [
+        for (final photo in photos)
+          if (keep.contains(photo.itemId)) photo,
+      ];
     case RetentionMode.newDay:
       return const [];
   }

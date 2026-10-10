@@ -4,6 +4,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../api/bloom_api_client.dart';
 import '../models/auth_models.dart';
+import '../models/device_models.dart';
 
 /// 账号会话的本地存放与读写。
 ///
@@ -92,10 +93,12 @@ class AuthRepository {
     if (token == null) return null;
     try {
       final account = await _api.fetchAccount(token);
+      if (_token != token) return _account;
       _account = account;
       await _persistAccount(account);
       return account;
     } on BloomApiException catch (error) {
+      if (_token != token) return _account;
       if (error.statusCode == 401) {
         await clear();
         return null;
@@ -165,16 +168,16 @@ class AuthRepository {
   /// 无论服务端是否响应成功，本地状态一定清干净 —— 用户点了"退出登录"却
   /// 因为一次网络超时而留在登录态，是最让人不信任的一类 bug。服务端那边
   /// 这个会话会在过期后自然失效。
-  Future<void> signOut() async {
+  Future<void> signOut({DeviceCredentials? device}) async {
     final token = _token;
+    await clear();
     if (token != null) {
       try {
-        await _api.logoutAccount(token);
+        await _api.logoutAccount(token, device: device);
       } catch (_) {
         // 刻意吞掉：本地登出必须完成。
       }
     }
-    await clear();
   }
 
   /// 只清本地，不通知服务端。令牌失效时用。

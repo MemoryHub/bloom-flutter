@@ -4,42 +4,60 @@ import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProvider
 import android.content.Context
 import android.content.Intent
-import android.graphics.BitmapFactory
-import android.view.View
-import android.widget.RemoteViews
+import android.os.Bundle
 import java.io.File
 
 class BloomLargeSquareWidgetProvider : AppWidgetProvider() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.getBooleanExtra(BLOOM_CAROUSEL_REFILL_EXTRA, false)) {
-            BloomCarouselSchedule.applyLatestDueEntry(context, intent)
-            super.onReceive(context, intent)
-            try { BloomWidgetRefresh.enqueueRecovery(context) } catch (_: Exception) { }
+        if (intent.getBooleanExtra("bloomAccountReset", false)) {
+            BloomWidgetRefresh.cancelForSignOut(context)
+            val ids = intent.getIntArrayExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS) ?: intArrayOf()
+            BloomWidgetImageUpdate.forget(context, ids)
             return
         }
         if (intent.getBooleanExtra(BLOOM_CAROUSEL_ALARM_EXTRA, false)) {
             BloomCarouselSchedule.applyLatestDueEntry(context, intent)
         }
-        super.onReceive(context, intent)
+        val internalRefresh = intent.getBooleanExtra(BloomWidgetImageUpdate.CONTENT_ONLY_EXTRA, false) ||
+            intent.getBooleanExtra(BLOOM_CAROUSEL_ALARM_EXTRA, false)
+        if (intent.action == AppWidgetManager.ACTION_APPWIDGET_UPDATE && internalRefresh) {
+            val ids = intent.getIntArrayExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS)
+            if (ids != null) updateContent(context, AppWidgetManager.getInstance(context), ids)
+        } else {
+            // The host may have discarded its view even when the image did
+            // not change. A genuine host request must restore a full snapshot.
+            super.onReceive(context, intent)
+        }
+        if (intent.getBooleanExtra(BLOOM_CAROUSEL_REFILL_EXTRA, false)) {
+            // Refill is independent of rendering: unchanged pixels skip the
+            // launcher update, while WorkManager still prepares the next batch.
+            try { BloomWidgetRefresh.enqueueRecovery(context) } catch (_: Exception) { }
+        }
     }
 
     override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
-        // 先对齐到「此刻」再按 prefs 重绘。详见
-        // `BloomCarouselSchedule.applyLatestDueEntryIfCarousel`。
+        updateContent(context, manager, ids, forceFull = true)
+    }
+
+    fun updateContent(context: Context, manager: AppWidgetManager, ids: IntArray, forceFull: Boolean = false) {
         BloomCarouselSchedule.applyLatestDueEntryIfCarousel(context)
         val path = context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
             .getString("mobileLocalLargeSquarePath", null)
             ?: File(context.filesDir, "widget-cache/mobile-local-largeSquare.png").absolutePath
         try { BloomWidgetRefresh.enqueueIfNeeded(context, path) } catch (_: Exception) { }
-        ids.forEach { id ->
-            val views = RemoteViews(context.packageName, R.layout.widget_large_square)
-            BloomWidgetClick.bind(context, views)
-            BitmapFactory.decodeFile(path)?.let {
-                val (width, height) = BloomWidgetSize.pixels(context, manager, id, 280, 280)
-                views.setImageViewBitmap(R.id.widget_image, BloomRoundedBitmap.create(it, context, width, height))
-                views.setViewVisibility(R.id.widget_placeholder, View.GONE)
-            }
-            manager.updateAppWidget(id, views)
-        }
+        BloomWidgetImageUpdate.update(context, manager, ids, path, R.layout.widget_large_square, 280, 280, forceFull)
+    }
+
+    override fun onAppWidgetOptionsChanged(context: Context, manager: AppWidgetManager, id: Int, options: Bundle) {
+        updateContent(context, manager, intArrayOf(id), forceFull = true)
+    }
+
+    override fun onRestored(context: Context, oldIds: IntArray, newIds: IntArray) {
+        BloomWidgetImageUpdate.forget(context, oldIds + newIds)
+        updateContent(context, AppWidgetManager.getInstance(context), newIds, forceFull = true)
+    }
+
+    override fun onDeleted(context: Context, ids: IntArray) {
+        BloomWidgetImageUpdate.forget(context, ids)
     }
 }

@@ -69,6 +69,7 @@ object BloomKeepAlive {
             exactAlarm(context),
             batteryWhitelist(context),
             autostart(context),
+            vendorBattery(context),
         )
 
     /**
@@ -85,7 +86,10 @@ object BloomKeepAlive {
     ): List<String> = buildList {
         if (exactAlarmApplies(sdkInt)) add(ID_EXACT_ALARM)
         if (batteryApplies(sdkInt)) add(ID_BATTERY)
-        if (isXiaomiFamily(manufacturer, brand)) add(ID_AUTOSTART)
+        if (isXiaomiFamily(manufacturer, brand)) {
+            add(ID_AUTOSTART)
+            add(ID_VENDOR_BATTERY)
+        }
     }
 
     /** 精确闹钟：Android 12（S）起才有这个权限；更早的系统本来就精确。 */
@@ -135,7 +139,7 @@ object BloomKeepAlive {
         val manager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
         return Item(
             id = ID_BATTERY,
-            title = "允许后台不受限",
+            title = "允许系统电池优化豁免",
             why = "省电策略会把后台唤醒压到十几分钟一次",
             satisfied = manager?.isIgnoringBatteryOptimizations(context.packageName) ?: false,
             canOpen = true,
@@ -158,7 +162,7 @@ object BloomKeepAlive {
         return Item(
             id = ID_AUTOSTART,
             title = "允许后台自启动",
-            why = "「上滑清理」会强制停止应用并取消全部闹钟；开了这个才不会",
+            why = "清理后台可能停止应用；允许自启动帮助小组件恢复",
             // **小米不提供查询接口**（securitycenter 的 provider 抛
             // SecurityException），所以只有用户自己确认过才算数。确认之前是
             // null（「需确认」），确认之后是 true（不再计入待开启）。
@@ -184,6 +188,21 @@ object BloomKeepAlive {
             Log.w(TAG, "resolve autostart page failed", error)
             null
         }
+    }
+
+    /** 厂商冻结策略独立于 Android 的电池优化白名单，不能由后者推断已允许。 */
+    private fun vendorBattery(context: Context): Item? {
+        if (!isXiaomiFamily(Build.MANUFACTURER, Build.BRAND)) return null
+        val ack = acknowledged(context, ID_VENDOR_BATTERY)
+        return Item(
+            id = ID_VENDOR_BATTERY,
+            title = "允许小米后台无限制",
+            why = "小米省电策略可能冻结换图闹钟；系统电池豁免不能代替这项设置",
+            satisfied = if (ack) true else null,
+            canOpen = true,
+            steps = "设置 → 应用管理 → Bloom → 电池或省电策略 → 无限制；设置后返回并确认已开启",
+            needsAck = !ack,
+        )
     }
 
     /**
@@ -306,6 +325,10 @@ object BloomKeepAlive {
                 Uri.parse("package:${context.packageName}"),
             )
             ID_AUTOSTART -> autostartIntent(context)
+            ID_VENDOR_BATTERY -> Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:${context.packageName}"),
+            )
             else -> null
         } ?: return false
         return try {
@@ -323,6 +346,7 @@ object BloomKeepAlive {
     const val ID_EXACT_ALARM = "exact_alarm"
     const val ID_BATTERY = "battery_whitelist"
     const val ID_AUTOSTART = "autostart"
+    const val ID_VENDOR_BATTERY = "vendor_battery"
 
     private const val MIUI_SECURITY_CENTER = "com.miui.securitycenter"
     private const val MIUI_AUTOSTART_ACTIVITY =

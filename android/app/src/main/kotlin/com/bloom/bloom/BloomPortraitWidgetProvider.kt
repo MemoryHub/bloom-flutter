@@ -4,51 +4,60 @@ import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProvider
 import android.content.Context
 import android.content.Intent
-import android.widget.RemoteViews
-import android.graphics.BitmapFactory
-import android.view.View
+import android.os.Bundle
 import java.io.File
 
 class BloomPortraitWidgetProvider : AppWidgetProvider() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.getBooleanExtra(BLOOM_CAROUSEL_REFILL_EXTRA, false)) {
-            BloomCarouselSchedule.applyLatestDueEntry(context, intent)
-            super.onReceive(context, intent)
-            // Keep the AppWidget broadcast short. Network and Flutter work
-            // belongs to WorkManager; holding goAsync while a headless Flutter
-            // engine performs I/O can trigger MIUI's 60-second broadcast ANR.
-            try { BloomWidgetRefresh.enqueueRecovery(context) } catch (_: Exception) { }
+        if (intent.getBooleanExtra("bloomAccountReset", false)) {
+            BloomWidgetRefresh.cancelForSignOut(context)
+            val ids = intent.getIntArrayExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS) ?: intArrayOf()
+            BloomWidgetImageUpdate.forget(context, ids)
             return
         }
         if (intent.getBooleanExtra(BLOOM_CAROUSEL_ALARM_EXTRA, false)) {
             BloomCarouselSchedule.applyLatestDueEntry(context, intent)
         }
-        super.onReceive(context, intent)
+        val internalRefresh = intent.getBooleanExtra(BloomWidgetImageUpdate.CONTENT_ONLY_EXTRA, false) ||
+            intent.getBooleanExtra(BLOOM_CAROUSEL_ALARM_EXTRA, false)
+        if (intent.action == AppWidgetManager.ACTION_APPWIDGET_UPDATE && internalRefresh) {
+            val ids = intent.getIntArrayExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS)
+            if (ids != null) updateContent(context, AppWidgetManager.getInstance(context), ids)
+        } else {
+            // The host may have discarded its view even when the image did
+            // not change. A genuine host request must restore a full snapshot.
+            super.onReceive(context, intent)
+        }
+        if (intent.getBooleanExtra(BLOOM_CAROUSEL_REFILL_EXTRA, false)) {
+            // Refill is independent of rendering: unchanged pixels skip the
+            // launcher update, while WorkManager still prepares the next batch.
+            try { BloomWidgetRefresh.enqueueRecovery(context) } catch (_: Exception) { }
+        }
     }
 
     override fun onUpdate(context: Context, manager: AppWidgetManager, ids: IntArray) {
-        // 先对齐到「此刻」再按 prefs 重绘：闹钟链重建、重启、包替换之后，当前
-        // 格往往已经过去了，只重绘会把画面留在旧照片上。详见
-        // `BloomCarouselSchedule.applyLatestDueEntryIfCarousel`。
+        updateContent(context, manager, ids, forceFull = true)
+    }
+
+    fun updateContent(context: Context, manager: AppWidgetManager, ids: IntArray, forceFull: Boolean = false) {
         BloomCarouselSchedule.applyLatestDueEntryIfCarousel(context)
-        val prefs = context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
-        val path = prefs.getString("mobileLocalPortraitPath", null)
+        val path = context.getSharedPreferences("bloom_widget", Context.MODE_PRIVATE)
+            .getString("mobileLocalPortraitPath", null)
             ?: File(context.filesDir, "widget-cache/mobile-local-portrait.png").absolutePath
-        try {
-            BloomWidgetRefresh.enqueueIfNeeded(context, path)
-        } catch (_: Exception) {
-            // The app may not have been opened yet, so Workmanager may not
-            // have a Dart callback handle. Keep the widget receiver alive.
-        }
-        ids.forEach { id ->
-            val views = RemoteViews(context.packageName, R.layout.widget_portrait)
-            BloomWidgetClick.bind(context, views)
-            BitmapFactory.decodeFile(File(path).absolutePath)?.let {
-                val (width, height) = BloomWidgetSize.pixels(context, manager, id, 180, 300)
-                views.setImageViewBitmap(R.id.widget_image, BloomRoundedBitmap.create(it, context, width, height))
-                views.setViewVisibility(R.id.widget_placeholder, View.GONE)
-            }
-            manager.updateAppWidget(id, views)
-        }
+        try { BloomWidgetRefresh.enqueueIfNeeded(context, path) } catch (_: Exception) { }
+        BloomWidgetImageUpdate.update(context, manager, ids, path, R.layout.widget_portrait, 180, 300, forceFull)
+    }
+
+    override fun onAppWidgetOptionsChanged(context: Context, manager: AppWidgetManager, id: Int, options: Bundle) {
+        updateContent(context, manager, intArrayOf(id), forceFull = true)
+    }
+
+    override fun onRestored(context: Context, oldIds: IntArray, newIds: IntArray) {
+        BloomWidgetImageUpdate.forget(context, oldIds + newIds)
+        updateContent(context, AppWidgetManager.getInstance(context), newIds, forceFull = true)
+    }
+
+    override fun onDeleted(context: Context, ids: IntArray) {
+        BloomWidgetImageUpdate.forget(context, ids)
     }
 }

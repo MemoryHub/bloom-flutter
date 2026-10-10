@@ -4,12 +4,19 @@ import CoreText
 import ImageIO
 
 private let bloomAppGroup = "group.com.zhangbo.bloom.zb20260815"
-private let bloomBaseURL = URL(string: "https://bloom.jihu.top")!
 
 struct BloomEntry: TimelineEntry {
   let date: Date
-  let compositeImage: UIImage?
-  let photoImage: UIImage?
+  // Keep paths so five timeline entries do not retain five decoded bitmaps.
+  let compositePath: String?
+  let photoPath: String?
+  let maxPixels: Int
+  var compositeImage: UIImage? { load(compositePath) }
+  var photoImage: UIImage? { load(photoPath) }
+  private func load(_ path: String?) -> UIImage? {
+    guard let path else { return nil }
+    return BloomWidgetRenderer.image(at: URL(fileURLWithPath: path), maxPixels: maxPixels)
+  }
   let captionZh: String?
   let captionEn: String?
   let capturedDateText: String?
@@ -22,8 +29,9 @@ struct BloomEntry: TimelineEntry {
 
   init(
     date: Date,
-    compositeImage: UIImage?,
-    photoImage: UIImage?,
+    compositePath: String?,
+    photoPath: String?,
+    maxPixels: Int = 480,
     captionZh: String?,
     captionEn: String?,
     capturedDateText: String?,
@@ -31,8 +39,9 @@ struct BloomEntry: TimelineEntry {
     itemID: Int? = nil
   ) {
     self.date = date
-    self.compositeImage = compositeImage
-    self.photoImage = photoImage
+    self.compositePath = compositePath
+    self.photoPath = photoPath
+    self.maxPixels = maxPixels
     self.captionZh = captionZh
     self.captionEn = captionEn
     self.capturedDateText = capturedDateText
@@ -43,8 +52,8 @@ struct BloomEntry: TimelineEntry {
   static func placeholder(at date: Date = Date()) -> BloomEntry {
     BloomEntry(
       date: date,
-      compositeImage: nil,
-      photoImage: nil,
+      compositePath: nil,
+      photoPath: nil,
       captionZh: nil,
       captionEn: nil,
       capturedDateText: nil,
@@ -53,199 +62,36 @@ struct BloomEntry: TimelineEntry {
   }
 }
 
-private struct BloomCaption: Decodable {
-  let zh: String?
-  let en: String?
-}
-
-private struct BloomPhotoDescriptor: Decodable {
-  let url: String?
-  let postURL: String?
-
-  enum CodingKeys: String, CodingKey {
-    case url
-    case postURL = "post_url"
-  }
-}
-
-private struct BloomDailyPayload: Decodable {
-  let recommendationID: Int
-  let caption: BloomCaption?
-  let capturedDateText: String?
-  let locationText: String?
-  let nextCheckAt: String?
-  let photo: BloomPhotoDescriptor
-
-  enum CodingKeys: String, CodingKey {
-    case recommendationID = "recommendation_id"
-    case caption
-    case capturedDateText = "captured_date_text"
-    case locationText = "location_text"
-    case nextCheckAt = "next_check_at"
-    case photo
-  }
-}
-
-private struct BloomCarouselItem: Decodable {
-  let itemID: Int
-  let displayAt: String
-  let caption: BloomCaption?
-  let capturedDateText: String?
-  let locationText: String?
-  let photo: BloomPhotoDescriptor
-
-  enum CodingKeys: String, CodingKey {
-    case itemID = "item_id"
-    case displayAt = "display_at"
-    case caption
-    case capturedDateText = "captured_date_text"
-    case locationText = "location_text"
-    case photo
-  }
-}
-
-private struct BloomCarouselPlanPayload: Decodable {
-  let planID: Int
-  let currentItemID: Int
-  let nextCheckAt: String?
-  let items: [BloomCarouselItem]
-
-  enum CodingKeys: String, CodingKey {
-    case planID = "plan_id"
-    case currentItemID = "current_item_id"
-    case nextCheckAt = "next_check_at"
-    case items
-  }
-}
-
-private struct BloomCarouselPayload: Decodable {
-  let nextCheckAt: String?
-  let item: BloomCarouselItem
-
-  enum CodingKeys: String, CodingKey {
-    case nextCheckAt = "next_check_at"
-    case item
-  }
-}
-
-private struct BloomRemoteContent {
-  let revision: Int
-  let captionZh: String?
-  let captionEn: String?
-  let capturedDateText: String?
-  let locationText: String?
-  let photoPath: String
-}
-
-private enum BloomWidgetNetworkError: Error {
-  case invalidCredentials
-  case invalidURL
-  case invalidResponse
-  case invalidImage
-}
-
 private enum BloomWidgetRemoteLoader {
-  static func timeline(family: String) async -> ([BloomEntry], Date) {
-    let missingCredentialsNext = Date().addingTimeInterval(30 * 60)
-    let networkRetryNext = Date().addingTimeInterval(5 * 60)
-    guard
-      let defaults = UserDefaults(suiteName: bloomAppGroup),
-      let deviceID = defaults.string(forKey: "bloom.device_id"),
-      let token = defaults.string(forKey: "bloom.device_token"),
-      token.count >= 32
-    else {
-      return ([cachedEntry(family: family)], missingCredentialsNext)
+  static func timeline(family: String) -> ([BloomEntry], Date) {
+    if UserDefaults(suiteName: bloomAppGroup)?.bool(forKey: "bloom.signed_out") == true {
+      return ([.placeholder()], .distantFuture)
     }
-
-    let selectionMode = defaults.string(forKey: "bloom.display_mode") ?? "recommend"
-    let mode = defaults.bool(forKey: "bloom.scheduled_plan") ? "carousel" : selectionMode
-    let appEntry = freshAppCompositeEntry(family: family, defaults: defaults)
-    do {
-      if mode == "carousel" {
-        // The host app pre-renders the current and future composites while it
-        // is in the foreground. A WidgetKit extension has a short execution
-        // budget and should not have to serially download several multi-MB
-        // originals merely to advance an already-known local timeline.
-        if let local = localCarouselTimeline(family: family, defaults: defaults) {
-          logTimelineChoice(
-            "family=\(family) source=local entries=\(local.0.count) "
-              + "first=\(Int(local.0.first?.date.timeIntervalSince1970 ?? 0)) "
-              + "last=\(Int(local.0.last?.date.timeIntervalSince1970 ?? 0))"
-          )
-          // **Never serve a timeline that can only repeat.** The local plan is
-          // preferred because it needs no network, but a future timestamp alone
-          // does not mean there is anything new left to show: once every entry in
-          // the pool has already been displayed, `last.date > Date()` stays true
-          // forever (the stale plan still carries future-dated slots) while the
-          // wall just cycles the same few already-seen photos — the "iOS only
-          // loops through a handful of old photos" symptom. The real question is
-          // whether an *unseen* entry still exists; only then is there something
-          // this local timeline can still advance to. Falling through to the
-          // fetch path is what breaks the loop: it pulls the next page *and* its
-          // pictures.
-          // **「还有没有没看过的」也由共享状态回答，不再用本地 id 阈值。**
-          //
-          // 旧实现用 `iosLastShownItemId` 作单调阈值，前提是「同一代计划内
-          // item_id 递增」——而计划换代时 id 会整段重排（实测 plan 127 → 132
-          // 全部换号），阈值一跨代就会把新照片误判成「已看过」，表现就是
-          // 「iOS 反复显示那几张老照片」。现在只问一件事：共享状态的栅格里
-          // 还有没有未来格子。没有就落到取数路径，把新计划连同照片一起拉回来。
-          let gridHasRunway: Bool = {
-            guard let shared = BloomSharedState.load() else { return false }
-            let nowMs = Date().timeIntervalSince1970 * 1000
-            return BloomSharedState.grid(shared).contains {
-              (($0["slot_at_ms"] as? NSNumber)?.doubleValue ?? 0) > nowMs
-            }
-          }()
-          if let last = local.0.last, last.date > Date(), gridHasRunway {
-            return local
-          }
-          // **本地池用尽：这里不会、也不能去联网。**
-          //
-          // 轮播模式下的扩展是纯离线的查表器（见 `localCarouselTimeline` 上方的说明），
-          // 所以画面会停在当前这一张，一直等到宿主 App——或它的
-          // `BGAppRefreshTask`——把新格子补进来。把这件事明确写进日志，是因为
-          // "小组件卡住"必须能从设备上被认出来，而不是靠猜：历史上这段代码写的是
-          // "fetching instead / source=online"，但被调用的函数只是把同一份本地数据
-          // 再返回一次，于是日志一直在报告一件没发生的事。
-          logTimelineChoice(
-            "family=\(family) source=local-spent future=0 "
-              + "gridHasRunway=\(gridHasRunway) action=hold-wait-for-host-refill"
-          )
-          return local
-        }
-        logTimelineChoice("family=\(family) source=local-empty (no usable local plan)")
-        // 共享状态还没有内容（App 从未打开过）时**宁可什么都不排**：WidgetKit 会
-        // 继续显示上一份时间线，也好过扩展凭空猜一张用户没看过的照片。
-        return ([], Date().addingTimeInterval(15 * 60))
-      }
-      // In recommendation mode there are no future 15-minute entries to
-      // preload. Preserve the host app's exact composite briefly so a native
-      // fetch cannot overwrite a photo the user has just selected.
-      if let appEntry {
-        return ([appEntry], Date().addingTimeInterval(2 * 60))
-      }
-      return try await recommendationTimeline(
-        family: family,
-        deviceID: deviceID,
-        token: token,
-        defaults: defaults
-      )
-    } catch {
-      // A timeline request can coincide with a temporary loss of network.
-      // Ask WidgetKit for another opportunity soon after connectivity is
-      // likely to have returned instead of leaving an exhausted carousel on
-      // screen for another half hour.
-      let next = mode == "carousel"
-        ? nextCarouselCheck(proposed: nil, defaults: defaults)
-        : networkRetryNext
-      return ([cachedEntry(family: family)], next)
+    guard let defaults = UserDefaults(suiteName: bloomAppGroup) else {
+      return ([cachedEntry(family: family)], Date().addingTimeInterval(15 * 60))
     }
+    let scheduled = defaults.bool(forKey: "bloom.scheduled_plan") ||
+      defaults.string(forKey: "bloom.display_mode") == "carousel"
+    if scheduled, let local = localCarouselTimeline(family: family, defaults: defaults) {
+      logTimelineChoice("family=\(family) source=shared-state entries=\(local.0.count)")
+      return local
+    }
+    // A missing/failed new download holds the last complete composition. Never
+    // publish an empty timeline or change the current item before bytes exist.
+    return ([cachedEntry(family: family)], Date().addingTimeInterval(scheduled ? 5 * 60 : 30 * 60))
   }
 
   static func cachedEntry(family: String) -> BloomEntry {
     guard let defaults = UserDefaults(suiteName: bloomAppGroup) else {
       return .placeholder()
+    }
+    if defaults.bool(forKey: "bloom.signed_out") { return .placeholder() }
+
+    let scheduled = defaults.bool(forKey: "bloom.scheduled_plan") ||
+      defaults.string(forKey: "bloom.display_mode") == "carousel"
+    if scheduled, let local = localCarouselTimeline(family: family, defaults: defaults),
+       let current = local.0.first, current.date <= Date() {
+      return current
     }
 
     if let appEntry = freshAppCompositeEntry(family: family, defaults: defaults) {
@@ -263,8 +109,9 @@ private enum BloomWidgetRemoteLoader {
     // 照片和文案同源，错配在结构上不可能发生。
     return BloomEntry(
       date: Date(),
-      compositeImage: compositeImage(family: family, defaults: defaults),
-      photoImage: nil,
+      compositePath: compositePath(family: family, defaults: defaults),
+      photoPath: nil,
+      maxPixels: family == "square" ? 480 : 800,
       captionZh: nil,
       captionEn: nil,
       capturedDateText: nil,
@@ -279,56 +126,20 @@ private enum BloomWidgetRemoteLoader {
     let updatedAt = defaults.double(forKey: "appWidgetUpdatedAt")
     guard updatedAt > 0,
           Date().timeIntervalSince1970 - updatedAt < 2 * 60,
-          let image = compositeImage(family: family, defaults: defaults) else {
+          let path = compositePath(family: family, defaults: defaults) else {
       return nil
     }
     return BloomEntry(
       date: Date(),
-      compositeImage: image,
-      photoImage: nil,
+      compositePath: path,
+      photoPath: nil,
+      maxPixels: family == "square" ? 480 : 800,
       captionZh: nil,
       captionEn: nil,
       capturedDateText: nil,
       locationText: nil
     )
   }
-
-  private static func recommendationTimeline(
-    family: String,
-    deviceID: String,
-    token: String,
-    defaults: UserDefaults
-  ) async throws -> ([BloomEntry], Date) {
-    let path = "/api/frame/devices/\(deviceID)/daily"
-    let payload: BloomDailyPayload = try await requestJSON(
-      path: path,
-      token: token,
-      method: "POST",
-      body: ["target": "mobile"]
-    )
-    guard let photoPath = payload.photo.url else {
-      throw BloomWidgetNetworkError.invalidURL
-    }
-    let photoData = try await requestData(
-      path: photoPath,
-      token: token,
-      method: "GET"
-    )
-    let content = try cache(
-      photoData: photoData,
-      revision: payload.recommendationID,
-      caption: payload.caption,
-      capturedDateText: payload.capturedDateText,
-          locationText: payload.locationText,
-      defaults: defaults,
-      mode: "recommend"
-    )
-    return (
-      [entry(content)],
-      normalizedNext(parseDate(payload.nextCheckAt))
-    )
-  }
-
 
   /// **Why did the widget pick that photo?**
   ///
@@ -343,7 +154,10 @@ private enum BloomWidgetRemoteLoader {
         forSecurityApplicationGroupIdentifier: bloomAppGroup
       )
     else { return }
-    let file = root.appendingPathComponent("widget-timeline.log")
+    let file = root.appendingPathComponent("widget-cache/widget-timeline.log")
+    if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 64 * 1024 {
+      try? FileManager.default.removeItem(at: file)
+    }
     let stamp = ISO8601DateFormatter().string(from: Date())
     let entry = "\(stamp) \(line)\n"
     if let handle = try? FileHandle(forWritingTo: file) {
@@ -384,15 +198,15 @@ private enum BloomWidgetRemoteLoader {
       } else {
         selected = nil
       }
-      guard let selected,
-            let image = UIImage(contentsOfFile: selected.path) else { return nil }
+      guard let selected else { return nil }
       let scheduled = Date(timeIntervalSince1970: millis / 1000)
       return (
         scheduled,
         BloomEntry(
           date: scheduled,
-          compositeImage: selected.isComposite ? image : nil,
-          photoImage: selected.isComposite ? nil : image,
+          compositePath: selected.isComposite ? selected.path : nil,
+          photoPath: selected.isComposite ? nil : selected.path,
+          maxPixels: family == "square" ? 480 : 800,
           captionZh: item["captionZh"] as? String,
           captionEn: item["captionEn"] as? String,
           capturedDateText: item["capturedDateText"] as? String,
@@ -471,8 +285,9 @@ private enum BloomWidgetRemoteLoader {
     if let current {
       entries.append(BloomEntry(
         date: now,
-        compositeImage: current.1.compositeImage,
-        photoImage: current.1.photoImage,
+        compositePath: current.1.compositePath,
+        photoPath: current.1.photoPath,
+        maxPixels: current.1.maxPixels,
         captionZh: current.1.captionZh,
         captionEn: current.1.captionEn,
         capturedDateText: current.1.capturedDateText,
@@ -481,7 +296,10 @@ private enum BloomWidgetRemoteLoader {
       ))
     }
     entries.append(contentsOf: future.map { $0.1 })
-    guard !entries.isEmpty else { return nil }
+    // WidgetKit must always receive a ready entry for now. If only a future
+    // download succeeded, keep the last composition instead of starting a
+    // timeline with a future image at its first position.
+    guard current != nil, !entries.isEmpty else { return nil }
     // Ask for the next batch at the second-to-last stamp when there is one, at
     // the last known stamp when there is only one, and right away when the local
     // plan is spent.
@@ -496,62 +314,11 @@ private enum BloomWidgetRemoteLoader {
     return (entries, nextCarouselCheck(proposed: refillAt, defaults: defaults))
   }
 
-  // 这里原本还有一个 `carouselTimeline(family:deviceID:token:defaults:currentOverride:)`。
-  //
-  // 它的文档说自己是"只读共享状态、不联网"，函数体确实是纯本地查询；但调用点
-  // 把它当成"联网补货"来用（前一行日志写着 `fetching instead`），而且
-  // `deviceID` / `token` / `currentOverride` 三个参数从头到尾没有被读过。那套
-  // 扩展自建的在线补货——自己拉 `/carousel/plan`、自己挑分页游标、自己下载照片、
-  // 自己合并进 `iosCarouselPlan`——是**重写之前遗留的第二写者**（最早见于
-  // 2026-08-17 的初始提交），也正是「照片和文案来自两个不同来源」的源头：照片走
-  // 共享状态、文案走它自己那张表，实测停在不同的条目上（照片 4376、共享状态已到
-  // 4409）。方案把「选哪一格」明确列为 Swift 侧不得实现的决策。
-  //
-  // 现在整个扩展与小组件主体、宿主 App、安卓原生读**同一份共享状态**，规则只有
-  // 一条：`date_ms <= now` 的最后一条。**Dart 是唯一的写者。**
-  //
-  // 那层空转已经被删掉了，调用点直接走本地查表 + 明确的"露底"日志。补货是宿主
-  // App 的职责：前台靠 `_armNextSlotWake`，后台靠 `BGAppRefreshTask`；扩展不做
-  // 也不该做网络。
-
-  private static func localDay(_ date: Date = Date()) -> String {
-    let formatter = DateFormatter()
-    formatter.locale = Locale(identifier: "en_US_POSIX")
-    formatter.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
-    formatter.dateFormat = "yyyy-MM-dd"
-    return formatter.string(from: date)
-  }
-
-  /// The shared plan, or an empty one when it belongs to a previous day.
-  ///
-  /// A **missing** day key — a plan written before this bookkeeping existed — is
-  /// treated as usable rather than discarded, so an update cannot blank a widget
-  /// that is working.
-  /// 扩展要烘焙的计划：**优先读共享状态**，本地缓存只作兜底。
-  ///
-  /// 方案要求扩展「从共享状态读取计划」。`carousel-state.json` 里的
-  /// `timeline_entries` 恰好带着这里需要的全部信息，而且比扩展自建的
-  /// `iosCarouselPlan` 更权威：它是 Dart 的单写者写下的，两端因此看到同一份
-  /// 计划。扩展自建那份曾经是**第二个写者**——App 与小组件显示两张不同照片
-  /// 的根源之一。
-  ///
-  /// 键名映射（snake_case → 扩展内部命名）：
-  ///   * `item_id`        → `itemId`
-  ///   * `date_ms`        → `displayAtMillis`
-  ///   * `square_path`    → `squarePath`（Dart 已渲染好的信纸合成图）
-  ///   * `large_square_path` → `largeSquarePath`（同上）
-  ///   * `original_path`  → `photoPath`（**原图**，仍需走信纸排版）
-  ///
-  /// 注意最后一条：Dart 渲染出的 `portrait_path` 是合成图，而扩展的
-  /// `photoPath` 语义是「需要套信纸排版的原始照片」，两者不能混用——混用会
-  /// 让文案消失（那张图里已经把文案画进去了，再套一次排版就没有文案位置）。
-  ///
-  /// 共享状态缺失（App 从未打开过）时退回本地缓存，行为与从前一致。
+  // The only plan table is the App Group's canonical timeline. The extension
+  // may refill it under the shared writer lease; it never keeps a private plan.
   private static func storedCarouselPlan(defaults: UserDefaults) -> [[String: Any]] {
-    // 优先读共享状态：它是 Dart 单写者写下的权威计划，键名映射在
-    // `BloomSharedState.planItems`（那个文件可脱离模拟器被测试）。扩展自建的
-    // `iosCarouselPlan` 曾经是**第二个写者**，正是 App 与小组件显示两张不同
-    // 照片的根源之一。
+    // Flutter 与扩展在同一批次锁内更新这份共享状态，键名映射在
+    // BloomSharedState.planItems。播放不读取扩展私有计划表。
     if let shared = BloomSharedState.load() {
       let items = BloomSharedState.planItems(from: shared)
       if !items.isEmpty {
@@ -572,199 +339,21 @@ private enum BloomWidgetRemoteLoader {
     return []
   }
 
-  /// 此刻是哪一格：**由 Dart 的单写者决定，扩展不自行判断**。
-  ///
-  /// 方案把「选哪一格」明确列为 Swift 侧不得实现的决策之一。扩展在自己的
-  /// 计划响应里也能看到一个 `current_item_id`，但那是第二次独立判断：它和
-  /// Dart 的判断依据同一份服务端计划、却在不同的时刻取数，一旦分叉就会让
-  /// App 与小组件显示两张不同的照片。
-  ///
-  /// 因此：共享状态里能读到 `current_item_id` 时一律以它为准；只有在状态
-  /// 缺失（App 从未打开过、扩展独立运行）时才退回服务端字段。
-  ///
-  /// 注意「都不是当前」是合法结果：此时整页条目都按各自时刻排期，WidgetKit
-  /// 会继续显示上一份时间线的最后一条，而不是抢先跳到未来的某一格。
-  private static func isCurrentSlot(
-    itemID: Int,
-    displayAt: Date,
-    now: Date,
-    shared: [String: Any]?,
-    serverCurrentItemID: Int
-  ) -> Bool {
-    if let sharedItemID = (shared?["current_item_id"] as? NSNumber)?.intValue,
-       sharedItemID > 0 {
-      return itemID == sharedItemID
-    }
-    // Outside the active window the API may identify tomorrow's first item as
-    // `currentItemID`. It is still a future entry and must not replace
-    // tonight's final photo before its scheduled display time.
-    return itemID == serverCurrentItemID &&
-      displayAt <= now.addingTimeInterval(60)
-  }
-
-  // 这里曾有三个只服务于「扩展自己补货」的函数：`carouselCursor`（分页游标）、
-  // `mergeCarouselPlan`（把它拉到的页并进本地表）、`persistCarouselPlan`（把这张
-  // 表写进 `iosCarouselPlan`）。在线补货删除后它们全部失去调用者，一并删除。
-  //
-  // `persistCarouselPlan` 曾经是 `iosCarouselPlan` 的**写入端**——正是它让那张
-  // 陈旧表一直活下去，进而覆盖宿主 App 的文案。
-
-  private static func entry(
-    _ content: BloomRemoteContent,
-    at date: Date = Date(),
-    itemID: Int? = nil
-  ) -> BloomEntry {
-    BloomEntry(
-      date: date,
-      compositeImage: nil,
-      photoImage: UIImage(contentsOfFile: content.photoPath),
-      captionZh: content.captionZh,
-      captionEn: content.captionEn,
-      capturedDateText: content.capturedDateText,
-      locationText: content.locationText,
-      itemID: itemID
-    )
-  }
-
-  private static func cache(
-    photoData: Data,
-    revision: Int,
-    caption: BloomCaption?,
-    capturedDateText: String?,
-    locationText: String?,
-    defaults: UserDefaults,
-    persistAsCurrent: Bool = true,
-    mode: String = "recommend"
-  ) throws -> BloomRemoteContent {
-    guard let widgetImage = downsampleForWidget(photoData),
-          let encoded = widgetImage.jpegData(compressionQuality: 0.88),
-          let root = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: bloomAppGroup
-          ) else {
-      throw BloomWidgetNetworkError.invalidImage
-    }
-    let directory = root.appendingPathComponent("widget-cache", isDirectory: true)
-    try FileManager.default.createDirectory(
-      at: directory,
-      withIntermediateDirectories: true
-    )
-    let file = directory.appendingPathComponent("ios-widget-remote-\(revision).jpg")
-    try encoded.write(to: file, options: .atomic)
-
-    if persistAsCurrent {
-      // **旧的六个键已停止写入**（`iosWidgetPhotoPath` / `iosWidgetRevision` /
-      // `iosWidgetCaptionZh` / `iosWidgetCaptionEn` / `iosWidgetCapturedDate` /
-      // `iosWidgetLocation`）。
-      //
-      // 它们是重写前那套「扩展自己下载、自己存照片和文案」的产物。照片用
-      // `iosWidgetPhotoPath`、文案用 `iosWidgetCaptionZh`，**两者是两个不同的键**，
-      // 实测停在不同的条目上（照片 4376、文案也 4376，但共享状态已经走到 4409），
-      // 于是首页出现「照片换了、文案没换」。读取端已删除，这里也不再写。
-      // Keep the host App's shared current-item reader in sync with the
-      // extension process. Flutter can consume this path after WidgetKit has
-      // advanced while the app was closed.
-      defaults.set(revision, forKey: "recommendationId")
-      defaults.set(file.path, forKey: "widgetCurrentOriginalPhotoPath")
-      defaults.set(caption?.zh, forKey: "captionZh")
-      defaults.set(caption?.en, forKey: "captionEn")
-      defaults.set(capturedDateText, forKey: "capturedDateText")
-      defaults.set(locationText, forKey: "locationText")
-      defaults.set(mode, forKey: "mode")
-      defaults.set(Date().timeIntervalSince1970 * 1000, forKey: "updatedAtMillis")
-    }
-    pruneRemoteImages(in: directory, keeping: file)
-
-    return BloomRemoteContent(
-      revision: revision,
-      captionZh: caption?.zh,
-      captionEn: caption?.en,
-      capturedDateText: capturedDateText,
-      locationText: locationText,
-      photoPath: file.path
-    )
-  }
-
-  private static func downsampleForWidget(_ data: Data) -> UIImage? {
-    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
-      return nil
-    }
-    let options: [CFString: Any] = [
-      kCGImageSourceCreateThumbnailFromImageAlways: true,
-      kCGImageSourceCreateThumbnailWithTransform: true,
-      kCGImageSourceThumbnailMaxPixelSize: 1000,
-      kCGImageSourceShouldCacheImmediately: true,
-    ]
-    guard let image = CGImageSourceCreateThumbnailAtIndex(
-      source,
-      0,
-      options as CFDictionary
-    ) else {
-      return nil
-    }
-    return UIImage(cgImage: image)
-  }
-
-  private static func requestJSON<T: Decodable>(
-    path: String,
-    token: String,
-    method: String,
-    body: [String: Any]? = nil
-  ) async throws -> T {
-    let data = try await requestData(
-      path: path,
-      token: token,
-      method: method,
-      body: body
-    )
-    return try JSONDecoder().decode(T.self, from: data)
-  }
-
-  private static func requestData(
-    path: String,
-    token: String,
-    method: String,
-    body: [String: Any]? = nil
-  ) async throws -> Data {
-    guard let url = URL(string: path, relativeTo: bloomBaseURL)?.absoluteURL else {
-      throw BloomWidgetNetworkError.invalidURL
-    }
-    var request = URLRequest(url: url)
-    request.httpMethod = method
-    request.timeoutInterval = 20
-    request.setValue(token, forHTTPHeaderField: "X-Frame-Token")
-    if let body {
-      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-      request.httpBody = try JSONSerialization.data(withJSONObject: body)
-    }
-    let (data, response) = try await URLSession.shared.data(for: request)
-    guard let http = response as? HTTPURLResponse,
-          (200..<300).contains(http.statusCode) else {
-      throw BloomWidgetNetworkError.invalidResponse
-    }
-    return data
-  }
-
-  private static func compositeImage(
+  private static func compositePath(
     family: String,
     defaults: UserDefaults
-  ) -> UIImage? {
+  ) -> String? {
+    let scheduled = defaults.bool(forKey: "bloom.scheduled_plan") ||
+      defaults.string(forKey: "bloom.display_mode") == "carousel"
+    if scheduled,
+       let due = BloomCarouselRule.currentEntry(BloomSharedState.timelineEntries(BloomSharedState.load()), nowMillis: Date().timeIntervalSince1970 * 1000),
+       let path = due[family == "square" ? "square_path" : "large_square_path"] as? String,
+       FileManager.default.fileExists(atPath: path) {
+      return path
+    }
     let key = family == "square" ? "squarePath" : "largeSquarePath"
     guard let path = defaults.string(forKey: key) else { return nil }
-    return UIImage(contentsOfFile: path)
-  }
-
-  private static func parseDate(_ value: String?) -> Date? {
-    guard let value else { return nil }
-    let fractional = ISO8601DateFormatter()
-    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let date = fractional.date(from: value) { return date }
-    return ISO8601DateFormatter().date(from: value)
-  }
-
-  private static func normalizedNext(_ proposed: Date?) -> Date {
-    let minimum = Date().addingTimeInterval(15 * 60)
-    guard let proposed, proposed > minimum else { return minimum }
-    return proposed
+    return FileManager.default.fileExists(atPath: path) ? path : nil
   }
 
   private static func nextCarouselCheck(
@@ -810,25 +399,7 @@ private enum BloomWidgetRemoteLoader {
     return hour * 60 + minute
   }
 
-  private static func pruneRemoteImages(in directory: URL, keeping: URL) {
-    guard let files = try? FileManager.default.contentsOfDirectory(
-      at: directory,
-      includingPropertiesForKeys: [.contentModificationDateKey]
-    ) else { return }
-    let candidates = files.filter {
-      $0.lastPathComponent.hasPrefix("ios-widget-remote-") && $0 != keeping
-    }
-    let sorted = candidates.sorted {
-      let left = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-      let right = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-      return left > right
-    }
-    // A carousel timeline currently holds up to four UIImage file references.
-    // Keep enough generations alive until WidgetKit replaces that timeline.
-    for file in sorted.dropFirst(6) {
-      try? FileManager.default.removeItem(at: file)
-    }
-  }
+
 }
 
 private enum BloomWidgetFont {
@@ -870,10 +441,11 @@ struct BloomProvider: TimelineProvider {
   }
 
   func getTimeline(in context: Context, completion: @escaping (Timeline<BloomEntry>) -> Void) {
-    Task {
-      let (entries, next) = await BloomWidgetRemoteLoader.timeline(family: family)
-      completion(Timeline(entries: entries, policy: .after(next)))
-    }
+    // Queue system-owned metadata/download work without awaiting transport.
+    // The ready shared timeline is always returned during this provider pass.
+    BloomWidgetSync.shared.refill()
+    let (entries, next) = BloomWidgetRemoteLoader.timeline(family: family)
+    completion(Timeline(entries: entries, policy: .after(next)))
   }
 }
 
@@ -894,7 +466,10 @@ struct BloomWidgetView: View {
 
   private var content: some View {
     Group {
-      if let image = entry.photoImage {
+      if UserDefaults(suiteName: bloomAppGroup)?.bool(forKey: "bloom.signed_out") == true {
+        Color(red: 0.96, green: 0.95, blue: 0.91)
+          .overlay(Text("请登录 Bloom").foregroundColor(.secondary))
+      } else if let image = entry.photoImage {
         GeometryReader { proxy in
           let paperHeight = proxy.size.height * 0.25
           VStack(spacing: 0) {
@@ -996,6 +571,9 @@ struct BloomSquareWidget: Widget {
     .configurationDisplayName("Bloom 方形 2×2")
     .description("每天展示一张今日推荐照片。")
     .supportedFamilies([.systemSmall])
+    .onBackgroundURLSessionEvents(matching: BloomWidgetSync.sessionID) { identifier, completion in
+      BloomWidgetSync.shared.handleEvents(identifier: identifier, completion: completion)
+    }
   }
 }
 
@@ -1013,6 +591,9 @@ struct BloomLargeSquareWidget: Widget {
     .configurationDisplayName("Bloom 方形 4×4")
     .description("每天展示一张今日推荐照片。")
     .supportedFamilies([.systemLarge])
+    .onBackgroundURLSessionEvents(matching: BloomWidgetSync.sessionID) { identifier, completion in
+      BloomWidgetSync.shared.handleEvents(identifier: identifier, completion: completion)
+    }
   }
 }
 

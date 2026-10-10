@@ -46,3 +46,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# 真机缓存、照片和本机验证日志不进入版本库。
+docs/validation/

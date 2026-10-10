@@ -5,6 +5,7 @@ import WidgetKit
 public final class BloomWidgetBridgePlugin: NSObject, FlutterPlugin {
   private static let appGroup = "group.com.zhangbo.bloom.zb20260815"
 
+
   public static func register(with registrar: FlutterPluginRegistrar) {
     let channel = FlutterMethodChannel(name: "com.bloom/widget", binaryMessenger: registrar.messenger())
     registrar.addMethodCallDelegate(BloomWidgetBridgePlugin(), channel: channel)
@@ -69,6 +70,27 @@ public final class BloomWidgetBridgePlugin: NSObject, FlutterPlugin {
         "locationText": defaults.string(forKey: "locationText"),
         "updatedAtMillis": Int(defaults.double(forKey: "updatedAtMillis")),
       ])
+    case "writeDeviceCredentials":
+      // First-login mirroring must work while AppDelegate is still attaching
+      // its richer channel; an unimplemented response leaves a stale token.
+      guard let arguments = call.arguments as? [String: Any],
+            let deviceID = arguments["deviceId"] as? String,
+            let token = arguments["deviceToken"] as? String,
+            let defaults = UserDefaults(suiteName: Self.appGroup) else {
+        result(FlutterError(code: "bad_arguments", message: nil, details: nil))
+        return
+      }
+      let changed = defaults.string(forKey: "bloom.device_id") != deviceID ||
+        defaults.string(forKey: "bloom.device_token") != (token.isEmpty ? nil : token)
+      if token.isEmpty {
+        defaults.removeObject(forKey: "bloom.device_token")
+      } else {
+        defaults.set(deviceID, forKey: "bloom.device_id")
+        defaults.set(token, forKey: "bloom.device_token")
+      }
+      defaults.synchronize()
+      if changed { WidgetCenter.shared.reloadAllTimelines() }
+      result(nil)
     case "stableDeviceCredentials":
       // 【已废】这个方法在 iOS 上由 AppDelegate 实现（Keychain + App Group）。
       //

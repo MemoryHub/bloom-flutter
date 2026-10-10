@@ -8,6 +8,8 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.util.Log
+import org.json.JSONObject
+import java.io.File
 
 /**
  * 从权威状态排闹钟。
@@ -121,9 +123,11 @@ object BloomCarouselAlarms {
         //
         // 广播目标是显式组件，系统照样投递、provider 也照常处理；而它做的事情与
         // 哪一个 family 收到无关——先 `applyLatestDueEntry` 落盘，再唤起 Dart 跑批。
-        // 排在下一格之前一点点，好让照片在格子到来前就已落盘；若下一格近在眼前则
-        // 退化为尽快唤醒一次。栅格用尽时，它同时充当"跨天恢复"闹钟。
-        val refillAt = maxOf(now + 60_000L, recoveryTarget - REFILL_LEAD_MS)
+        // 下一格缺图时提前准备；图片齐全时在到点后补新的未来格。
+        // 近在眼前的缺图仍尽快重试；栅格用尽时同时负责跨天恢复。
+        // 已备好的下一格由原生闹钟直接上屏；到点后再补新的未来格。
+        // 在到点前反复 tick 只能得到相同四格，造成每分钟重复请求和重绘。
+        val refillAt = refillAt(now, recoveryTarget, slotPrepared(state, recoveryTarget))
         val refillComponent = refillComponent(context)
         val refillIds = widgets.firstOrNull { it.second == refillComponent }?.third ?: IntArray(0)
         val refill = PendingIntent.getBroadcast(
@@ -144,6 +148,18 @@ object BloomCarouselAlarms {
                 "recoveryTarget=$recoveryTarget refillAt=$refillAt widgets=${widgets.size}",
         )
     }
+
+    fun slotPrepared(state: JSONObject?, target: Long): Boolean {
+        val entry = BloomCarouselState.currentEntry(state, target) ?: return false
+        if (entry.optLong("date_ms", 0L) != target) return false
+        return listOf("original_path", "portrait_path", "square_path", "large_square_path").all { key ->
+            val path = entry.optString(key, "")
+            path.isNotEmpty() && path != "null" && File(path).let { it.isFile && it.length() > 0L }
+        }
+    }
+
+    fun refillAt(now: Long, target: Long, prepared: Boolean): Long =
+        maxOf(now + 60_000L, if (prepared) target + 60_000L else target - REFILL_LEAD_MS)
 
     /**
      * 取消本模块排出的全部闹钟。

@@ -129,6 +129,19 @@ void main() {
     expect(await sweepOrphanPhotos(dir: dir, alivePaths: []), 0);
     expect(await file.exists(), isTrue);
   });
+  test(
+    'abandoned preparation lock cannot retain orphan photos forever',
+    () async {
+      final file = await make('carousel-original-19.photo');
+      final lock = await make('photo-prepare-19.lock');
+      await lock.setLastModified(
+        DateTime.now().subtract(const Duration(minutes: 3)),
+      );
+      expect(await sweepOrphanPhotos(dir: dir, alivePaths: []), 1);
+      expect(await file.exists(), isFalse);
+      expect(await lock.exists(), isFalse);
+    },
+  );
   test('空目录不报错', () async {
     expect(await sweepOrphanPhotos(dir: dir, alivePaths: const []), 0);
   });

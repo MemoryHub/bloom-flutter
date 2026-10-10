@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// 与 Dart、安卓共用的查表规则。
 ///
@@ -50,10 +51,8 @@ enum BloomCarouselRule {
     }
 }
 
-/// 读取 Dart 单写者写下的权威状态 `carousel-state.json`。
-///
-/// 扩展**只读这张表，不做任何决策**：选哪一格、是否需要替补、下一格如何计算、
-/// 缓存如何淘汰，全部由 Dart 的 tick 引擎在写入这份状态时已经决定。
+/// App 与小组件共用的权威状态。补货入口可以来自 Flutter 或 WidgetKit，
+/// 但只能在同一批次锁和状态锁内提交；播放始终使用同一条 currentEntry 规则。
 enum BloomSharedState {
     /// 与 App、扩展两侧 entitlements 中的 App Group 必须一致。
     static let appGroup = "group.com.zhangbo.bloom.zb20260815"
@@ -79,6 +78,87 @@ enum BloomSharedState {
               let object = json as? [String: Any]
         else { return nil }
         return object
+    }
+
+    static func readJSON(_ url: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data)
+        else { return nil }
+        return object as? [String: Any]
+    }
+
+    static func writeJSON(_ object: [String: Any], to url: URL) throws {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
+        #if os(iOS)
+        try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        #else
+        try data.write(to: url, options: .atomic)
+        #endif
+    }
+
+    /// Pure merge used by native refill. No second current-item table: both
+    /// readers choose the latest ready entry whose server time has arrived.
+    static func merging(
+        _ state: [String: Any], plan: [String: Any], grid: [[String: Any]],
+        ready: [[String: Any]], nowMillis: Double, serverNext: Double?
+    ) -> [String: Any] {
+        let oldEntries = timelineEntries(state)
+        let oldDue = BloomCarouselRule.currentEntry(oldEntries, nowMillis: nowMillis)
+        let fallbackID = (oldDue?["item_id"] as? NSNumber)?.intValue
+            ?? (state["current_item_id"] as? NSNumber)?.intValue
+        let pointerID = (state["current_item_id"] as? NSNumber)?.intValue
+        let previousID = fallbackID != pointerID ? pointerID
+            : (state["previous_item_id"] as? NSNumber)?.intValue
+        let existingPhotos = (state["photos"] as? [[String: Any]]) ?? []
+        let readyIDs = Set(ready.compactMap { ($0["item_id"] as? NSNumber)?.intValue })
+        var entries = oldEntries.filter { entry in
+            guard let id = (entry["item_id"] as? NSNumber)?.intValue, !readyIDs.contains(id) else { return false }
+            if id == fallbackID || id == previousID { return true }
+            return grid.contains { slot in
+                (slot["item_id"] as? NSNumber)?.intValue == id &&
+                slot["asset_id"] as? String == (entry["asset_id"] as? String ?? existingPhotos.first { ($0["item_id"] as? NSNumber)?.intValue == id }?["asset_id"] as? String)
+            }
+        }
+        entries += ready
+        entries.sort { (($0["date_ms"] as? NSNumber)?.doubleValue ?? 0) < (($1["date_ms"] as? NSNumber)?.doubleValue ?? 0) }
+        let due = BloomCarouselRule.currentEntry(entries, nowMillis: nowMillis)
+        let id = (due?["item_id"] as? NSNumber)?.intValue ?? fallbackID
+        let previous = id != fallbackID ? fallbackID : previousID
+        let future = entries.filter { (($0["date_ms"] as? NSNumber)?.doubleValue ?? 0) > nowMillis }.prefix(4)
+        let keepIDs = Set(future.compactMap { ($0["item_id"] as? NSNumber)?.intValue } + [id, previous].compactMap { $0 })
+        entries = entries.filter { keepIDs.contains(($0["item_id"] as? NSNumber)?.intValue ?? 0) }
+        let photos: [[String: Any]] = entries.map { entry in
+            let entryID = (entry["item_id"] as? NSNumber)?.intValue ?? 0
+            let old = existingPhotos.first { ($0["item_id"] as? NSNumber)?.intValue == entryID }
+            return [
+                "item_id": entryID,
+                "asset_id": entry["asset_id"] ?? old?["asset_id"] ?? "",
+                "path": entry["portrait_path"] ?? entry["original_path"] ?? "",
+                "etag": old?["etag"] ?? NSNull(),
+                "fetched_at_ms": old?["fetched_at_ms"] ?? Int(nowMillis),
+            ]
+        }
+        let next = BloomCarouselRule.upcomingGridTimes(grid, nowMillis: nowMillis, limit: 1).first
+            ?? (serverNext.flatMap { $0 > nowMillis ? $0 : nil })
+        let currentSlot = grid.last { (($0["slot_at_ms"] as? NSNumber)?.doubleValue ?? 0) <= nowMillis }
+        let dueID = (currentSlot?["item_id"] as? NSNumber)?.intValue
+        var result = state
+        result["plan"] = plan
+        result["grid"] = grid
+        result["timeline_entries"] = entries
+        result["photos"] = photos
+        result["current_item_id"] = id ?? 0
+        result["current_photo_path"] = due?["portrait_path"] ?? state["current_photo_path"] ?? NSNull()
+        result["current_slot_at_ms"] = currentSlot?["slot_at_ms"] ?? state["current_slot_at_ms"] ?? NSNull()
+        result["previous_item_id"] = previous.map { $0 as Any } ?? NSNull()
+        result["previous_photo_path"] = photos.first { ($0["item_id"] as? NSNumber)?.intValue == previous }?["path"] ?? NSNull()
+        result["current_status"] = dueID == nil || dueID == id ? "ok" : "download_failed"
+        result["next_slot_at_ms"] = next.map { Int($0) as Any } ?? NSNull()
+        result["next_slot_source"] = "plan"
+        result["revision"] = ((state["revision"] as? NSNumber)?.intValue ?? 0) + 1
+        result["updated_at_ms"] = Int(nowMillis)
+        result["writer"] = "ios-widget-refill"
+        return result
     }
 
     static func timelineEntries(_ state: [String: Any]?) -> [[String: Any]] {
@@ -146,7 +226,65 @@ enum BloomSharedState {
             if let value = entry["location_text"] as? String {
                 item["locationText"] = value
             }
+            item["sourceName"] = entry["source_name"] ?? "personal"
+            item["artwork"] = entry["content_snapshot"] ?? [:]
+            item["photoMetadata"] = entry["photo_metadata"] ?? [:]
             return item
         }
     }
+}
+
+/// O_EXCL matches CarouselLock in Dart. No advisory flock: that would not
+/// exclude Dart's file-create lock. Holds only short publications/preparations.
+final class BloomSharedFileLock {
+    private let url: URL
+    private var held = false
+    private let owner = "\(getpid()):\(UUID().uuidString)"
+    private(set) var failureDescription = ""
+    init(_ url: URL) { self.url = url }
+    func acquire() -> Bool {
+        for attempt in 0..<2 {
+            let fd = open(url.path, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)
+            if fd >= 0 {
+                let bytes = Array(owner.utf8)
+                _ = bytes.withUnsafeBytes { write(fd, $0.baseAddress, bytes.count) }
+                close(fd)
+                try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: url.path)
+                held = true
+                return true
+            }
+            let openError = errno
+            var attributes = stat()
+            let present = lstat(url.path, &attributes) == 0
+            let age = present ? Date().timeIntervalSince1970 - Double(attributes.st_mtimespec.tv_sec) : 0
+            failureDescription = "errno=\(openError) age=\(Int(age))s"
+            let existingOwner = try? String(contentsOf: url, encoding: .utf8)
+            let ownerPID = existingOwner?.split(separator: ":").first.flatMap { Int32($0) }
+            let ownerExited = ownerPID.map { $0 > 0 && kill($0, 0) == -1 && errno == ESRCH } ?? false
+            if attempt == 0, openError == EEXIST, present, age > 90 || ownerExited {
+                // Read POSIX timestamps directly: URL resource metadata can be
+                // cached across extension suspension. An interrupted owner
+                // leaves no heartbeat, so the next pass can recover it.
+                // A killed Dart/native owner can be reclaimed immediately;
+                // an existing owner (including EPERM) must never be stolen.
+                guard unlink(url.path) == 0 || errno == ENOENT else {
+                    failureDescription += " unlink=\(errno)"; return false
+                }
+                continue
+            }
+            return false
+        }
+        return false
+    }
+    func isHeld() -> Bool {
+        held && (try? String(contentsOf: url, encoding: .utf8)) == owner
+    }
+
+    func release() {
+        if held, (try? String(contentsOf: url, encoding: .utf8)) == owner {
+            try? FileManager.default.removeItem(at: url)
+        }
+        held = false
+    }
+    deinit { release() }
 }

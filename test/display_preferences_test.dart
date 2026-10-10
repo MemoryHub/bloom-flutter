@@ -44,7 +44,7 @@ void main() {
   };
 
   test(
-    'art recommendation uses the scheduled widget pipeline without changing the ranking mode',
+    'recommendation shares the scheduled widget pipeline for art and personal photos',
     () async {
       SharedPreferences.setMockInitialValues({});
       final preferences = DisplayPreferences();
@@ -63,7 +63,7 @@ void main() {
       await preferences.cacheLocal(
         art.copyWith(sources: [BloomPhotoSource.personal]),
       );
-      expect(prefs.getBool('bloom.scheduled_plan'), isFalse);
+      expect(prefs.getBool('bloom.scheduled_plan'), isTrue);
       expect(
         (await preferences.readLocal()).mode,
         BloomDisplayMode.recommendation,

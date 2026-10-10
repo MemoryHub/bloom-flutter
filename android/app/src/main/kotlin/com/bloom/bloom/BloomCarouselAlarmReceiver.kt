@@ -54,11 +54,11 @@ class BloomCarouselAlarmReceiver : BroadcastReceiver() {
             if (ids.isNotEmpty()) {
                 when (provider) {
                     BloomPortraitWidgetProvider::class.java ->
-                        BloomPortraitWidgetProvider().onUpdate(context, manager, ids)
+                        BloomPortraitWidgetProvider().updateContent(context, manager, ids)
                     BloomSquareWidgetProvider::class.java ->
-                        BloomSquareWidgetProvider().onUpdate(context, manager, ids)
+                        BloomSquareWidgetProvider().updateContent(context, manager, ids)
                     BloomLargeSquareWidgetProvider::class.java ->
-                        BloomLargeSquareWidgetProvider().onUpdate(context, manager, ids)
+                        BloomLargeSquareWidgetProvider().updateContent(context, manager, ids)
                 }
             }
         }

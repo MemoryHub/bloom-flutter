@@ -21,6 +21,7 @@ class KeepAliveApplicabilityTest {
     private val exact = BloomKeepAlive.ID_EXACT_ALARM
     private val battery = BloomKeepAlive.ID_BATTERY
     private val autostart = BloomKeepAlive.ID_AUTOSTART
+    private val vendorBattery = BloomKeepAlive.ID_VENDOR_BATTERY
 
     @Test
     fun `小米5 Android 8 没有精确闹钟项 因为那个权限 Android 12 才有`() {
@@ -32,12 +33,12 @@ class KeepAliveApplicabilityTest {
             manufacturer = "Xiaomi",
             brand = "Xiaomi",
         )
-        assertEquals(listOf(battery, autostart), ids)
+        assertEquals(listOf(battery, autostart, vendorBattery), ids)
         assertFalse("Android 8 不该出现精确闹钟项", ids.contains(exact))
     }
 
     @Test
-    fun `小米14 Android 14 三项都要 精确闹钟是最容易漏的一项`() {
+    fun `小米14 系统电池豁免不能代替厂商后台无限制`() {
         // targetSdk 35 的包在 Android 14 上 canScheduleExactAlarms() 默认 false，
         // 闹钟会静默退化成非精确。这一项必须出现。
         val ids = BloomKeepAlive.applicableIds(
@@ -45,7 +46,7 @@ class KeepAliveApplicabilityTest {
             manufacturer = "Xiaomi",
             brand = "xiaomi",
         )
-        assertEquals(listOf(exact, battery, autostart), ids)
+        assertEquals(listOf(exact, battery, autostart, vendorBattery), ids)
     }
 
     @Test
@@ -58,6 +59,7 @@ class KeepAliveApplicabilityTest {
         // 换牌子不该出现小米的设置页——那会是一个点了没反应的按钮。
         assertEquals(listOf(exact, battery), ids)
         assertFalse(ids.contains(autostart))
+        assertFalse(ids.contains(vendorBattery))
     }
 
     @Test
@@ -94,11 +96,12 @@ class KeepAliveApplicabilityTest {
     }
 
     @Test
-    fun `每一项的 id 都稳定 界面靠它派发跳转`() {
+    fun `系统电池优化与厂商冻结使用独立的确认状态`() {
         // 这三个字符串同时是 MethodChannel 的 openKeepAlive 参数值，
         // 改了就会让界面上的按钮跳错页面。
         assertEquals("exact_alarm", exact)
         assertEquals("battery_whitelist", battery)
         assertEquals("autostart", autostart)
+        assertEquals("vendor_battery", vendorBattery)
     }
 }

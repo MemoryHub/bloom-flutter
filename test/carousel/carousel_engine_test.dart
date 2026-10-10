@@ -78,12 +78,17 @@ class _FakePhotoStore extends CarouselPhotoStore {
   final List<int?> nextSlotSeenDuringPrepare = [];
 
   @override
+  Future<bool> isReadyFor(Directory dir, CarouselItemContent item) =>
+      CarouselPhotoStore.isReady(dir, item.itemId);
+
+  @override
   Future<PhotoFetchResult> prepare({
     required Directory dir,
     required CarouselItemContent item,
     required DeviceCredentials credentials,
     int attempts = 2,
     String? etag,
+    Future<bool> Function()? canPrepare,
   }) async {
     if (failFor.contains(item.itemId) || failAssets.contains(item.assetId)) {
       return const PhotoFetchResult(

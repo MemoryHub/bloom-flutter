@@ -542,6 +542,8 @@ class UserDevice {
     this.name,
     required this.deviceType,
     required this.enabled,
+    this.playbackPaused = false,
+    this.relationship = 'owner',
     this.lastSeenAt,
     this.boundAt,
     this.boundUserCount = 1,
@@ -557,6 +559,11 @@ class UserDevice {
   /// 服务端侧是否启用。注意这与用户的"小组件开关"不是一回事：
   /// 那个开关只控制本机是否联网，服务器并不知情。
   final bool enabled;
+
+  /// 明确退出本机登录；设备归属与作息继续保留。
+  final bool playbackPaused;
+  final String relationship;
+  bool get canManage => relationship == 'owner';
 
   final DateTime? lastSeenAt;
   final DateTime? boundAt;
@@ -575,6 +582,8 @@ class UserDevice {
       name: json['name'] as String?,
       deviceType: (json['device_type'] as String?) ?? 'eink',
       enabled: json['enabled'] as bool? ?? true,
+      playbackPaused: json['playback_paused'] as bool? ?? false,
+      relationship: json['relationship'] as String? ?? 'owner',
       lastSeenAt: _parseDateTime(json['last_seen_at']),
       boundAt: _parseDateTime(json['bound_at']),
       boundUserCount: (json['bound_user_count'] as num?)?.toInt() ?? 1,

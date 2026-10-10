@@ -13,6 +13,8 @@ library;
 
 import 'dart:io';
 
+import 'state_store.dart';
+
 /// 本项目在缓存目录里拥有的两种照片命名。
 ///
 /// 用**精确到带条目 id 的正则**，而不是宽松的前缀匹配：`mobile-local-{orientation}.png`
@@ -20,7 +22,7 @@ import 'dart:io';
 /// iOS 扩展自己管理的 `ios-widget-remote-*.jpg`、`widget-timeline.log`，以及各种
 /// `.json` 也都不在范围内。
 final RegExp _originalFile = RegExp(r'^carousel-original-\d+\.photo$');
-final RegExp _markerFile = RegExp(r'^mobile-render-\d+\.json$');
+final RegExp _markerFile = RegExp(r'^mobile-(?:render|original)-\d+\.json$');
 final RegExp _renderedFile = RegExp(r'^mobile-local-[A-Za-z]+-\d+\.png$');
 
 bool isOwnedPhotoFile(String name) =>
@@ -57,19 +59,22 @@ Future<int> sweepOrphanPhotos({
     final id = RegExp(
       r'-(\d+)\.(?:photo|png|json)$',
     ).firstMatch(entity.path)?.group(1);
-    if (id != null &&
-        await File('${dir.path}/photo-prepare-$id.lock').exists()) {
-      continue;
-    }
     if (alive.contains(entity.path)) continue;
     try {
       if (alive.contains(await entity.resolveSymbolicLinks())) continue;
     } catch (_) {}
+    // Claim the same preparation lease, including its existing stale-owner
+    // recovery. An abandoned lock must not protect orphaned bytes forever.
+    final lock =
+        id == null ? null : CarouselLock('${dir.path}/photo-prepare-$id.lock');
+    if (lock != null && !await lock.acquire()) continue;
     try {
       await entity.delete();
       swept++;
     } catch (_) {
       // 被占用或已消失都无所谓，下一轮再来。
+    } finally {
+      await lock?.release();
     }
   }
   return swept;

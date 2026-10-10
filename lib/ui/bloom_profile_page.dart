@@ -127,13 +127,13 @@ class BloomProfilePage extends StatelessWidget {
         if (account.isProvisioning) ...[
           const SizedBox(height: 16),
           Text(
-            '正在准备你的相册，稍后就能看到照片了。',
+            '正在准备你的图库，稍后就能看到照片了。',
             style: BloomType.meta,
           ),
         ] else if (account.provisionFailed) ...[
           const SizedBox(height: 16),
           Text(
-            '相册准备失败，请联系我们。',
+            '图库准备失败，请联系我们。',
             style: BloomType.meta.copyWith(color: BloomInk.accent),
           ),
         ],

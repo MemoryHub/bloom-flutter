@@ -12,6 +12,7 @@ import 'package:bloom/ui/bloom_auth_pages.dart';
 import 'package:bloom/ui/bloom_device_pages.dart';
 import 'package:bloom/ui/bloom_glass_home.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -38,15 +39,21 @@ void main() {
   // 首页的卡片是 `Image.file`，路径必须真实存在，否则会退化成占位图，
   // "看到内容"的断言就失去意义了。
   late final String photoPath;
+  late final Directory photoDirectory;
   setUpAll(() {
-    final dir = Directory.systemTemp.createTempSync('bloom-login-gate-test');
-    final file = File('${dir.path}/photo.png');
+    photoDirectory = Directory.systemTemp.createTempSync(
+      'bloom-login-gate-test',
+    );
+    final file = File('${photoDirectory.path}/photo.png');
     file.writeAsBytesSync(
       base64Decode(
         'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
       ),
     );
     photoPath = file.path;
+  });
+  tearDownAll(() {
+    if (photoDirectory.existsSync()) photoDirectory.deleteSync(recursive: true);
   });
 
   /// 玻璃动画不会真正 settle，按帧推完即可。
@@ -113,7 +120,7 @@ void main() {
   group('未登录', () {
     for (final entry in const [
       (tab: 0, label: '首页', key: 'bloom-home-signed-out'),
-      (tab: 1, label: '照片', key: 'bloom-photos-signed-out'),
+      (tab: 2, label: '照片', key: 'bloom-photos-signed-out'),
       (tab: 3, label: '设备', key: 'bloom-devices-signed-out'),
       (tab: 4, label: '我的', key: 'bloom-profile-signed-out'),
     ]) {
@@ -169,10 +176,10 @@ void main() {
     });
 
     testWidgets('照片页保留原来的插画与文案，只是多了一个登录按钮', (tester) async {
-      await pump(tester, account: null, tab: 1);
+      await pump(tester, account: null, tab: 2);
       // 用户明确要求"中间是个图标、下面字不变"：这两句不能被提示语替换掉。
-      expect(find.text('照片库即将上线'), findsOneWidget);
-      expect(find.text('以后可以在这里回看每天推荐过的照片。'), findsOneWidget);
+      expect(find.text('登录后查看你的照片'), findsOneWidget);
+      expect(find.text('在这里回看照片，把回忆带到你的设备上。'), findsOneWidget);
       expect(find.widgetWithText(BloomPrimaryButton, '登录'), findsOneWidget);
     });
 
@@ -210,7 +217,7 @@ void main() {
 
     testWidgets('「我的」页未就绪时说明正在准备相册', (tester) async {
       await pump(tester, account: fakeProvisioningAccount(), tab: 4);
-      expect(find.textContaining('正在准备你的相册'), findsOneWidget);
+      expect(find.textContaining('正在准备你的图库'), findsOneWidget);
     });
 
     testWidgets('首页显示内容而不是登录提示', (tester) async {
@@ -219,9 +226,9 @@ void main() {
       expect(find.text('首页'), findsWidgets);
     });
 
-    testWidgets('照片页仍是即将上线（登录后也一样，上传还没做）', (tester) async {
-      await pump(tester, account: fakeAccount(), tab: 1);
-      expect(find.text('照片库即将上线'), findsOneWidget);
+    testWidgets('未注入照片库页面时外壳显示默认占位', (tester) async {
+      await pump(tester, account: fakeAccount(), tab: 2);
+      expect(find.text('这里还没有照片'), findsOneWidget);
       expect(
         find.byKey(const ValueKey('bloom-photos-signed-out')),
         findsNothing,
@@ -257,6 +264,129 @@ void main() {
     expect(find.text('Alex'), findsOneWidget);
   });
 
+  testWidgets('新账号等待图库就绪再认领，空图库明确引导且导航始终可用', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    const channel = MethodChannel('com.bloom/widget');
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (_) async => null);
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null),
+    );
+    const headers = {'content-type': 'application/json; charset=utf-8'};
+    var ready = false;
+    var claimed = false;
+    var claimAttempts = 0;
+    final requests = <String>[];
+    Map<String, dynamic> account() => {
+      'id': 'new-account',
+      'phone': '+8613800138000',
+      'provision_status': ready ? 'ready' : 'pending',
+      'immich_ready': ready,
+    };
+    final secure = <String, String>{};
+    final client = MockClient((request) async {
+      final path = request.url.path;
+      requests.add(path);
+      if (path.endsWith('/account')) {
+        return http.Response(
+          jsonEncode({'account': account()}),
+          200,
+          headers: headers,
+        );
+      }
+      if (path.endsWith('/photos/days')) {
+        expect(ready, isTrue, reason: '照片页也必须等待图库就绪');
+        return http.Response(jsonEncode({'days': []}), 200, headers: headers);
+      }
+      if (path.endsWith('/devices/claim')) {
+        expect(ready, isTrue, reason: '未完成图库准备不得认领');
+        if (++claimAttempts == 1) {
+          return http.Response(
+            jsonEncode({'code': 'account_not_provisioned'}),
+            409,
+            headers: headers,
+          );
+        }
+        claimed = true;
+        return http.Response(
+          jsonEncode({
+            'device_id': 'bloom-mobile-new',
+            'device_token': 'd' * 64,
+          }),
+          200,
+          headers: headers,
+        );
+      }
+      if (path.contains('/devices/bloom-mobile-new/')) {
+        expect(ready && claimed, isTrue, reason: '设备内容请求必须晚于图库就绪和令牌下发');
+        expect(request.headers['X-Frame-Token'], 'd' * 64);
+        if (path.endsWith('/status')) {
+          return http.Response(
+            jsonEncode({
+              'paired': true,
+              'has_assets': false,
+              'mode': 'recommend',
+            }),
+            200,
+            headers: headers,
+          );
+        }
+      }
+      return http.Response('{}', 404, headers: headers);
+    });
+    final api = BloomApiClient(client: client);
+    final auth = AuthRepository(
+      api: api,
+      readValue:
+          (key) async =>
+              key == AuthRepository.tokenKey
+                  ? 'new-session'
+                  : jsonEncode(account()),
+      writeValue: (_, _) async {},
+      deleteValue: (_) async {},
+    );
+    final identity = DeviceIdentityRepository(
+      readToken: (key) async => secure[key],
+      writeToken: (key, value) async => secure[key] = value,
+      mirrorToWidget: (_, _) async {},
+      stableCredentials:
+          () async => {'deviceId': 'bloom-mobile-new', 'deviceToken': 'a' * 64},
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: BloomHomePage(
+          api: api,
+          auth: auth,
+          identity: identity,
+          displayPreferences: DisplayPreferences(api: api),
+        ),
+      ),
+    );
+    await settle(tester);
+    expect(find.text('正在准备你的图库'), findsOneWidget);
+    expect(find.byType(LiquidGlassBottomNavBar), findsOneWidget);
+    expect(requests.where((p) => p.contains('/devices/')), isEmpty);
+    expect(requests.where((p) => p.endsWith('/photos/days')), isEmpty);
+    ready = true;
+    for (var i = 0; i < 100; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    expect(claimed, isTrue);
+    expect(requests.any((p) => p.endsWith('/status')), isTrue);
+    expect(find.text('还没有可展示的照片'), findsOneWidget);
+    expect(find.byKey(const ValueKey('bloom-next-slot')), findsNothing);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
+    await tester.tap(find.widgetWithText(BloomPrimaryButton, '去上传照片'));
+    await settle(tester);
+    expect(
+      tester.widget<BloomGlassHome>(find.byType(BloomGlassHome)).selectedTab,
+      2,
+    );
+    expect(find.text('这里还没有照片'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   /// **登录成功之后必须自己去取一次图。**
   ///
   /// 这条守的是一个真实发生过的故障：`_load()` 改成"未登录就什么都不做"之后，
@@ -268,8 +398,20 @@ void main() {
   /// 而这里漏掉的是**取数**。渲染全对、就是不联网，界面上看不出区别。
   testWidgets('登录成功后会自动请求本机状态（不会停在空态）', (tester) async {
     SharedPreferences.setMockInitialValues({});
+    const channel = MethodChannel('com.bloom/widget');
+    final nativeCalls = <String>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+          nativeCalls.add(call.method);
+          return null;
+        });
+    addTearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null);
+    });
     final requests = <String>[];
     final secure = <String, String>{};
+    var secondDeviceJoined = false;
 
     // ⚠️ 必须带 charset：`http.Response(body, 200)` 默认按 latin-1 编码，
     //    body 里只要有中文就抛 ArgumentError（看起来像"网络异常"）。
@@ -278,6 +420,27 @@ void main() {
     Future<http.Response> handler(http.Request request) async {
       final path = request.url.path;
       requests.add('${request.method} $path');
+      if (path.endsWith('/users/me/devices')) {
+        return http.Response(
+          jsonEncode({
+            'devices': [
+              {
+                'device_id': 'bloom-mobile-test',
+                'device_type': 'mobile',
+                'name': '本机',
+              },
+              if (secondDeviceJoined)
+                {
+                  'device_id': 'bloom-second-phone',
+                  'device_type': 'mobile',
+                  'name': '第二台手机',
+                },
+            ],
+          }),
+          200,
+          headers: jsonHeaders,
+        );
+      }
       if (path.endsWith('/auth/login')) {
         return http.Response(
           jsonEncode({
@@ -319,6 +482,11 @@ void main() {
       readToken: (key) async => secure[key],
       writeToken: (key, value) async => secure[key] = value,
       mirrorToWidget: (_, _) async {},
+      stableCredentials:
+          () async => {
+            'deviceId': 'bloom-mobile-test',
+            'deviceToken': 'a' * 64,
+          },
     );
     final api = BloomApiClient(
       baseUrl: 'https://bloom.jihu.top',
@@ -374,6 +542,36 @@ void main() {
           '实际发出的请求：$requests；'
           '登录页还在吗：${find.byType(BloomAuthPage).evaluate().isNotEmpty}；'
           '屏幕上的文字：${find.byType(Text).evaluate().map((e) => (e.widget as Text).data).where((t) => t != null).toList()}',
+    );
+    // 另一手机晚加入同一账号；进入设备页必须重取列表。
+    secondDeviceJoined = true;
+    final nav = find.byType(LiquidGlassBottomNavBar);
+    await tester.tap(
+      find.descendant(of: nav, matching: find.text('设备')).first,
+      warnIfMissed: false,
+    );
+    await settle(tester);
+    expect(find.text('第二台手机'), findsOneWidget);
+    // 退出必须真正复位原生时间线，不能只删 Dart 登录令牌。
+    final resetsBefore =
+        nativeCalls.where((m) => m == 'resetAccountContent').length;
+    await tester.tap(
+      find.descendant(of: nav, matching: find.text('我的')).first,
+      warnIfMissed: false,
+    );
+    await settle(tester);
+    await tester.tap(find.text('退出登录'));
+    await settle(tester);
+    expect(auth.isSignedIn, isTrue);
+    await tester.tap(find.widgetWithText(BloomPrimaryButton, '退出登录').last);
+    for (var i = 0; i < 20; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    expect(auth.isSignedIn, isFalse);
+    expect(await identity.read(), isNull);
+    expect(
+      nativeCalls.where((m) => m == 'resetAccountContent').length,
+      greaterThan(resetsBefore),
     );
   });
 }

@@ -61,5 +61,9 @@
 	<array>
 		<string>fetch</string>
 	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>扫描设备二维码，向家人的小组件提供照片</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>选择你希望上传到个人图库的照片</string>
 </dict>
 </plist>

@@ -92,6 +92,41 @@ class CarouselPhotoStore {
   static File renderedFile(Directory dir, String family, int itemId) =>
       File('${dir.path}/mobile-local-$family-$itemId.png');
 
+  static String _renderSignature(CarouselItemContent item) => jsonEncode({
+    'asset': item.assetId,
+    'layout': MobileArtworkRenderer.template,
+    'source': item.sourceName,
+    'photo': [item.photo.focusX, item.photo.focusY],
+    'artwork': item.artwork,
+    'caption': [item.captionZh, item.captionEn],
+    'captured': item.capturedDateText,
+    'location': item.locationText,
+  });
+
+  Future<bool> isReadyFor(Directory dir, CarouselItemContent item) async {
+    try {
+      final identity =
+          jsonDecode(
+                await File(
+                  '${dir.path}/mobile-original-${item.itemId}.json',
+                ).readAsString(),
+              )
+              as Map;
+      if (identity['asset'] != item.assetId ||
+          identity['source'] != item.sourceName) {
+        return false;
+      }
+      final signature =
+          await File(
+            '${dir.path}/mobile-render-${item.itemId}.json',
+          ).readAsString();
+      return signature == _renderSignature(item) &&
+          await isReady(dir, item.itemId);
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// 该 [itemId] 的四张本地文件是否齐全。
   static Future<bool> isReady(Directory dir, int itemId) async {
     if (!await originalFile(dir, itemId).exists()) return false;
@@ -111,7 +146,9 @@ class CarouselPhotoStore {
     required DeviceCredentials credentials,
     int attempts = 2,
     String? etag,
+    Future<bool> Function()? canPrepare,
   }) async {
+    final allowed = canPrepare;
     final lock = CarouselLock('${dir.path}/photo-prepare-${item.itemId}.lock');
     final deadline = DateTime.now().add(const Duration(seconds: 60));
     while (!await lock.acquire()) {
@@ -124,12 +161,19 @@ class CarouselPhotoStore {
       await Future<void>.delayed(const Duration(milliseconds: 150));
     }
     try {
+      if (allowed != null && !await allowed()) {
+        return const PhotoFetchResult(
+          outcome: PhotoFetchOutcome.unavailable,
+          reason: 'content_sync_superseded',
+        );
+      }
       return await _prepareUnlocked(
         dir: dir,
         item: item,
         credentials: credentials,
         attempts: attempts,
         etag: etag,
+        allowed: allowed,
       );
     } finally {
       await lock.release();
@@ -142,19 +186,25 @@ class CarouselPhotoStore {
     required DeviceCredentials credentials,
     int attempts = 2,
     String? etag,
+    Future<bool> Function()? allowed,
   }) async {
     final itemId = item.itemId;
     final startedMs = DateTime.now().millisecondsSinceEpoch;
     try {
       final marker = File('${dir.path}/mobile-render-$itemId.json');
-      final signature = jsonEncode({
+      // Render metadata describes the label, not the downloaded image. Older
+      // clients could stamp a new asset onto an old original with the same item
+      // ID. Only a marker written immediately after a download proves identity.
+      final originalMarker = File('${dir.path}/mobile-original-$itemId.json');
+      final originalIdentity = jsonEncode({
         'asset': item.assetId,
-        'layout': MobileArtworkRenderer.template,
         'source': item.sourceName,
-        'photo': [item.photo.focusX, item.photo.focusY],
-        'artwork': item.artwork,
       });
-      if (await originalFile(dir, itemId).exists()) {
+      final originalMatches =
+          await originalMarker.exists() &&
+          await originalMarker.readAsString() == originalIdentity;
+      final signature = _renderSignature(item);
+      if (originalMatches && await originalFile(dir, itemId).exists()) {
         final fresh =
             await marker.exists() && await marker.readAsString() == signature;
         await _renderAll(
@@ -171,15 +221,29 @@ class CarouselPhotoStore {
       }
 
       var lastReason = 'unknown';
+      await _writeAtomic(originalMarker, utf8.encode('{}'));
       for (var attempt = 0; attempt < attempts; attempt++) {
         try {
+          if (allowed != null && !await allowed()) {
+            return const PhotoFetchResult(
+              outcome: PhotoFetchOutcome.unavailable,
+              reason: 'content_sync_superseded',
+            );
+          }
           final downloadStartedMs = DateTime.now().millisecondsSinceEpoch;
           final bytes = await _download(
             credentials: credentials,
             itemId: itemId,
-            etag: etag,
+            etag: originalMatches ? etag : null,
             destination: originalFile(dir, itemId),
           );
+          if (allowed != null && !await allowed()) {
+            return const PhotoFetchResult(
+              outcome: PhotoFetchOutcome.unavailable,
+              reason: 'content_sync_superseded',
+            );
+          }
+          await _writeAtomic(originalMarker, utf8.encode(originalIdentity));
           final downloadMs =
               DateTime.now().millisecondsSinceEpoch - downloadStartedMs;
 

@@ -5,6 +5,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../api/bloom_api_client.dart';
 import '../models/device_models.dart';
+import '../../platform/widget_bridge.dart';
+import 'content_sync_epoch.dart';
 
 enum BloomDisplayMode { recommendation, carousel }
 
@@ -221,11 +223,12 @@ class BloomDisplaySettings {
   final Map<String, double> sourceWeights;
   final List<BloomPhotoSource> sources;
 
-  /// Art follows the same schedule in both ranking modes. Native widgets read
-  /// the prepared plan; recommendation remains a server selection strategy.
-  bool get usesScheduledPlan =>
-      mode == BloomDisplayMode.carousel ||
-      sources.contains(BloomPhotoSource.art);
+  /// Both modes share the prepared timeline. Recommendation changes ranking
+  /// and cadence, including personal-only libraries; it never runs a separate
+  /// once-a-day downloader beside the two-photo schedule.
+  bool get usesScheduledPlan => switch (mode) {
+    BloomDisplayMode.carousel || BloomDisplayMode.recommendation => true,
+  };
   final String activeStart;
   final String activeEnd;
 
@@ -676,6 +679,12 @@ class DisplayPreferences {
   /// page guards this with `settingsTarget == 'mobile'`; there is no server
   /// target other than `mobile` that owns these keys.
   Future<void> cacheLocal(BloomDisplaySettings settings) async {
+    if (Platform.isAndroid || Platform.isIOS) {
+      final path = await WidgetBridge().cacheDirectory();
+      if (path != null) {
+        await ContentSyncEpoch.activate(Directory(path), settings);
+      }
+    }
     if (Platform.isIOS) {
       await BloomWidgetBridgePlatform.writeDisplayPreferences(
         mode:

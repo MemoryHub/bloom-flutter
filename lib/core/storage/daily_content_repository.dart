@@ -5,12 +5,13 @@ import 'package:flutter/foundation.dart';
 import '../api/bloom_api_client.dart';
 import '../models/device_models.dart';
 import '../../platform/widget_bridge.dart';
-import '../rendering/mobile_letter_renderer.dart';
 import 'display_preferences.dart';
+import 'content_sync_epoch.dart';
 import '../carousel/carousel_engine.dart';
 import '../carousel/carousel_rules.dart';
 import '../carousel/photo_gc.dart';
 import '../carousel/state_store.dart';
+import '../carousel/carousel_state.dart';
 import '../carousel/photo_store.dart';
 
 class DailyContentRepository {
@@ -38,145 +39,8 @@ class DailyContentRepository {
     return dir;
   }
 
-  Future<DailyContent> sync(DeviceCredentials credentials) async {
-    try {
-      await WidgetBridge().clearCarouselSchedule();
-    } catch (_) {}
-    final manifest = await api.daily(credentials, target: 'mobile');
-    final dir = await _dir();
-    final metadataFile = File('${dir.path}/daily.json');
-
-    String? previousEtag;
-    if (await metadataFile.exists()) {
-      try {
-        previousEtag =
-            (jsonDecode(await metadataFile.readAsString())
-                    as Map<String, dynamic>)['photo_etag']
-                as String?;
-      } catch (_) {}
-    }
-
-    // ⭐ 这一版推荐的三张图都已经在本地了，就【不要再下载原图、再渲染一次】。
-    //
-    // sync() 原来每次都会：拉 /daily -> 下载原图（可能好几 MB）-> 在手机上把
-    // 它渲染成 portrait / square / largeSquare 三种尺寸。这三步是纯本机 CPU 活，
-    // 一次要几十秒到几分钟。
-    //
-    // 而设置保存之后也要重跑一次 sync（好让首页文案与小组件跟上），于是
-    // "切一下模式"就变成一次全量重下重渲染 —— 用户看到的就是等好几分钟。
-    // 版本号是图片的一部分，所以版本没变就没有任何东西需要重做。
-    final alreadyRendered = <String>['portrait', 'square', 'largeSquare'].every(
-      (family) =>
-          _versionedImage(dir, family, manifest.recommendationId).existsSync(),
-    );
-    if (alreadyRendered &&
-        await File(
-          '${dir.path}/carousel-original-${manifest.recommendationId}.photo',
-        ).exists()) {
-      // 元数据仍然补写一次：它很便宜，而且能修好"图在但 daily.json 丢了"的状态。
-      await metadataFile.writeAsString(
-        jsonEncode({
-          // ⚠️ photo_etag 必须一起写。漏掉它，下一次 sync 就没有 ETag 可用，
-          //    只能无条件重下原图 —— 正好抵消掉这个跳过分支省下来的时间。
-          'photo_etag': previousEtag,
-          'date': manifest.date,
-          'recommendation_id': manifest.recommendationId,
-          'caption_zh': manifest.captionZh,
-          'caption_en': manifest.captionEn,
-          'captured_date_text': manifest.capturedDateText,
-          'location_text': manifest.locationText,
-          'photo_orientation': manifest.photoOrientation,
-          'source_name': manifest.sourceName,
-          'content_snapshot': manifest.artwork,
-          'photo_metadata': {
-            'url': manifest.photo?.url ?? '',
-            'focus_x': manifest.photo?.focusX,
-            'focus_y': manifest.photo?.focusY,
-          },
-        }),
-        flush: true,
-      );
-      // ⭐ 和轮播引擎 tick 之后一样，必须通知原生小组件重载。
-      //    少了这一句，App 里的文案已经换成新的、桌面小组件却还是上一张，
-      //    App 的照片又取自小组件状态 —— 于是"文案新、照片旧"。
-      try {
-        await WidgetBridge().refresh();
-      } catch (_) {}
-      return manifest;
-    }
-    var response = await api.originalPhoto(credentials, etag: previousEtag);
-    final photoFile = File('${dir.path}/original.photo');
-    if (response.statusCode == 304 && !await photoFile.exists()) {
-      response = await api.originalPhoto(credentials);
-    }
-    if (response.statusCode == 200) {
-      final temp = File('${photoFile.path}.tmp');
-      await temp.writeAsBytes(response.bodyBytes, flush: true);
-      await temp.rename(photoFile.path);
-    }
-    if (!await photoFile.exists()) throw StateError('原图下载失败');
-    final photoBytes = await photoFile.readAsBytes();
-    final immutable = File(
-      '${dir.path}/carousel-original-${manifest.recommendationId}.photo',
-    );
-    final immutableTemp = File('${immutable.path}.tmp');
-    await immutableTemp.writeAsBytes(photoBytes, flush: true);
-    await immutableTemp.rename(immutable.path);
-    for (final family in ['portrait', 'square', 'largeSquare']) {
-      final output = _versionedImage(dir, family, manifest.recommendationId);
-      final rendered = await MobileLetterRenderer.render(
-        photoBytes,
-        manifest,
-        family,
-      );
-      final temp = File('${output.path}.tmp');
-      await temp.writeAsBytes(rendered, flush: true);
-      await temp.rename(output.path);
-      await _pruneVersionedImages(dir, family, keeping: {output.path});
-    }
-    final originals =
-        await dir
-            .list()
-            .where(
-              (e) =>
-                  e is File &&
-                  RegExp(r'carousel-original-\d+\.photo$').hasMatch(e.path),
-            )
-            .cast<File>()
-            .toList();
-    originals.sort(
-      (a, b) => b.statSync().modified.compareTo(a.statSync().modified),
-    );
-    for (final obsolete in originals.skip(9)) {
-      if (obsolete.path != immutable.path) await obsolete.delete();
-    }
-    await metadataFile.writeAsString(
-      jsonEncode({
-        'photo_etag': response.headers['etag'],
-        'date': manifest.date,
-        'recommendation_id': manifest.recommendationId,
-        'caption_zh': manifest.captionZh,
-        'caption_en': manifest.captionEn,
-        'captured_date_text': manifest.capturedDateText,
-        'location_text': manifest.locationText,
-        'photo_orientation': manifest.photoOrientation,
-        'source_name': manifest.sourceName,
-        'content_snapshot': manifest.artwork,
-        'photo_metadata': {
-          'url': manifest.photo?.url ?? '',
-          'focus_x': manifest.photo?.focusX,
-          'focus_y': manifest.photo?.focusY,
-        },
-      }),
-      flush: true,
-    );
-    // ⭐ 同上：推荐这条路原来【从不通知小组件重载】（轮播引擎每次都通知），
-    //    所以推荐模式下桌面小组件会一直停在旧图上。
-    try {
-      await WidgetBridge().refresh();
-    } catch (_) {}
-    return manifest;
-  }
+  File _dailyVersionedImage(Directory dir, String family, int id) =>
+      File('${dir.path}/mobile-daily-$family-$id.png');
 
   /// 轮播同步：全部交给 [CarouselEngine]。
   ///
@@ -199,55 +63,79 @@ class DailyContentRepository {
     bool next = false,
     bool foreground = false,
   }) async {
-    if (next) {
-      await _advanceCarouselOnServer(credentials, settings);
+    final dir = await _dir();
+    final capturedEpoch = await ContentSyncEpoch.capture(dir);
+    final lease = await CarouselSyncLease.acquire(dir);
+    if (lease == null) {
+      final current = await nativeContent(expectedMode: 'carousel');
+      if (current != null) return current;
+      throw StateError('carousel refill is busy');
     }
-    // 顺手清掉上一轮留下的半成品文件。引擎的所有写入都是「临时文件 + rename」，
-    // 上一次运行被系统杀掉时可能留下 .tmp，这里按年龄兜底清理。
+    final epoch = ContentSyncEpoch(dir, capturedEpoch.token, lease: lease);
+    var handedToPrefetch = false;
     try {
-      await _sweepTempFiles(await _dir());
-    } catch (_) {}
-    final engine = CarouselEngine(api: api);
-    final writer = foreground ? 'app-foreground' : 'app-background';
-    final outcome = await engine.tickCurrent(
-      credentials: credentials,
-      settings: settings,
-      writer: writer,
-    );
-    debugPrint('[BloomSync] $outcome');
-
-    // 预取与「清理无主照片」必须绑在一起、且都在当前格提交之后：
-    // 清理删的是「权威状态里不存在的照片文件」，而预取正在下载的那些文件在它
-    // 提交之前恰好不在状态里 —— 两者并行会把刚下好的图删掉，时间线上留下一个洞。
-    Future<void> rest() async {
-      final plan = outcome.plan;
-      if (plan != null) {
-        await engine.prefetchAhead(
-          credentials: credentials,
-          settings: settings,
-          writer: writer,
-          plan: plan,
-        );
+      if (next) {
+        await _advanceCarouselOnServer(credentials, settings);
       }
+      // 顺手清掉上一轮留下的半成品文件。引擎的所有写入都是「临时文件 + rename」，
+      // 上一次运行被系统杀掉时可能留下 .tmp，这里按年龄兜底清理。
       try {
-        await _sweepOrphanPhotos(await _dir(), settings);
-      } catch (error) {
-        debugPrint('[BloomSync] orphan sweep failed: $error');
+        await _sweepTempFiles(await _dir());
+      } catch (_) {}
+      if (!await epoch.isCurrent()) throw StateError('content sync superseded');
+      final engine = CarouselEngine(api: api);
+      final writer = foreground ? 'app-foreground' : 'app-background';
+      final outcome = await engine.tickCurrent(
+        credentials: credentials,
+        settings: settings,
+        writer: writer,
+        syncEpoch: epoch,
+      );
+      debugPrint('[BloomSync] $outcome');
+
+      // 预取与「清理无主照片」必须绑在一起、且都在当前格提交之后：
+      // 清理删的是「权威状态里不存在的照片文件」，而预取正在下载的那些文件在它
+      // 提交之前恰好不在状态里 —— 两者并行会把刚下好的图删掉，时间线上留下一个洞。
+      Future<void> rest() async {
+        try {
+          if (!await epoch.isCurrent()) return;
+          final plan = outcome.plan;
+          if (plan != null) {
+            await engine.prefetchAhead(
+              credentials: credentials,
+              settings: settings,
+              writer: writer,
+              plan: plan,
+              epoch: outcome.epoch,
+            );
+          }
+          if (!await epoch.isCurrent()) return;
+          try {
+            await _sweepOrphanPhotos(await _dir(), settings);
+          } catch (error) {
+            debugPrint('[BloomSync] orphan sweep failed: $error');
+          }
+        } finally {
+          await lease.release();
+        }
       }
-    }
 
-    if (foreground) {
-      // 界面路径：内容已经可以读了，把控制权立刻交回去，剩下的在后台跑。
-      unawaited(rest());
-    } else {
-      await rest();
-    }
+      handedToPrefetch = true;
+      if (foreground) {
+        // 界面路径：内容已经可以读了，把控制权立刻交回去，剩下的在后台跑。
+        unawaited(rest());
+      } else {
+        await rest();
+      }
 
-    final content = await cachedContent();
-    if (content == null) {
-      throw StateError('轮播内容不可用: $outcome');
+      final content = await cachedContent();
+      if (content == null) {
+        throw StateError('轮播内容不可用: $outcome');
+      }
+      return content;
+    } finally {
+      if (!handedToPrefetch) await lease.release();
     }
-    return content;
   }
 
   /// 手动「下一张」：让服务端把计划的当前格后移一格，再由 tick 按新计划重算。
@@ -272,10 +160,29 @@ class DailyContentRepository {
 
   Future<CachedWidgetImage?> cached(String orientation) async {
     final dir = await _dir();
+    final activeMode = await DisplayPreferences().readLocal();
+    if (activeMode.usesScheduledPlan) {
+      final entry = await _currentReadyEntry(dir);
+      if (entry != null) {
+        final path = switch (orientation) {
+          'square' => entry.squarePath,
+          'largeSquare' => entry.largeSquarePath,
+          _ => entry.portraitPath,
+        };
+        if (await File(path).exists()) {
+          return CachedWidgetImage(
+            path: path,
+            orientation: orientation,
+            date: entry.date,
+            recommendationId: entry.itemId,
+          );
+        }
+      }
+    }
     Map<String, dynamic> data = {};
     final meta = File('${dir.path}/$orientation.json');
     final dailyMeta = File('${dir.path}/daily.json');
-    final metadataSource = await meta.exists() ? meta : dailyMeta;
+    final metadataSource = await dailyMeta.exists() ? dailyMeta : meta;
     if (await metadataSource.exists()) {
       try {
         data =
@@ -287,6 +194,8 @@ class DailyContentRepository {
     var image =
         recommendationId == null
             ? File('${dir.path}/mobile-local-$orientation.png')
+            : data['pipeline'] == 'daily'
+            ? _dailyVersionedImage(dir, orientation, recommendationId)
             : _versionedImage(dir, orientation, recommendationId);
     // An item ID is only valid with that item's immutable image.
     if (recommendationId == null && !await image.exists()) {
@@ -317,21 +226,79 @@ class DailyContentRepository {
   /// a decode that raced the rewrite showed the letter fallback for a while.
   /// Deriving the path from the same id the caption comes from makes the card one
   /// unit again: it cannot show item A's picture next to item B's words.
-  Future<String?> photoPathFor(int? itemId) async {
+  Future<String?> photoPathFor(int? itemId, {String? mode}) async {
     if (itemId == null || itemId < 1) return null;
     final dir = await _dir();
+    if (mode == 'recommend') {
+      final daily = File('${dir.path}/daily-original-$itemId.photo');
+      return await daily.exists() ? daily.path : null;
+    }
+    final metadata = File('${dir.path}/daily.json');
+    try {
+      final raw = jsonDecode(await metadata.readAsString()) as Map;
+      if (mode != 'carousel' &&
+          raw['pipeline'] == 'daily' &&
+          raw['recommendation_id'] == itemId) {
+        final daily = File('${dir.path}/daily-original-$itemId.photo');
+        return await daily.exists() ? daily.path : null;
+      }
+    } catch (_) {}
     final versioned = File('${dir.path}/carousel-original-$itemId.photo');
-    if (await versioned.exists()) return versioned.path;
+    if (await versioned.exists()) {
+      try {
+        final identity =
+            jsonDecode(
+                  await File(
+                    '${dir.path}/mobile-original-$itemId.json',
+                  ).readAsString(),
+                )
+                as Map;
+        final state = await CarouselStateStore(directory: dir).read();
+        final photo = state.photos.where((p) => p.itemId == itemId).firstOrNull;
+        if (identity['asset'] is! String) return null;
+        if (photo != null && identity['asset'] != photo.assetId) return null;
+        return versioned.path;
+      } catch (_) {
+        // A legacy render marker cannot establish which asset was downloaded.
+        return null;
+      }
+    }
 
     return null;
   }
 
-  Future<DailyContent?> cachedContent() async {
-    final file = File('${(await _dir()).path}/daily.json');
+  Future<DailyContent?> cachedContent({String? mode}) async {
+    final dir = await _dir();
+    final localMode = await DisplayPreferences().readLocal();
+    if (mode == 'carousel' || (mode == null && localMode.usesScheduledPlan)) {
+      final entry = await _currentReadyEntry(dir);
+      if (entry != null) {
+        return DailyContent(
+          date: entry.date,
+          recommendationId: entry.itemId,
+          photo:
+              entry.photoMetadata.isEmpty
+                  ? null
+                  : PhotoAsset.fromJson(entry.photoMetadata),
+          captionZh: entry.captionZh,
+          captionEn: entry.captionEn,
+          capturedDateText: entry.capturedDateText,
+          locationText: entry.locationText,
+          sourceName: entry.sourceName,
+          artwork: entry.artwork,
+        );
+      }
+    }
+    final file = File('${dir.path}/daily.json');
     if (!await file.exists()) return null;
     try {
       final data =
           jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+      if (mode != null &&
+          data['mode'] != mode &&
+          !(mode == 'recommend' && data['pipeline'] == 'daily')) {
+        return null;
+      }
       final id = (data['recommendation_id'] as num?)?.toInt();
       final date = data['date'] as String?;
       if (id == null || date == null) return null;
@@ -359,6 +326,36 @@ class DailyContentRepository {
     }
   }
 
+  Future<TimelineEntry?> _currentReadyEntry(Directory dir) async {
+    final state = await CarouselStateStore(directory: dir).read();
+    final due = currentEntryFromTimeline(
+      state.timelineEntries,
+      DateTime.now().millisecondsSinceEpoch,
+    );
+    if (due == null ||
+        due.originalPath.isEmpty ||
+        !await File(due.originalPath).exists()) {
+      return null;
+    }
+    try {
+      final marker =
+          jsonDecode(
+                await File(
+                  '${dir.path}/mobile-original-${due.itemId}.json',
+                ).readAsString(),
+              )
+              as Map;
+      final photo = photoFor(state.photos, due.itemId);
+      if (marker['asset'] != photo?.assetId ||
+          marker['source'] != due.sourceName) {
+        return null;
+      }
+      return due;
+    } catch (_) {
+      return null;
+    }
+  }
+
   File _versionedImage(Directory dir, String family, int recommendationId) =>
       File('${dir.path}/mobile-local-$family-$recommendationId.png');
 
@@ -368,34 +365,41 @@ class DailyContentRepository {
   }) async {
     final local = await CarouselStateStore(directory: await _dir()).read();
     final entry =
-        local.timelineEntries
+        (state.mode == 'recommend' ? <TimelineEntry>[] : local.timelineEntries)
             .where((item) => item.itemId == state.recommendationId)
             .firstOrNull;
     final matching =
-        fallback?.recommendationId == state.recommendationId
+        fallback?.recommendationId == state.recommendationId &&
+                !(state.mode == 'recommend' && fallback?.sourceName == 'art')
             ? fallback
-            : await cachedContent();
+            : await cachedContent(mode: state.mode);
     final metadata =
         matching?.recommendationId == state.recommendationId ? matching : null;
     return DailyContent(
-      date: state.date ?? '',
+      date: entry?.date ?? metadata?.date ?? state.date ?? '',
       recommendationId: state.recommendationId,
       photo:
           entry?.photoMetadata.isNotEmpty == true
               ? PhotoAsset.fromJson(entry!.photoMetadata)
               : metadata?.photo,
-      captionZh: state.captionZh,
-      captionEn: state.captionEn,
-      capturedDateText: state.capturedDateText,
-      locationText: state.locationText,
-      sourceName:
-          entry?.sourceName == 'art'
-              ? 'art'
-              : metadata?.sourceName ?? entry?.sourceName ?? 'personal',
-      artwork:
-          entry?.artwork.isNotEmpty == true
-              ? entry!.artwork
-              : metadata?.artwork ?? const {},
+      captionZh:
+          entry != null
+              ? entry.captionZh
+              : metadata?.captionZh ?? state.captionZh,
+      captionEn:
+          entry != null
+              ? entry.captionEn
+              : metadata?.captionEn ?? state.captionEn,
+      capturedDateText:
+          entry != null
+              ? entry.capturedDateText
+              : metadata?.capturedDateText ?? state.capturedDateText,
+      locationText:
+          entry != null
+              ? entry.locationText
+              : metadata?.locationText ?? state.locationText,
+      sourceName: entry?.sourceName ?? metadata?.sourceName ?? 'personal',
+      artwork: entry != null ? entry.artwork : metadata?.artwork ?? const {},
     );
   }
 
@@ -440,10 +444,15 @@ class DailyContentRepository {
   /// sync, so between two syncs the widget could move ahead and the card stayed on
   /// the previous photo (measured on iOS: two different photos on one phone). Read
   /// this periodically and the two cannot disagree.
-  Future<DailyContent?> nativeContent() async {
+  Future<DailyContent?> nativeContent({String? expectedMode}) async {
     try {
       final state = await WidgetBridge().readCurrentState();
       if (state == null || state.recommendationId <= 0) return null;
+      if (expectedMode != null &&
+          state.mode != null &&
+          state.mode != expectedMode) {
+        return null;
+      }
       return await contentForNative(state);
     } catch (error) {
       debugPrint('[BloomSync] native current unavailable: $error');
@@ -469,6 +478,7 @@ class DailyContentRepository {
 
       // ① 栅格：晚于此刻的第一格。这是方案原文那条规则，纯查表、不依赖网络。
       final state = await CarouselStateStore(directory: dir).read();
+      if (state.plan == null) return null;
       final fromGrid = nextSlotAfter(
         state.grid.map((slot) => slot.slotAtMs),
         nowMs,
@@ -569,6 +579,7 @@ class DailyContentRepository {
         for (final photo in state.photos) ...[
           photo.path,
           '${dir.path}/mobile-render-${photo.itemId}.json',
+          '${dir.path}/mobile-original-${photo.itemId}.json',
           CarouselPhotoStore.originalFile(dir, photo.itemId).path,
           for (final family in ['portrait', 'square', 'largeSquare'])
             CarouselPhotoStore.renderedFile(dir, family, photo.itemId).path,
@@ -581,6 +592,33 @@ class DailyContentRepository {
         ],
       }..removeWhere((path) => path.isEmpty);
 
+      // Once the new scheduled image is published, retire the daily pipeline's
+      // old files. Keep any paths still reported by the native widget while it
+      // is finishing its handover.
+      final projection = File('${dir.path}/daily.json');
+      if (await projection.exists()) {
+        final raw = jsonDecode(await projection.readAsString()) as Map;
+        if (raw['pipeline'] == 'carousel') {
+          final native = await WidgetBridge().readCurrentState();
+          final nativePaths = {
+            native?.originalPhotoPath,
+            native?.portraitPath,
+            native?.squarePath,
+            native?.largeSquarePath,
+          };
+          await for (final file in dir.list()) {
+            if (file is! File || nativePaths.contains(file.path)) continue;
+            final name = file.uri.pathSegments.last;
+            if (RegExp(
+              r'^(daily-original-\d+\.photo|mobile-daily-[A-Za-z]+-\d+\.png)$',
+            ).hasMatch(name)) {
+              try {
+                await file.delete();
+              } catch (_) {}
+            }
+          }
+        }
+      }
       final swept = await sweepOrphanPhotos(
         dir: dir,
         alivePaths: alive,
@@ -591,38 +629,6 @@ class DailyContentRepository {
       }
     } catch (error) {
       debugPrint('[BloomSync] orphan sweep failed: $error');
-    }
-  }
-
-  Future<void> _pruneVersionedImages(
-    Directory dir,
-    String family, {
-    required Set<String> keeping,
-  }) async {
-    final candidates = <File>[];
-    await for (final entity in dir.list()) {
-      if (entity is! File) continue;
-      final name = entity.uri.pathSegments.last;
-      if (name.startsWith('mobile-local-$family-') && name.endsWith('.png')) {
-        candidates.add(entity);
-      }
-    }
-    candidates.sort(
-      (a, b) => b.statSync().modified.compareTo(a.statSync().modified),
-    );
-    // Keep every referenced item plus a few unreferenced fallbacks. Android can
-    // then switch locally without waking Flutter — and, unlike the old
-    // newest-eight rule, it can still switch to the slot that is due *next*.
-    var spares = 0;
-    for (final file in candidates) {
-      if (keeping.contains(file.path)) continue;
-      if (spares < 8) {
-        spares++;
-        continue;
-      }
-      try {
-        await file.delete();
-      } catch (_) {}
     }
   }
 }
