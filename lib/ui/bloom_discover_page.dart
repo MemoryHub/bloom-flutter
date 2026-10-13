@@ -1,10 +1,13 @@
+import 'bloom_artwork_frame.dart';
 import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../core/api/bloom_api_client.dart';
 import '../core/rendering/mobile_artwork_renderer.dart';
+import '../core/rendering/country_flag_assets.dart';
 import 'bloom_glass_home.dart';
+import 'bloom_image_viewer.dart';
 
 const _paper = BloomInk.page;
 const _ink = BloomInk.text;
@@ -53,19 +56,11 @@ final _primaryDialogStyle = FilledButton.styleFrom(
 );
 
 String galleryArtistNationality(Map<String, dynamic> work) {
-  const countries = {
-    'JP': '日本',
-    'NL': '荷兰',
-    'FR': '法国',
-    'AT': '奥地利',
-    'IT': '意大利',
-    'GB': '英国',
-    'US': '美国',
-    'DE': '德国',
-    'ES': '西班牙',
-    'UA': '乌克兰',
-  };
-  final country = countries[work['artist_country_code']];
+  final supplied = work['artist_country_display_name'];
+  if (supplied is String && supplied.trim().isNotEmpty) return supplied;
+  final country =
+      MobileArtworkRenderer
+          .supportedCountries[MobileArtworkRenderer.countryCode(work)];
   if (country != null) return country;
   final translated = galleryArtworkText(work, 'artist_nationality');
   if (translated == 'Netherlandish') return '尼德兰地区';
@@ -77,23 +72,22 @@ class _ArtistNationality extends StatelessWidget {
   final Map<String, dynamic> work;
   @override
   Widget build(BuildContext context) {
-    final country = work['artist_country_code'] as String? ?? '';
+    final country = MobileArtworkRenderer.countryCode(work);
     return Wrap(
       crossAxisAlignment: WrapCrossAlignment.center,
       spacing: 6,
       children: [
-        if (const [
-          'JP',
-          'NL',
-          'FR',
-          'AT',
-          'IT',
-          'GB',
-          'US',
-          'DE',
-          'ES',
-          'UA',
-        ].contains(country))
+        if (MobileArtworkRenderer.hasFlagAsset(work))
+          ExcludeSemantics(
+            child: Image.memory(
+              CountryFlagAssets.bytes(work)!,
+              width: 18,
+              height: 12,
+              fit: BoxFit.fill,
+              errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+            ),
+          )
+        else if (country.isNotEmpty)
           ExcludeSemantics(
             child: ClipRect(
               child: CustomPaint(
@@ -329,6 +323,7 @@ class _BloomDiscoverPageState extends State<BloomDiscoverPage> {
                             api: widget.api,
                             path: (c['cover'] as Map)['image_url'] as String,
                             height: 280,
+                            fit: BoxFit.cover,
                           ),
                           const SizedBox(height: 18),
                           Text(
@@ -400,17 +395,19 @@ class GalleryImage extends StatelessWidget {
     required this.api,
     required this.path,
     this.height = 300,
+    this.fit = BoxFit.contain,
   });
   final BloomApiClient api;
   final String path;
   final double height;
+  final BoxFit fit;
   @override
   Widget build(BuildContext context) => SizedBox(
     height: height,
     width: double.infinity,
     child: Image.network(
       api.discoverImageUrl(path),
-      fit: BoxFit.contain,
+      fit: fit,
       frameBuilder:
           (context, child, frame, synchronous) =>
               synchronous || frame != null
@@ -809,35 +806,9 @@ class BloomExhibitionArtwork extends StatelessWidget {
             child: Padding(
               padding: const EdgeInsets.fromLTRB(29, 88, 29, 48),
               child: Center(
-                child: Container(
+                child: SizedBox(
                   width: width + 12,
-                  padding: const EdgeInsets.all(6),
-                  decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: [
-                        Color(0xff545049),
-                        Color(0xff282824),
-                        Color(0xff48453e),
-                      ],
-                    ),
-                    border: Border.all(
-                      color: const Color(0xff262622),
-                      width: 1,
-                    ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withValues(alpha: .23),
-                        blurRadius: 16,
-                        spreadRadius: 1,
-                        offset: const Offset(5, 10),
-                      ),
-                    ],
-                  ),
-                  child: Container(
-                    padding: const EdgeInsets.all(1.5),
-                    color: const Color(0xffbbb6a9),
+                  child: BloomArtworkFrame(
                     child:
                         imageBuilder?.call(height) ??
                         GalleryImage(
@@ -1023,7 +994,30 @@ class _ArtworkPage extends StatelessWidget {
       child: ListView(
         padding: const EdgeInsets.fromLTRB(26, 20, 26, 60),
         children: [
-          BloomExhibitionArtwork(api: api, work: work),
+          BloomExhibitionArtwork(
+            api: api,
+            work: work,
+            imageBuilder:
+                (height) => GestureDetector(
+                  key: const ValueKey('gallery-open-original'),
+                  onTap:
+                      () => BloomImageViewer.open(
+                        context,
+                        NetworkImage(
+                          api.discoverImageUrl(
+                            (work['full_image_url'] ?? work['image_url'])
+                                as String,
+                          ),
+                        ),
+                        galleryArtworkText(work, 'title'),
+                      ),
+                  child: GalleryImage(
+                    api: api,
+                    path: work['image_url'] as String,
+                    height: height,
+                  ),
+                ),
+          ),
           const SizedBox(height: 24),
           if ((work['bloom_note_zh'] as String? ?? '').isNotEmpty) ...[
             Container(

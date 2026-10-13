@@ -6,6 +6,7 @@ Future<bool> confirmBloomAction(
   required String title,
   required String message,
   required String confirmLabel,
+  bool destructive = false,
 }) async =>
     await showDialog<bool>(
       context: context,
@@ -34,6 +35,7 @@ Future<bool> confirmBloomAction(
                       Expanded(
                         child: BloomPrimaryButton(
                           label: confirmLabel,
+                          destructive: destructive,
                           onPressed: () => Navigator.pop(context, true),
                         ),
                       ),

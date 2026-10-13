@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import '../models/device_models.dart';
+import 'country_flag_assets.dart';
 
 class GalleryTextRun {
   GalleryTextRun(
@@ -47,7 +48,7 @@ class GalleryLabelLayout {
 
 /// Original artwork is rendered locally; widgets never decode the frame RAW.
 class MobileArtworkRenderer {
-  static const template = 'bloom-mobile-gallery-v7-cover-balanced-note';
+  static const template = 'bloom-mobile-gallery-v8-server-country-assets';
   static const sizes = {
     'portrait': Size(720, 1200),
     'square': Size(720, 720),
@@ -108,21 +109,47 @@ class MobileArtworkRenderer {
 
   static String countryCode(Map<String, dynamic> metadata) {
     final code = cleanText(metadata['artist_country_code']).toUpperCase();
-    return [
-          'JP',
-          'NL',
-          'FR',
-          'AT',
-          'IT',
-          'GB',
-          'US',
-          'DE',
-          'ES',
-          'UA',
-        ].contains(code)
+    return RegExp(r'^[A-Z]{2}$').hasMatch(code) &&
+            (supportedCountries.containsKey(code) || hasFlagAsset(metadata))
         ? code
         : '';
   }
+
+  static bool hasFlagAsset(Map<String, dynamic> metadata) =>
+      CountryFlagAssets.bytes(metadata) != null;
+
+  static double artworkFocus(
+    Map<String, dynamic> metadata,
+    String axis,
+    double fallback,
+  ) {
+    final focus = metadata['artwork_focus'];
+    final value = focus is Map ? focus[axis] : null;
+    return value is num && value.isFinite && value >= 0 && value <= 1
+        ? value.toDouble()
+        : fallback;
+  }
+
+  static const supportedCountries = {
+    'JP': '日本',
+    'NL': '荷兰',
+    'FR': '法国',
+    'AT': '奥地利',
+    'IT': '意大利',
+    'GB': '英国',
+    'US': '美国',
+    'DE': '德国',
+    'ES': '西班牙',
+    'UA': '乌克兰',
+    'BE': '比利时',
+    'IE': '爱尔兰',
+    'CA': '加拿大',
+    'AU': '澳大利亚',
+    'CZ': '捷克',
+    'RU': '俄罗斯',
+    'PL': '波兰',
+    'TW': '中国台湾',
+  };
 
   static String editorialNote(Map<String, dynamic> metadata) {
     final value = metadata['bloom_note_zh'];
@@ -395,6 +422,36 @@ class MobileArtworkRenderer {
       }
     }
 
+    void polygon(List<(double, double)> points, Color color) {
+      final path =
+          Path()..moveTo(
+            box.left + points.first.$1 * box.width,
+            box.top + points.first.$2 * box.height,
+          );
+      for (final point in points.skip(1)) {
+        path.lineTo(
+          box.left + point.$1 * box.width,
+          box.top + point.$2 * box.height,
+        );
+      }
+      path.close();
+      canvas.drawPath(path, Paint()..color = color);
+    }
+
+    void star(double x, double y, double radius, int points) {
+      polygon(
+        List.generate(points * 2, (n) {
+          final angle = n * math.pi / points - math.pi / 2;
+          final r = radius * (n.isEven ? 1 : .45);
+          return (
+            x + math.cos(angle) * r * box.height / box.width,
+            y + math.sin(angle) * r,
+          );
+        }),
+        Colors.white,
+      );
+    }
+
     switch (flag.country) {
       case 'JP':
         canvas.drawCircle(box.center, box.height * .3, Paint()..color = red);
@@ -404,6 +461,73 @@ class MobileArtworkRenderer {
         stripes([blue, Colors.white, red], vertical: true);
       case 'IT':
         stripes([const Color(0xff227543), Colors.white, red], vertical: true);
+      case 'BE':
+        stripes([
+          const Color(0xff1e1e1e),
+          const Color(0xffe9c33d),
+          red,
+        ], vertical: true);
+      case 'IE':
+        stripes([
+          const Color(0xff227543),
+          Colors.white,
+          const Color(0xffe7892f),
+        ], vertical: true);
+      case 'RU':
+        stripes([Colors.white, blue, red]);
+      case 'PL':
+        stripes([Colors.white, red]);
+      case 'CZ':
+        stripes([Colors.white, red]);
+        polygon([(0.0, 0.0), (.5, .5), (0.0, 1.0)], blue);
+      case 'CA':
+        rect(0, 0, .25, 1, red);
+        rect(.75, 0, .25, 1, red);
+        polygon([
+          (.5, .17),
+          (.55, .34),
+          (.61, .29),
+          (.60, .46),
+          (.69, .40),
+          (.65, .58),
+          (.57, .64),
+          (.58, .71),
+          (.52, .70),
+          (.52, .84),
+          (.48, .84),
+          (.48, .70),
+          (.42, .71),
+          (.43, .64),
+          (.35, .58),
+          (.31, .40),
+          (.40, .46),
+          (.39, .29),
+          (.45, .34),
+        ], red);
+      case 'TW':
+        rect(0, 0, 1, 1, red);
+        rect(0, 0, .5, .5, blue);
+        star(.25, .25, .16, 12);
+      case 'AU':
+        rect(0, 0, 1, 1, blue);
+        canvas.save();
+        canvas.clipRect(
+          Rect.fromLTWH(box.left, box.top, box.width * .5, box.height * .5),
+        );
+        drawFlag(
+          canvas,
+          GalleryFlag(
+            'GB',
+            Rect.fromLTWH(box.left, box.top, box.width * .5, box.height * .5),
+          ),
+        );
+        canvas.restore();
+        star(.25, .76, .12, 7);
+        star(.76, .20, .07, 7);
+        star(.63, .46, .07, 7);
+        star(.90, .42, .07, 7);
+        star(.76, .82, .07, 7);
+        star(.82, .58, .035, 5);
       case 'AT':
         stripes([red, Colors.white, red]);
       case 'DE':
@@ -469,8 +593,9 @@ class MobileArtworkRenderer {
   static void paintLabel(
     Canvas canvas,
     Map<String, dynamic> metadata,
-    Size size,
-  ) {
+    Size size, {
+    ui.Image? flagImage,
+  }) {
     final label = layoutLabel(metadata, size), unit = label.scale;
     for (final card in label.cards) {
       canvas.drawRect(
@@ -489,7 +614,21 @@ class MobileArtworkRenderer {
       canvas.restore();
     }
     for (final flag in label.flags) {
-      drawFlag(canvas, flag);
+      if (flagImage != null) {
+        canvas.drawImageRect(
+          flagImage,
+          Rect.fromLTWH(
+            0,
+            0,
+            flagImage.width.toDouble(),
+            flagImage.height.toDouble(),
+          ),
+          flag.bounds,
+          Paint()..filterQuality = FilterQuality.high,
+        );
+      } else if (supportedCountries.containsKey(flag.country)) {
+        drawFlag(canvas, flag);
+      }
     }
     label.dispose();
   }
@@ -520,21 +659,20 @@ class MobileArtworkRenderer {
     );
     final cropWidth = size.width / scale;
     final cropHeight = size.height / scale;
-    final left = (sourceWidth * .5 - cropWidth / 2).clamp(
-      0.0,
-      sourceWidth - cropWidth,
-    );
-    final top = (sourceHeight * .45 - cropHeight / 2).clamp(
-      0.0,
-      sourceHeight - cropHeight,
-    );
+    final left = (sourceWidth * artworkFocus(content.artwork, 'x', .5) -
+            cropWidth / 2)
+        .clamp(0.0, sourceWidth - cropWidth);
+    final top = (sourceHeight * artworkFocus(content.artwork, 'y', .45) -
+            cropHeight / 2)
+        .clamp(0.0, sourceHeight - cropHeight);
     canvas.drawImageRect(
       image,
       Rect.fromLTWH(left, top, cropWidth, cropHeight),
       Offset.zero & size,
       Paint()..filterQuality = FilterQuality.high,
     );
-    paintLabel(canvas, content.artwork, size);
+    final flagImage = await CountryFlagAssets.load(content.artwork);
+    paintLabel(canvas, content.artwork, size, flagImage: flagImage);
     final picture = recorder.endRecording();
     final output = await picture.toImage(
       size.width.toInt(),
@@ -545,6 +683,75 @@ class MobileArtworkRenderer {
     codec.dispose();
     output.dispose();
     picture.dispose();
+    flagImage?.dispose();
     return data!.buffer.asUint8List();
   }
+}
+
+/// Home labels load the same server-owned flag as widget exports.
+class ServerArtworkLabel extends StatefulWidget {
+  const ServerArtworkLabel({super.key, required this.metadata});
+  final Map<String, dynamic> metadata;
+  @override
+  State<ServerArtworkLabel> createState() => _ServerArtworkLabelState();
+}
+
+class _ServerArtworkLabelState extends State<ServerArtworkLabel> {
+  ui.Image? _image;
+  int _generation = 0;
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void didUpdateWidget(ServerArtworkLabel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (CountryFlagAssets.signature(oldWidget.metadata) !=
+        CountryFlagAssets.signature(widget.metadata)) {
+      _image?.dispose();
+      _image = null;
+      _load();
+    }
+  }
+
+  Future<void> _load() async {
+    final generation = ++_generation;
+    final image = await CountryFlagAssets.load(widget.metadata);
+    if (!mounted || generation != _generation) {
+      image?.dispose();
+      return;
+    }
+    setState(() {
+      _image?.dispose();
+      _image = image;
+    });
+  }
+
+  @override
+  void dispose() {
+    _generation++;
+    _image?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) =>
+      CustomPaint(painter: _ServerLabelPainter(widget.metadata, _image));
+}
+
+class _ServerLabelPainter extends CustomPainter {
+  _ServerLabelPainter(this.metadata, this.image);
+  final Map<String, dynamic> metadata;
+  final ui.Image? image;
+  @override
+  void paint(Canvas canvas, Size size) => MobileArtworkRenderer.paintLabel(
+    canvas,
+    metadata,
+    size,
+    flagImage: image,
+  );
+  @override
+  bool shouldRepaint(_ServerLabelPainter oldDelegate) => true;
 }

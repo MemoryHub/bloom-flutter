@@ -2,12 +2,32 @@ import 'dart:convert';
 import 'package:bloom/core/api/bloom_api_client.dart';
 import 'package:bloom/ui/bloom_discover_page.dart';
 import 'package:bloom/ui/bloom_glass_home.dart';
+import 'package:bloom/ui/bloom_image_viewer.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 void main() {
+  test('reviewed country code supplies clean Chinese country text', () {
+    expect(
+      galleryArtistNationality({
+        'artist_country_code': 'BE',
+        'artist_nationality': '比利时（核验说明）',
+      }),
+      '比利时',
+    );
+    expect(galleryArtistNationality({'artist_country_code': 'CA'}), '加拿大');
+    expect(
+      galleryArtistNationality({'artist_nationality': 'Netherlandish'}),
+      '尼德兰地区',
+    );
+    expect(
+      galleryArtistNationality({'artist_nationality': '意大利／波兰背景'}),
+      '意大利／波兰背景',
+    );
+  });
+
   test('中文展示优先翻译、英文原文保留，缺少翻译回退原文', () {
     final work = <String, dynamic>{
       'title': 'Sunflowers',
@@ -31,6 +51,75 @@ void main() {
     };
     addTearDown(() => FlutterError.onError = reportError);
   }
+
+  testWidgets('作品详情点击原画进入高清缩放，返回仍在同一作品', (tester) async {
+    ignoreTestImageRequests();
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    final work = {
+      'id': 'car-work',
+      'position': 0,
+      'title': '小汽车',
+      'artist': 'Artist',
+      'year': '2025',
+      'image_url': '/small.jpg',
+      'full_image_url': '/large.jpg',
+      'image_width': 1600,
+      'image_height': 1200,
+      'short_description': '沿着街道出发。',
+    };
+    final collection = {
+      'id': 'cars',
+      'title': '汽车展览',
+      'work_count': 1,
+      'cover': work,
+      'subtitle': '想象力的旅程',
+      'introduction': '一起出发。',
+    };
+    final api = BloomApiClient(
+      client: MockClient(
+        (request) async => http.Response(
+          jsonEncode(
+            request.url.path.endsWith('/collections')
+                ? {
+                  'items': [collection],
+                  'has_more': false,
+                }
+                : {
+                  ...collection,
+                  'items': [work],
+                  'has_more': false,
+                },
+          ),
+          200,
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        ),
+      ),
+    );
+    await tester.pumpWidget(
+      MaterialApp(home: Scaffold(body: BloomDiscoverPage(api: api, frames: const []))),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('汽车展览'));
+    await tester.pumpAndSettle();
+    final picture = find.byKey(const ValueKey('gallery-image-car-work'));
+    await tester.ensureVisible(picture);
+    await tester.tap(picture);
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('gallery-open-original')));
+    await tester.pumpAndSettle();
+    final viewer = tester.widget<BloomImageViewer>(
+      find.byType(BloomImageViewer),
+    );
+    expect((viewer.image as NetworkImage).url, endsWith('/large.jpg'));
+    final zoom = find.byKey(const ValueKey('bloom-image-zoom'));
+    expect(tester.widget<InteractiveViewer>(zoom).maxScale, 8);
+    await tester.pageBack();
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('gallery-open-original')), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+  });
 
   testWidgets('滑动自动接续50幅，分页失败可重试，加入入口始终可见', (tester) async {
     ignoreTestImageRequests();

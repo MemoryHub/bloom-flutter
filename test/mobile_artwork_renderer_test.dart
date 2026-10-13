@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:bloom/core/models/device_models.dart';
 import 'package:bloom/core/rendering/mobile_artwork_renderer.dart';
+import 'package:bloom/core/rendering/country_flag_assets.dart';
 import 'package:bloom/core/rendering/mobile_letter_renderer.dart';
 
 void main() {
@@ -16,6 +17,103 @@ void main() {
     await (FontLoader('BloomHandwriting')
       ..addFont(rootBundle.load('assets/fonts/mmxj.ttf'))).load();
   });
+  test(
+    'a future country paints the supplied image without a country painter branch',
+    () async {
+      final metadata = <String, dynamic>{
+        'title': 'Car',
+        'artist': 'An artist',
+        'artist_country_code': 'SE',
+      };
+      expect(
+        MobileArtworkRenderer.supportedCountries.containsKey('SE'),
+        isFalse,
+      );
+      final flagRecorder = ui.PictureRecorder();
+      ui.Canvas(
+        flagRecorder,
+      ).drawColor(const ui.Color(0xffff00ff), ui.BlendMode.src);
+      final flagPicture = flagRecorder.endRecording();
+      final asset = await flagPicture.toImage(8, 8);
+      flagPicture.dispose();
+      final png = await asset.toByteData(format: ui.ImageByteFormat.png);
+      metadata['artist_flag'] = {
+        'country': 'SE',
+        'version': '1',
+        'media_type': 'image/png',
+        'data_base64': base64Encode(png!.buffer.asUint8List()),
+      };
+      final decoded = await CountryFlagAssets.load(metadata);
+      expect(decoded, isNotNull);
+      expect(MobileArtworkRenderer.countryCode(metadata), 'SE');
+      for (final size in MobileArtworkRenderer.sizes.values) {
+        final layout = MobileArtworkRenderer.layoutLabel(metadata, size);
+        final point = layout.flags.single.bounds.center;
+        final recorder = ui.PictureRecorder();
+        MobileArtworkRenderer.paintLabel(
+          ui.Canvas(recorder),
+          metadata,
+          size,
+          flagImage: decoded,
+        );
+        final picture = recorder.endRecording();
+        final image = await picture.toImage(
+          size.width.toInt(),
+          size.height.toInt(),
+        );
+        final bytes = await image.toByteData(
+          format: ui.ImageByteFormat.rawRgba,
+        );
+        final offset = (point.dy.toInt() * image.width + point.dx.toInt()) * 4;
+        expect(bytes!.buffer.asUint8List().sublist(offset, offset + 4), [
+          255,
+          0,
+          255,
+          255,
+        ]);
+        image.dispose();
+        picture.dispose();
+        layout.dispose();
+      }
+      asset.dispose();
+      decoded?.dispose();
+    },
+  );
+  test(
+    'new collection countries have deterministic icons in all widget shapes',
+    () {
+      for (final code in ['BE', 'IE', 'CA', 'AU', 'CZ', 'RU', 'PL', 'TW']) {
+        final meta = <String, dynamic>{
+          'title': 'A blue car',
+          'artist': 'Leo Timmers',
+          'artist_birth_year': 1970,
+          'artist_country_code': code,
+          'bloom_note_zh': '先把车摆好。\n这次，轮到我来带路。',
+        };
+        expect(MobileArtworkRenderer.countryCode(meta), code);
+        for (final size in MobileArtworkRenderer.sizes.values) {
+          final layout = MobileArtworkRenderer.layoutLabel(meta, size);
+          expect(layout.flags.single.country, code);
+          expect(
+            layout.runs.any(
+              (r) => r.bounds.overlaps(layout.flags.single.bounds),
+            ),
+            isFalse,
+          );
+          final recorder = ui.PictureRecorder();
+          MobileArtworkRenderer.drawFlag(
+            ui.Canvas(recorder),
+            layout.flags.single,
+          );
+          recorder.endRecording().dispose();
+        }
+      }
+      expect(
+        MobileArtworkRenderer.countryCode({'artist_country_code': 'zz'}),
+        '',
+      );
+    },
+  );
   test(
     'all 50 curated labels fit every phone widget size, including approximate dates',
     () {

@@ -126,6 +126,62 @@ check(
     "[查表] 空状态应返回 nil"
 )
 
+// ---- WidgetKit notification boundary: metadata/heartbeats are not new pictures ----
+func reloadContent(_ state: [String: Any], mode: String = "carousel", renderer: String = "v1") -> Data? {
+    BloomSharedState.reloadContent(state, mode: mode, rendererVersion: renderer)
+}
+let initialContent = reloadContent(fixture)
+check(initialContent != nil, "[刷新内容] 完整时间线必须能生成稳定签名")
+var heartbeat = fixture
+heartbeat["revision"] = 9876
+heartbeat["writer"] = "ios-widget-refill"
+heartbeat["updated_at_ms"] = 123456
+heartbeat["current_item_id"] = 4481
+heartbeat["photos"] = [["item_id": 4481, "fetched_at_ms": 999999]]
+heartbeat["grid"] = [["item_id": 4482, "slot_at_ms": 1790567700000]]
+check(reloadContent(heartbeat) == initialContent, "[刷新去重] 心跳、仅元数据的栅格与修订号不应耗刷新额度")
+var readyFuture = fixture
+let futureEntry: [String: Any] = ["item_id": 4482, "asset_id": "asset-4482", "date_ms": 1790567700000,
+    "square_path": "/tmp/mobile-local-square-4482.png", "caption_zh": "未来图"]
+readyFuture["timeline_entries"] = BloomSharedState.timelineEntries(fixture) + [futureEntry]
+let futureContent = reloadContent(readyFuture)
+check(futureContent != initialContent, "[渐进发布] 一张未来图就绪应独立通知，不等后续慢图")
+check(reloadContent(readyFuture) == futureContent, "[重复补货] 相同已就绪时间线不能重复消耗刷新额度")
+check((BloomCarouselRule.currentEntry(BloomSharedState.timelineEntries(readyFuture), nowMillis: 1790567400000)?["item_id"] as? Int) == 4481,
+    "[保持栅格] 通知未来图就绪不应把它提前显示")
+var edited = fixture
+var editedEntry = BloomSharedState.timelineEntries(fixture)[0]
+editedEntry["caption_zh"] = "更新过的旁白"
+edited["timeline_entries"] = [editedEntry]
+check(reloadContent(edited) != initialContent, "[同图重绘] 旁白更改也须通知刷新")
+var newPlan = fixture
+newPlan["plan"] = ["plan_id": 153, "settings_hash": "h2", "day": "2026-09-28"]
+check(reloadContent(newPlan) != initialContent, "[换代] 新计划不受旧刷新签名限制")
+check(reloadContent(fixture, mode: "recommend") != initialContent, "[切模式] 推荐轮播变更须刷新")
+check(reloadContent(fixture, renderer: "v2") != initialContent, "[排版升级] 渲染版本变更须刷新")
+
+// Exercise the actual native progressive merge: a later download can remain
+// absent while the first future entry is already available to the notifier.
+let refillGrid: [[String: Any]] = [
+    ["item_id": 4481, "slot_at_ms": 1790566800000],
+    ["item_id": 4482, "asset_id": "asset-4482", "slot_at_ms": 1790567700000],
+    ["item_id": 4483, "slot_at_ms": 1790568600000],
+]
+let mergedReady = BloomSharedState.merging(fixture, plan: fixture["plan"] as! [String: Any],
+    grid: refillGrid, ready: [futureEntry], nowMillis: 1790567400000, serverNext: nil)
+check(BloomSharedState.timelineEntries(mergedReady).count == 2,
+    "[慢后续图] 第三项未下载不应挡住第二项进入共享时间线")
+check(reloadContent(mergedReady) != initialContent,
+    "[慢后续图] 首张就绪未来项无需等下一下载完成即可触发通知")
+let repeatedReady = BloomSharedState.merging(mergedReady, plan: fixture["plan"] as! [String: Any],
+    grid: refillGrid, ready: [], nowMillis: 1790567400000, serverNext: nil)
+check(reloadContent(repeatedReady) == reloadContent(mergedReady),
+    "[无变化补货] 实际合并修订增长不应导致重复reload")
+let advancedReady = BloomSharedState.merging(mergedReady, plan: fixture["plan"] as! [String: Any],
+    grid: refillGrid, ready: [], nowMillis: 1790567800000, serverNext: nil)
+check((advancedReady["current_item_id"] as? Int) == 4482 && reloadContent(advancedReady) == reloadContent(mergedReady),
+    "[到点播放] 已交付未来项按原时刻推进，不必重复请求同一时间线")
+
 print("Swift 侧共享检查：\(checked) 项")
 if failures.isEmpty {
     print("全部通过")

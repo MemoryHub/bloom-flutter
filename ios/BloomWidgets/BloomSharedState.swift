@@ -59,6 +59,21 @@ enum BloomSharedState {
     static let cacheDirectoryName = "widget-cache"
     static let fileName = "carousel-state.json"
 
+    /// Only ready, visible timeline content requires a WidgetKit reload. A
+    /// heartbeat/revision or staged network response cannot change any pixels.
+    /// Kept Foundation-only so this notification boundary can be regression-tested.
+    static func reloadContent(
+        _ state: [String: Any], mode: String, rendererVersion: String
+    ) -> Data? {
+        let content: [String: Any] = [
+            "mode": mode,
+            "renderer": rendererVersion,
+            "plan": state["plan"] ?? NSNull(),
+            "timeline": timelineEntries(state),
+        ]
+        return try? JSONSerialization.data(withJSONObject: content, options: [.sortedKeys, .withoutEscapingSlashes])
+    }
+
     static func cacheDirectory() -> URL? {
         guard let container = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: appGroup

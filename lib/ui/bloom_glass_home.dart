@@ -3,6 +3,9 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import '../core/storage/device_plan_preview_repository.dart';
+import 'bloom_image_viewer.dart';
+import 'bloom_artwork_frame.dart';
 import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
 import '../core/models/auth_models.dart';
@@ -241,6 +244,7 @@ class BloomGlassHome extends StatelessWidget {
     this.message,
     this.selectedDeviceId,
     this.nextSlotAt,
+    this.remotePlanPreviews = const {},
   });
 
   final bool loading;
@@ -262,6 +266,7 @@ class BloomGlassHome extends StatelessWidget {
   /// (`next_slot_at_ms` in the daily mirror). `null` outside carousel mode or
   /// before the first sync.
   final int? nextSlotAt;
+  final Map<String, DevicePlanPreview> remotePlanPreviews;
 
   final BloomDisplaySettings settings;
 
@@ -276,7 +281,13 @@ class BloomGlassHome extends StatelessWidget {
   /// is the first grid point after now, and once the window is done it is
   /// tomorrow's start.
 
-  static String? nextSlotText(BloomDisplaySettings settings, int? stampMillis) {
+  static String? nextSlotText(
+    BloomDisplaySettings settings,
+    int? stampMillis,
+  ) => nextUpdateText(stampMillis);
+
+  /// Shared presentation only. Each device supplies its own schedule timestamp.
+  static String? nextUpdateText(int? stampMillis) {
     final now = DateTime.now();
     final stamp =
         (stampMillis == null || stampMillis < 1)
@@ -604,6 +615,7 @@ class BloomGlassHome extends StatelessWidget {
     // 未登录时连 tab 都没了，用户连"我在哪一页"都看不出来。
     final pages = [
       _PhotoPage(
+        remotePlanPreviews: remotePlanPreviews,
         // The switch being off freezes this phone's card, so a "下次更新" under it
         // would be a promise the app is not keeping.
         //
@@ -1190,9 +1202,11 @@ class _PhotoPage extends StatelessWidget {
     required this.onDeviceChanged,
     required this.account,
     required this.onSignIn,
+    this.remotePlanPreviews = const {},
   });
 
   final String? nextSlotText;
+  final Map<String, DevicePlanPreview> remotePlanPreviews;
   final bool loading;
   final bool? hasAssets;
   final String? contentError;
@@ -1344,12 +1358,17 @@ class _PhotoPage extends StatelessWidget {
     }
 
     final selected = _selected;
-    // This app only holds its own device token, so it cannot load the frame's
-    // photos (`/carousel/plan` needs a token belonging to that device). Show
-    // the placeholder instead of pretending, and never touch the auth path.
+    // Remote previews use the account-authorized server-plan cache.
+    // Selection only reads this map; the phone widget remains independent.
     final remoteSelected = selected != null && !selected.isLocal;
-    final hasPhoto = originalPhotoPath != null && !remoteSelected;
+    final remoteDisplay =
+        remoteSelected ? remotePlanPreviews[selected.deviceId] : null;
+    final hasPhoto =
+        remoteSelected
+            ? selected.isFrame || remoteDisplay?.imagePath != null
+            : originalPhotoPath != null;
     final carousel = mode == BloomDisplayMode.carousel;
+    final remoteMode = bloomModeFromWire(remoteDisplay?.mode);
     return SafeArea(
       // [BloomSurface.pageInset] on the sides and on top: the same inset the
       // 设备 list page uses, and the one the page title below reads.
@@ -1398,8 +1417,7 @@ class _PhotoPage extends StatelessWidget {
                   // width, so its height comes out of the card's budget — reserve
                   // it here or the column overflows on a short screen.
                   //
-                  // This reservation is unconditional (unlike the row itself,
-                  // which is hidden while remote-selected): the label's text can
+                  // Reserve the same footer space for local and remote cards: the label's text can
                   // flip between null and non-null from one frame to the next
                   // (the plan hasn't returned yet, then it has), and if the
                   // reserved space changed with it the card would resize under
@@ -1407,7 +1425,23 @@ class _PhotoPage extends StatelessWidget {
                   // shows up". Reserving the slot always and only swapping what
                   // renders inside it keeps the card's box constant regardless
                   // of whether the label is showing.
-                  final nextSlot = remoteSelected ? null : nextSlotText;
+                  final nextSlot =
+                      remoteSelected
+                          ? (remoteDisplay?.loading == false &&
+                                  remoteDisplay?.offline == false
+                              ? BloomGlassHome.nextUpdateText(
+                                remoteDisplay
+                                    ?.nextCheckAt
+                                    ?.millisecondsSinceEpoch,
+                              )
+                              : null)
+                          : nextSlotText;
+                  // Match the row gap while keeping the widget's original
+                  // rounded card separate from the Bloom-Ink exhibition frame.
+                  final aspectRatio =
+                      remoteSelected
+                          ? _RemoteDeviceCard.aspectRatio
+                          : _LetterPhotoCard.aspectRatio;
                   const nextSlotGap = 8.0;
                   const nextSlotHeight = 15.0;
                   final cardBox = math.max(
@@ -1415,7 +1449,7 @@ class _PhotoPage extends StatelessWidget {
                     constraints.maxHeight -
                         rowHeight -
                         BloomGlassHome.cardGap -
-                        (remoteSelected ? 0.0 : nextSlotGap + nextSlotHeight),
+                        (nextSlotGap + nextSlotHeight),
                   );
                   // Same formula as `AspectRatio` itself: fill the width unless
                   // the height says otherwise (the card is portrait, 720x1200).
@@ -1423,7 +1457,7 @@ class _PhotoPage extends StatelessWidget {
                       hasPhoto
                           ? math.min(
                             constraints.maxWidth,
-                            cardBox * _LetterPhotoCard.aspectRatio,
+                            cardBox * aspectRatio,
                           )
                           : constraints.maxWidth;
                   final side = math.max(
@@ -1437,10 +1471,7 @@ class _PhotoPage extends StatelessWidget {
                   // [nextSlotGap] under its bottom edge on every screen.
                   final cardHeight =
                       hasPhoto
-                          ? math.min(
-                            cardBox,
-                            cardWidth / _LetterPhotoCard.aspectRatio,
-                          )
+                          ? math.min(cardBox, cardWidth / aspectRatio)
                           : cardBox;
                   return Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1460,21 +1491,32 @@ class _PhotoPage extends StatelessWidget {
                             // glyphs share one centre line.
                             crossAxisAlignment: CrossAxisAlignment.center,
                             children: [
-                              // The label describes *this phone's* home-screen
-                              // widget, so it is hidden while the dial points at
-                              // another device: the local mirror says nothing
-                              // about a frame.
-                              if (!remoteSelected)
+                              if (!remoteSelected || remoteMode != null)
                                 _ModeTag(
-                                  key: const ValueKey('bloom-mode-tag'),
-                                  carousel: carousel,
+                                  key: ValueKey(
+                                    remoteSelected
+                                        ? 'remote-mode-${selected.deviceId}'
+                                        : 'bloom-mode-tag',
+                                  ),
+                                  carousel:
+                                      remoteSelected
+                                          ? remoteMode ==
+                                              BloomDisplayMode.carousel
+                                          : carousel,
+                                )
+                              else
+                                const Text(
+                                  '模式读取中',
+                                  style: BloomType.labelStrong,
                                 ),
                               const Spacer(),
                               BloomDeviceSwitch(
                                 key: const ValueKey('bloom-device-switcher'),
                                 deviceName: selected?.name ?? '手机小组件',
                                 label:
-                                    selected?.isFrame == true ? 'E-Ink' : '小组件',
+                                    selected?.isFrame == true
+                                        ? bloomInkDeviceName
+                                        : '小组件',
                                 onTap:
                                     devices.length > 1
                                         ? () => _pickDevice(context)
@@ -1514,6 +1556,8 @@ class _PhotoPage extends StatelessWidget {
                                       ? _RemoteDeviceCard(
                                         deviceName: selected.name,
                                         isFrame: selected.isFrame,
+                                        snapshot: remoteDisplay,
+                                        onRetry: onRetry,
                                       )
                                       : !hasPhoto
                                       ? (loading &&
@@ -1556,7 +1600,11 @@ class _PhotoPage extends StatelessWidget {
                               alignment: Alignment.centerRight,
                               child: Text(
                                 nextSlot,
-                                key: const ValueKey('bloom-next-slot'),
+                                key: ValueKey(
+                                  remoteSelected
+                                      ? 'remote-next-${selected.deviceId}'
+                                      : 'bloom-next-slot',
+                                ),
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: BloomType.meta,
@@ -1731,50 +1779,128 @@ class BloomEmptyFrameIllustration extends StatelessWidget {
   );
 }
 
-/// 已登录时的照片页。功能还没做，所以仍然是"即将上线"。
-
 /// 切换器指向相框时显示的卡片。
 ///
-/// ⚠️ 这里【不是】"登录后就能看"：相框的照片由 `/carousel/plan` 提供，而那个
-/// 接口认的是**相框自己的设备令牌**，本 App 只持有本机令牌。用户会话解不开它 ——
-/// 那需要服务端新增一个用户会话取图的接口，而 F1 刻意没有加（本轮范围只做登录）。
-///
-/// 原来的文案是"登录后可查看此设备的照片（后续版本支持）"。F1 落地后这句话
-/// 依然兑现不了，所以改成实话：**能管理**（设置读写已由服务端的
-/// `devices_share_user` 授权，同一账号下的设备可互操作），**看不到照片**。
-/// 留着一句永远兑现不了的承诺，比不写更糟。
+/// An independent cached preview of this device’s current server-plan item.
 class _RemoteDeviceCard extends StatelessWidget {
-  const _RemoteDeviceCard({required this.deviceName, required this.isFrame});
+  // The frame's portrait screen is 1200×1600: preserve its real proportions.
+  static const aspectRatio = 1200 / 1600;
+  const _RemoteDeviceCard({
+    required this.deviceName,
+    required this.isFrame,
+    this.snapshot,
+    required this.onRetry,
+  });
 
   final String deviceName;
   final bool isFrame;
+  final DevicePlanPreview? snapshot;
+  final VoidCallback onRetry;
 
   @override
-  Widget build(BuildContext context) => Center(
-    child: BloomPanel(
-      lifted: true,
-      padding: const EdgeInsets.all(22),
+  Widget build(BuildContext context) {
+    final screen = snapshot;
+    if (screen == null || screen.loading) {
+      return const _HomePhotoSurface(
+        aspectRatio: aspectRatio,
+        child: _RemotePreviewLoading(),
+      );
+    }
+    if (!screen.offline && screen.imagePath != null) {
+      final image = FileImage(File(screen.imagePath!));
+      return _HomePhotoSurface(
+        aspectRatio: aspectRatio,
+        child: GestureDetector(
+          key: const ValueKey('bloom-remote-screen'),
+          onTap: () => BloomImageViewer.open(context, image, deviceName),
+          child: Image(
+            image: image,
+            key: ValueKey('${screen.deviceId}:${screen.imageKey}'),
+            fit: BoxFit.contain,
+            width: double.infinity,
+            height: double.infinity,
+            gaplessPlayback: false,
+            frameBuilder:
+                (context, child, frame, wasSynchronouslyLoaded) =>
+                    frame != null || wasSynchronouslyLoaded
+                        ? child
+                        : const _RemotePreviewLoading(),
+            errorBuilder:
+                (context, error, stack) => Center(
+                  child: TextButton(
+                    onPressed: onRetry,
+                    child: const Text('照片加载失败，点击重试', style: BloomType.body),
+                  ),
+                ),
+          ),
+        ),
+      );
+    }
+    return Center(
+      child: BloomPanel(
+        lifted: true,
+        padding: const EdgeInsets.all(22),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.devices_rounded,
+              size: 28,
+              color: BloomInk.textMuted,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              screen.offline || screen.status == 'unavailable'
+                  ? '当前照片加载失败，请重试'
+                  : screen.status == 'waiting'
+                  ? '还没到首次展示时间'
+                  : screen.status == 'empty'
+                  ? '相框还没有可展示的照片'
+                  : '正在读取设备画面',
+              textAlign: TextAlign.center,
+              style: BloomType.rowTitle,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              isFrame
+                  ? '这里会显示“$deviceName”当前计划中的照片。'
+                  : '这里会显示“$deviceName”当前计划中的照片。',
+              textAlign: TextAlign.center,
+              style: BloomType.body,
+            ),
+            TextButton(
+              onPressed: onRetry,
+              child: const Text('刷新', style: BloomType.meta),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 当前计划、下载及解码尚未完成时只显示加载提示，避免旧照片占位。
+class _RemotePreviewLoading extends StatelessWidget {
+  const _RemotePreviewLoading();
+
+  @override
+  Widget build(BuildContext context) => const ColoredBox(
+    color: BloomInk.panel,
+    child: Center(
       child: Column(
+        key: ValueKey('bloom-remote-loading'),
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Icon(
-            Icons.devices_rounded,
-            size: 28,
-            color: BloomInk.textMuted,
+          SizedBox(
+            width: 26,
+            height: 26,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: BloomInk.accent,
+            ),
           ),
-          const SizedBox(height: 12),
-          Text(
-            isFrame ? '照片显示在这台相框上' : '照片显示在这台手机的小组件上',
-            textAlign: TextAlign.center,
-            style: BloomType.rowTitle,
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '当前选择的是“$deviceName”。本机首页暂时无法预览它正在显示的照片。'
-            '你可以在设备设置里调整它的刷新节奏与内容来源。',
-            textAlign: TextAlign.center,
-            style: BloomType.body,
-          ),
+          SizedBox(height: 16),
+          Text('正在从设备拉取图片', style: BloomType.rowTitle),
         ],
       ),
     ),
@@ -1806,17 +1932,56 @@ class _RenderedFileImage extends FileImage {
   int get hashCode => Object.hash(file.path, scale, modified);
 }
 
-class _ArtworkLabelPainter extends CustomPainter {
-  const _ArtworkLabelPainter(this.metadata);
-  final Map<String, dynamic> metadata;
+/// Reuse the exhibition frame without its wall, lighting or rounded corners.
+class _HomePhotoSurface extends StatelessWidget {
+  const _HomePhotoSurface({required this.aspectRatio, required this.child});
+  final double aspectRatio;
+  final Widget child;
+
   @override
-  void paint(Canvas canvas, Size size) =>
-      MobileArtworkRenderer.paintLabel(canvas, metadata, size);
+  Widget build(BuildContext context) => AspectRatio(
+    aspectRatio: aspectRatio,
+    child: BloomArtworkFrame(
+      key: const ValueKey('bloom-home-photo-frame'),
+      child: child,
+    ),
+  );
+}
+
+/// The original phone-widget preview: no exhibition frame or inner padding.
+class _WidgetPhotoSurface extends StatelessWidget {
+  const _WidgetPhotoSurface({required this.aspectRatio, required this.child});
+  final double aspectRatio;
+  final Widget child;
+
   @override
-  bool shouldRepaint(_ArtworkLabelPainter oldDelegate) => true;
+  Widget build(BuildContext context) => AspectRatio(
+    aspectRatio: aspectRatio,
+    child: DecoratedBox(
+      key: const ValueKey('bloom-widget-photo-surface'),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(27),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x78000000),
+            blurRadius: 30,
+            spreadRadius: 1,
+            offset: Offset(0, 14),
+          ),
+          BoxShadow(
+            color: Color(0x243E5B54),
+            blurRadius: 26,
+            offset: Offset(0, -3),
+          ),
+        ],
+      ),
+      child: ClipRRect(borderRadius: BorderRadius.circular(27), child: child),
+    ),
+  );
 }
 
 class _LetterPhotoCard extends StatelessWidget {
+  static const aspectRatio = 720 / 1200;
   const _LetterPhotoCard({
     super.key,
     required this.imagePath,
@@ -1832,103 +1997,79 @@ class _LetterPhotoCard extends StatelessWidget {
   final DailyContent? content;
   final String? fallbackDate;
 
-  /// The card's own proportions: a 720x1200 poster.
-  ///
-  /// Exposed so the page can derive the card's width — and from it the header
-  /// row's inset — from the very number the card is laid out with. One source,
-  /// two callers, which is what keeps the two edges aligned.
-  static const aspectRatio = 720 / 1200;
-
   @override
   Widget build(BuildContext context) {
-    final fx = (content?.photo?.focusX ?? .5).clamp(0.0, 1.0);
-    final fy = (content?.photo?.focusY ?? .45).clamp(0.0, 1.0);
-    return AspectRatio(
+    final fx = (content?.sourceName == 'art'
+            ? MobileArtworkRenderer.artworkFocus(content!.artwork, 'x', .5)
+            : content?.photo?.focusX ?? .5)
+        .clamp(0.0, 1.0);
+    final fy = (content?.sourceName == 'art'
+            ? MobileArtworkRenderer.artworkFocus(content!.artwork, 'y', .45)
+            : content?.photo?.focusY ?? .45)
+        .clamp(0.0, 1.0);
+    return _WidgetPhotoSurface(
       aspectRatio: aspectRatio,
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          borderRadius: BorderRadius.circular(27),
-          boxShadow: const [
-            BoxShadow(
-              color: Color(0x78000000),
-              blurRadius: 30,
-              spreadRadius: 1,
-              offset: Offset(0, 14),
+      child: AnimatedSwitcher(
+        // **A cross-fade, not a blink.** The old photo used to be swapped for
+        // the new one in a single frame — and because the new file still had
+        // to be decoded, what the eye caught was a flash of nothing. Letting
+        // the two overlap removes both the blink and the empty frame.
+        duration: const Duration(milliseconds: 480),
+        switchInCurve: Curves.easeOutCubic,
+        switchOutCurve: Curves.easeInCubic,
+        layoutBuilder:
+            (currentChild, previousChildren) => Stack(
+              fit: StackFit.expand,
+              children: [
+                ...previousChildren,
+                if (currentChild != null) currentChild,
+              ],
             ),
-            BoxShadow(
-              color: Color(0x243E5B54),
-              blurRadius: 26,
-              offset: Offset(0, -3),
-            ),
-          ],
-        ),
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(27),
-          child: AnimatedSwitcher(
-            // **A cross-fade, not a blink.** The old photo used to be swapped for
-            // the new one in a single frame — and because the new file still had
-            // to be decoded, what the eye caught was a flash of nothing. Letting
-            // the two overlap removes both the blink and the empty frame.
-            duration: const Duration(milliseconds: 480),
-            switchInCurve: Curves.easeOutCubic,
-            switchOutCurve: Curves.easeInCubic,
-            layoutBuilder:
-                (currentChild, previousChildren) => Stack(
+        // **Keyed by the item, so the fade runs only when the picture really
+        // changes** — a rebuild that re-renders the same item (a sync
+        // landing, the label ticking, the backdrop updating) must not
+        // animate it again. And the *whole* card fades, photo and words
+        // together: the two can never be seen from different items.
+        child:
+            content?.sourceName == 'art'
+                ? Stack(
+                  key: ValueKey('art:${content?.recommendationId}'),
                   fit: StackFit.expand,
                   children: [
-                    ...previousChildren,
-                    if (currentChild != null) currentChild,
+                    Image(
+                      image: _RenderedFileImage(File(imagePath)),
+                      fit: BoxFit.cover,
+                      alignment: Alignment(fx * 2 - 1, fy * 2 - 1),
+                      gaplessPlayback: true,
+                      errorBuilder:
+                          (_, __, ___) => const _LetterPhotoFallback(),
+                    ),
+                    ServerArtworkLabel(metadata: content!.artwork),
+                  ],
+                )
+                : Column(
+                  key: ValueKey(content?.recommendationId ?? imagePath),
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Expanded(
+                      flex: 3,
+                      child: Image.file(
+                        File(imagePath),
+                        fit: BoxFit.cover,
+                        alignment: Alignment(fx * 2 - 1, fy * 2 - 1),
+                        gaplessPlayback: true,
+                        errorBuilder:
+                            (_, __, ___) => const _LetterPhotoFallback(),
+                      ),
+                    ),
+                    Expanded(
+                      child: _LetterPaper(
+                        content: content,
+                        fallbackDate: fallbackDate,
+                      ),
+                    ),
                   ],
                 ),
-            // **Keyed by the item, so the fade runs only when the picture really
-            // changes** — a rebuild that re-renders the same item (a sync
-            // landing, the label ticking, the backdrop updating) must not
-            // animate it again. And the *whole* card fades, photo and words
-            // together: the two can never be seen from different items.
-            child:
-                content?.sourceName == 'art'
-                    ? Stack(
-                      key: ValueKey('art:${content?.recommendationId}'),
-                      fit: StackFit.expand,
-                      children: [
-                        Image(
-                          image: _RenderedFileImage(File(imagePath)),
-                          fit: BoxFit.cover,
-                          alignment: Alignment(fx * 2 - 1, fy * 2 - 1),
-                          gaplessPlayback: true,
-                          errorBuilder:
-                              (_, __, ___) => const _LetterPhotoFallback(),
-                        ),
-                        CustomPaint(
-                          painter: _ArtworkLabelPainter(content!.artwork),
-                        ),
-                      ],
-                    )
-                    : Column(
-                      key: ValueKey(content?.recommendationId ?? imagePath),
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        Expanded(
-                          flex: 3,
-                          child: Image.file(
-                            File(imagePath),
-                            fit: BoxFit.cover,
-                            alignment: Alignment(fx * 2 - 1, fy * 2 - 1),
-                            gaplessPlayback: true,
-                            errorBuilder:
-                                (_, __, ___) => const _LetterPhotoFallback(),
-                          ),
-                        ),
-                        Expanded(
-                          child: _LetterPaper(
-                            content: content,
-                            fallbackDate: fallbackDate,
-                          ),
-                        ),
-                      ],
-                    ),
-          ),
-        ),
       ),
     );
   }
@@ -2204,6 +2345,9 @@ abstract final class BloomInk {
   /// a signal red — it means "asleep", not "broken" — and it never appears
   /// anywhere except next to a device that is off.
   static const offline = Color(0xFFA6604F);
+
+  /// 解除绑定等需要确认的操作，使用红色区分。
+  static const danger = Color(0xFFED9A95);
 
   /// The same green, taken down to a *fill*: a selected tab, a tinted slot. The
   /// accent itself is too light to sit under white text.
@@ -2606,6 +2750,7 @@ class BloomPrimaryButton extends StatelessWidget {
     this.loadingLabel,
     this.loading = false,
     this.onPressed,
+    this.destructive = false,
   });
 
   final String label;
@@ -2616,6 +2761,7 @@ class BloomPrimaryButton extends StatelessWidget {
   final String? loadingLabel;
   final bool loading;
   final VoidCallback? onPressed;
+  final bool destructive;
 
   @override
   Widget build(BuildContext context) {
@@ -2633,7 +2779,7 @@ class BloomPrimaryButton extends StatelessWidget {
           // inconsistency they called out: 保存 was a filled bar while 生成新的
           // 激活码 was a hairline outline, so two actions of the same kind looked
           // like two different kinds of thing.
-          color: BloomInk.accent,
+          color: destructive ? BloomInk.danger : BloomInk.accent,
           borderRadius: corners,
         ),
         child: Material(
@@ -2776,7 +2922,7 @@ class BloomDeviceSwitch extends StatelessWidget {
   final String deviceName;
 
   /// **The word on the control itself**: `小组件` while it points at this phone,
-  /// `E-Ink` while it points at the frame. An icon alone left the reader guessing
+  /// `Bloom-Ink` while it points at the frame. An icon alone left the reader guessing
   /// what the two arrows were switching between.
   final String label;
 

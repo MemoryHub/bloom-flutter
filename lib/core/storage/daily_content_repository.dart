@@ -17,6 +17,7 @@ import '../carousel/photo_store.dart';
 class DailyContentRepository {
   DailyContentRepository({required this.api});
   final BloomApiClient api;
+  static final Map<String, String> _widgetTimelineCursors = {};
 
   Future<Directory> _dir() async {
     String? sharedPath;
@@ -412,8 +413,8 @@ class DailyContentRepository {
   /// are exhausted or the file is unreadable — the caller then simply leaves the
   /// existing behaviour alone rather than guessing a time.
 
-  /// Prints whatever the iOS widget extension recorded about its last timeline
-  /// builds and then clears the file, so it cannot grow without bound.
+  /// Print new timeline diagnostics without deleting the extension's evidence.
+  /// The native writer bounds the file; keep at most two in-memory read cursors.
   ///
   /// The extension cannot be observed from the build machine, which is why every
   /// earlier explanation of "iOS repeats a photo" was a guess; this brings its own
@@ -426,12 +427,22 @@ class DailyContentRepository {
       if (!await file.exists()) return;
       final text = await file.readAsString();
       if (text.trim().isEmpty) return;
-      for (final line in const LineSplitter().convert(text)) {
+      final lines = const LineSplitter().convert(text);
+      final cursor = _widgetTimelineCursors[file.path];
+      final index = cursor == null ? -1 : lines.lastIndexOf(cursor);
+      final start =
+          index >= 0
+              ? index + 1
+              : (lines.length > 100 ? lines.length - 100 : 0);
+      for (final line in lines.skip(start)) {
         if (line.trim().isNotEmpty) {
           debugPrint('[BloomWidget] $line');
         }
       }
-      await file.writeAsString('');
+      if (lines.isNotEmpty) _widgetTimelineCursors[file.path] = lines.last;
+      while (_widgetTimelineCursors.length > 2) {
+        _widgetTimelineCursors.remove(_widgetTimelineCursors.keys.first);
+      }
     } catch (error) {
       debugPrint('[BloomWidget] timeline log unavailable: $error');
     }

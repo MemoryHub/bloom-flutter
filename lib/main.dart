@@ -14,6 +14,8 @@ import 'core/storage/daily_content_repository.dart';
 import 'core/storage/device_identity_repository.dart';
 import 'core/storage/display_preferences.dart';
 import 'core/storage/content_sync_epoch.dart';
+import 'core/storage/device_plan_preview_repository.dart';
+import 'core/storage/photo_time_trace.dart';
 import 'platform/widget_bridge.dart';
 import 'ui/bloom_auth_pages.dart';
 import 'ui/bloom_device_pages.dart';
@@ -128,6 +130,11 @@ class _BloomHomePageState extends State<BloomHomePage>
   late final DisplayPreferences _displayPreferences =
       widget.displayPreferences ?? DisplayPreferences();
   late final AuthRepository _auth = widget.auth ?? AuthRepository();
+  late final DevicePlanPreviewRepository _devicePlanPreviews =
+      DevicePlanPreviewRepository(api: _api);
+  Timer? _displayWatch;
+  Timer? _remotePlanWake;
+  String? _displayRefreshToken;
 
   Timer? _messageTimer;
 
@@ -163,8 +170,7 @@ class _BloomHomePageState extends State<BloomHomePage>
   bool _nextLoading = false;
   int _selectedTab = 0;
 
-  /// Device whose photos the photo page shows. `null` = this phone (the only
-  /// device whose photos the app can load).
+  /// Device whose photos the photo page shows. `null` = this phone; remote devices use an independent server-plan cache.
   String? _photoDeviceId;
   BloomDisplaySettings _displaySettings = const BloomDisplaySettings();
 
@@ -186,6 +192,11 @@ class _BloomHomePageState extends State<BloomHomePage>
   @override
   void initState() {
     super.initState();
+    _displayWatch = Timer.periodic(const Duration(seconds: 60), (_) {
+      if (mounted && _pausedAt == null && _auth.isSignedIn) {
+        unawaited(_refreshDevicePlanPreviews());
+      }
+    });
     _deviceListWatch = Timer.periodic(const Duration(seconds: 30), (_) {
       if (mounted && _pausedAt == null && _selectedTab == 3) {
         unawaited(_loadRemoteDevices());
@@ -381,6 +392,8 @@ class _BloomHomePageState extends State<BloomHomePage>
 
   @override
   void dispose() {
+    _displayWatch?.cancel();
+    _remotePlanWake?.cancel();
     _accountReadyRetry?.cancel();
     _deviceListWatch?.cancel();
     _followNative?.cancel();
@@ -485,6 +498,7 @@ class _BloomHomePageState extends State<BloomHomePage>
       return;
     }
     _loadInFlight = true;
+    PhotoTimeTrace.shared.record(PhotoTimeStage.homeLoadStarted);
     final settingsRevision = _settingsRevision;
     if (showSpinner && mounted) setState(() => _loading = true);
     try {
@@ -952,6 +966,7 @@ class _BloomHomePageState extends State<BloomHomePage>
         _scheduleMessageClear();
       }
     } catch (error) {
+      PhotoTimeTrace.shared.record(PhotoTimeStage.homeLoadFailed);
       if (!mounted || settingsRevision != _settingsRevision) return;
       setState(() {
         _contentError = '暂时无法获取照片，请检查网络后重试。';
@@ -971,6 +986,7 @@ class _BloomHomePageState extends State<BloomHomePage>
           unawaited(_load(showSpinner: false));
         }
       }
+      PhotoTimeTrace.shared.record(PhotoTimeStage.homeLoadFinished);
     }
   }
 
@@ -1173,11 +1189,71 @@ class _BloomHomePageState extends State<BloomHomePage>
         return;
       }
       setState(() => _remoteDevices = devices);
+      unawaited(_refreshDevicePlanPreviews());
     } catch (_) {
       // 保留既有列表。
     } finally {
       if (generation == _devicesRequestGeneration) _devicesLoadingToken = null;
     }
+  }
+
+  Future<void> _refreshDevicePlanPreviews() async {
+    final token = _auth.token;
+    final account = _account;
+    if (token == null || account == null || _displayRefreshToken != null) {
+      return;
+    }
+    _displayRefreshToken = token;
+    final allowed =
+        _devices
+            .where((d) => !d.isLocal && d.canManage && d.isFrame)
+            .map((d) => d.deviceId)
+            .toSet();
+    _devicePlanPreviews.beginRefresh(account.id, allowed);
+    if (mounted) setState(() {});
+    try {
+      await _devicePlanPreviews.restore(account.id, allowed);
+      if (!mounted || _auth.token != token) return;
+      setState(() {});
+      if (allowed.isEmpty) return;
+      await _devicePlanPreviews.refresh(
+        account.id,
+        token,
+        allowed,
+        onChanged: () {
+          if (mounted && _auth.token == token) setState(() {});
+        },
+      );
+    } catch (_) {
+      if (mounted && _auth.token == token) {
+        _devicePlanPreviews.failRefresh(allowed);
+        setState(() {});
+      }
+    } finally {
+      if (_displayRefreshToken == token) {
+        _displayRefreshToken = null;
+        _scheduleRemotePlanWake();
+      }
+    }
+  }
+
+  void _scheduleRemotePlanWake() {
+    _remotePlanWake?.cancel();
+    if (!mounted || _pausedAt != null || !_auth.isSignedIn) return;
+    final now = DateTime.now();
+    final upcoming =
+        _devicePlanPreviews.snapshots.values
+            .map((s) => s.nextCheckAt)
+            .whereType<DateTime>()
+            .where((at) => at.isAfter(now))
+            .toList()
+          ..sort();
+    if (upcoming.isEmpty) return;
+    _remotePlanWake = Timer(upcoming.first.difference(now), () {
+      if (mounted && _pausedAt == null) {
+        unawaited(_refreshDevicePlanPreviews());
+      }
+    });
   }
 
   Future<void> _prepareAccountCache(
@@ -1192,6 +1268,9 @@ class _BloomHomePageState extends State<BloomHomePage>
   }
 
   Future<void> _clearAccountContent() async {
+    _displayRefreshToken = null;
+    _remotePlanWake?.cancel();
+    await _devicePlanPreviews.clear();
     _accountReadyRetry?.cancel();
     _accountRetryAttempt = 0;
     _settingsRevision++;
@@ -1306,7 +1385,7 @@ class _BloomHomePageState extends State<BloomHomePage>
     if (selected != null) {
       for (final device in devices) {
         if (device.deviceId == selected &&
-            (device.isLocal || device.isFrame && device.canManage)) {
+            (device.isLocal || device.canManage)) {
           return device;
         }
       }
@@ -1395,6 +1474,9 @@ class _BloomHomePageState extends State<BloomHomePage>
       onWidgetEnabledChanged:
           (enabled) => setState(() => _widgetEnabled = enabled),
     );
+    if (!device.isLocal && mounted && _auth.token == accountToken) {
+      unawaited(_refreshDevicePlanPreviews());
+    }
   }
 
   /// [_displaySettings] models **this phone's** own record: the photo page uses
@@ -1640,8 +1722,13 @@ class _BloomHomePageState extends State<BloomHomePage>
     onWidgetEnabledChanged:
         (enabled) => setState(() => _widgetEnabled = enabled),
     selectedDeviceId: _photoDevice?.deviceId,
+    remotePlanPreviews: Map.unmodifiable(_devicePlanPreviews.snapshots),
     onTabChanged: _changeTab,
     onRefresh: () async {
+      if (_photoDevice?.isLocal == false) {
+        await _refreshDevicePlanPreviews();
+        return;
+      }
       _accountRetryAttempt = 0;
       await _load();
     },

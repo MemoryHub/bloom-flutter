@@ -1,3 +1,6 @@
+/// 相框在所有 App 界面的统一名称；设备 ID 和服务端类型仍保留原值。
+const bloomInkDeviceName = 'Bloom-Ink';
+
 class DeviceCredentials {
   const DeviceCredentials({required this.deviceId, required this.deviceToken});
 

@@ -364,6 +364,29 @@ class BloomApiClient {
     return DeviceCarouselSettingsEnvelope.fromJson(_json(response));
   }
 
+  /// Read a managed device's own settings with the account session.
+  /// Remote previews must not use the phone's token or its settings mirror.
+  Future<DeviceCarouselSettingsEnvelope> getUserDeviceSettings(
+    String userToken,
+    String deviceId, {
+    required String target,
+  }) async {
+    final response = await _client
+        .post(
+          _uri(
+            '/api/frame/devices/${Uri.encodeComponent(deviceId)}/carousel/settings/get',
+          ),
+          headers: {
+            ..._userHeaders(userToken),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({'target': target}),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return DeviceCarouselSettingsEnvelope.fromJson(_json(response));
+  }
+
   /// Writes the carousel settings the server stores for [target].
   ///
   /// [callerDeviceId] must be the device id that owns [credentials]: the app
@@ -550,6 +573,25 @@ class BloomApiClient {
     final response = await _client
         .get(
           _uri('/api/frame/users/me/photos/$assetId/thumbnail'),
+          headers: _userHeaders(token),
+        )
+        .timeout(_photoRequestTimeout);
+    _ensure(response, 200);
+    return response.bodyBytes;
+  }
+
+  Future<Uint8List> devicePlanPreviewImage(
+    String token,
+    String deviceId,
+    int itemId,
+    String version,
+  ) async {
+    final response = await _client
+        .get(
+          _uri(
+            '/api/frame/users/me/devices/${Uri.encodeComponent(deviceId)}/plan-preview/image',
+            {'item_id': itemId.toString(), 'version': version},
+          ),
           headers: _userHeaders(token),
         )
         .timeout(_photoRequestTimeout);

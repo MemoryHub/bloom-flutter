@@ -182,6 +182,7 @@ void main() {
     ValueChanged<BloomDisplaySettings>? onModeChanged,
     ValueChanged<BloomDisplaySettings>? onSaved,
     Future<void> Function(BloomDisplaySettings settings)? onMirrored,
+    Future<void> Function()? onUnbind,
   }) => MaterialApp(
     home: BloomDeviceDetailPage(
       device: device,
@@ -192,6 +193,7 @@ void main() {
       onModeChanged: onModeChanged,
       onSaved: onSaved,
       onMirrored: onMirrored,
+      onUnbind: onUnbind,
     ),
   );
 
@@ -199,6 +201,124 @@ void main() {
     credentials: credentials,
     localOnline: true,
   ).firstWhere((device) => device.isLocal);
+
+  group('设备详情导航与底部安全区', () {
+    test('旧相框名统一显示，设备 ID/类型与手机名称保留', () {
+      for (final oldName in ['bloom-ink', 'e-ink', 'E-Ink', '客厅相框']) {
+        final device = BloomDevice(
+          deviceId: 'frame-original',
+          name: oldName,
+          type: 'eink',
+        );
+        expect(device.name, bloomInkDeviceName);
+        expect(device.typeLabel, bloomInkDeviceName);
+        expect(device.deviceId, 'frame-original');
+        expect(device.settingsTarget, 'eink');
+        final remote =
+            bloomDevicesFromRemote([
+              UserDevice(
+                deviceId: 'frame-original',
+                name: oldName,
+                deviceType: 'eink',
+                enabled: true,
+              ),
+            ]).single;
+        expect(remote.name, bloomInkDeviceName);
+      }
+      expect(
+        const BloomDevice(
+          deviceId: 'phone',
+          name: '家人的手机',
+          type: 'mobile',
+        ).name,
+        '家人的手机',
+      );
+    });
+
+    for (final isFrame in [true, false]) {
+      testWidgets('${isFrame ? '相框' : '小组件'}窄屏：导航不重叠、末尾内容完整高于保存', (
+        tester,
+      ) async {
+        tester.view.physicalSize = const Size(320, 700);
+        tester.view.devicePixelRatio = 1;
+        tester.view.padding = FakeViewPadding(top: 44, bottom: 34);
+        addTearDown(tester.view.reset);
+        SharedPreferences.setMockInitialValues(mirror);
+        final requests = <http.Request>[];
+        final prefs = DisplayPreferences(
+          api: BloomApiClient(client: settingsServer(requests: requests)),
+        );
+        var unbinds = 0;
+        final device = isFrame ? bloomBundledFrame : localDevice();
+        await tester.pumpWidget(
+          detail(
+            credentials: credentials,
+            preferences: prefs,
+            device: device,
+            onUnbind: () async {
+              unbinds++;
+            },
+          ),
+        );
+        await settle(tester);
+        final title = find.descendant(
+          of: find.byType(AppBar),
+          matching: find.text(isFrame ? bloomInkDeviceName : '小组件'),
+        );
+        final titleRect = tester.getRect(title);
+        final modeRect = tester.getRect(
+          find.byKey(const ValueKey('bloom-mode-carousel')),
+        );
+        expect(titleRect.bottom, lessThan(modeRect.top));
+        final save = find.byKey(const ValueKey('bloom-device-save'));
+        expect(tester.widget<BloomPrimaryButton>(save).loading, isFalse);
+        expect(tester.getRect(save).bottom, lessThanOrEqualTo(666));
+        final last =
+            isFrame
+                ? find.byKey(const ValueKey('bloom-device-unbind'))
+                : find.text(device.deviceId);
+        await tester.scrollUntilVisible(
+          last,
+          240,
+          scrollable: find.byType(Scrollable).first,
+        );
+        await tester.drag(find.byType(ListView).first, const Offset(0, -600));
+        await settle(tester);
+        expect(tester.getRect(last).bottom, lessThan(tester.getRect(save).top));
+        expect(tester.takeException(), isNull);
+        if (isFrame) {
+          final button = tester.widget<OutlinedButton>(last);
+          expect(button.style!.foregroundColor!.resolve({}), BloomInk.danger);
+          await tester.tap(last);
+          await settle(tester);
+          expect(find.text('解除相框绑定？'), findsOneWidget);
+          expect(unbinds, 0, reason: '打开提醒不解除绑定');
+          final confirm = tester.widget<BloomPrimaryButton>(
+            find.descendant(
+              of: find.byType(Dialog),
+              matching: find.byType(BloomPrimaryButton),
+            ),
+          );
+          expect(confirm.destructive, isTrue);
+          await tester.tap(find.text('取消'));
+          await settle(tester);
+          expect(unbinds, 0);
+          expect(find.byType(Dialog), findsNothing);
+          await tester.tap(last);
+          await settle(tester);
+          await tester.tap(
+            find.descendant(
+              of: find.byType(Dialog),
+              matching: find.text('解除绑定'),
+            ),
+          );
+          await settle(tester);
+          expect(unbinds, 1, reason: '仅确认后执行一次解绑回调');
+        }
+        await tester.pumpWidget(const SizedBox.shrink());
+      });
+    }
+  });
 
   group('登录后的设备列表（F1）', () {
     UserDevice remote({
@@ -301,7 +421,7 @@ void main() {
         remote(id: 'frame-x'),
         remote(id: 'phone-y', type: 'mobile'),
       ]);
-      expect(devices[0].name, 'E-Ink');
+      expect(devices[0].name, 'Bloom-Ink');
       expect(devices[1].name, '手机小组件');
     });
   });
@@ -355,7 +475,7 @@ void main() {
       // The tile carries the type and the state on its small top line, with the
       // name large at the bottom — the reference layout. So both are asserted,
       // and each on exactly one tile.
-      expect(find.text('E-Ink'), findsOneWidget);
+      expect(find.text('Bloom-Ink'), findsOneWidget);
       // type == name now, so the meta line is just the absent live state
       expect(find.text('离线'), findsOneWidget);
       // 引用常量而不是字面量：这个断言的意图是「兜底相框出现在列表里」，
@@ -365,7 +485,7 @@ void main() {
         isTrue,
       );
 
-      await tester.tap(find.text('E-Ink'));
+      await tester.tap(find.text('Bloom-Ink'));
       await settle(tester);
 
       // The detail page is on screen, led by its one raised sheet.
@@ -399,13 +519,13 @@ void main() {
       );
 
       final meta = tester.getRect(find.text('离线'));
-      final name = tester.getRect(find.text('E-Ink'));
+      final name = tester.getRect(find.text('Bloom-Ink'));
       expect(
         meta.bottom,
         lessThanOrEqualTo(name.top),
         reason: '说明行必须在名字上方，而不是并排',
       );
-      final style = tester.widget<Text>(find.text('E-Ink')).style!;
+      final style = tester.widget<Text>(find.text('Bloom-Ink')).style!;
       expect(
         style.fontSize,
         greaterThanOrEqualTo(18),
@@ -1409,6 +1529,9 @@ void main() {
       SharedPreferences.setMockInitialValues(<String, Object>{
         'bloom.device_id': credentials.deviceId,
         'bloom.identity_version': 2,
+        // 当前登录流程只接受已由服务端下发的设备令牌。
+        'bloom.device_token_issued': true,
+        'bloom.photo_account_owner': 'acc-test',
         ...mirror,
       });
       final requests = <http.Request>[];
@@ -1438,6 +1561,7 @@ void main() {
             identity: DeviceIdentityRepository(
               readToken: (_) async => credentials.deviceToken,
               writeToken: (_, _) async {},
+              mirrorToWidget: (_, _) async {},
             ),
             api: client,
             displayPreferences: DisplayPreferences(api: client),
@@ -1447,7 +1571,13 @@ void main() {
           ),
         ),
       );
-      await settle(tester);
+      // 启动读取真实文件缓存，释放实际 I/O 后推进桥接的有界等待。
+      for (var i = 0; i < 3; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)),
+        );
+        await settle(tester);
+      }
 
       // `_load()` really ran: the device status call proves it.
       expect(
@@ -1486,6 +1616,9 @@ void main() {
       SharedPreferences.setMockInitialValues(<String, Object>{
         'bloom.device_id': credentials.deviceId,
         'bloom.identity_version': 2,
+        // 当前登录流程只接受已由服务端下发的设备令牌。
+        'bloom.device_token_issued': true,
+        'bloom.photo_account_owner': 'acc-test',
         'bloom.display_mode': 'recommend', // stale
         'bloom.carousel_interval_minutes': 1440,
         'bloom.carousel_active_start': '06:00',
@@ -1518,6 +1651,7 @@ void main() {
             identity: DeviceIdentityRepository(
               readToken: (_) async => credentials.deviceToken,
               writeToken: (_, _) async {},
+              mirrorToWidget: (_, _) async {},
             ),
             api: client,
             displayPreferences: DisplayPreferences(api: client),
@@ -1527,7 +1661,13 @@ void main() {
           ),
         ),
       );
-      await settle(tester);
+      // 启动读取真实文件缓存，释放实际 I/O 后推进桥接的有界等待。
+      for (var i = 0; i < 3; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)),
+        );
+        await settle(tester);
+      }
 
       // The mirror was pulled onto the server's value, so the home-screen widget
       // — which reads that same mirror — follows too.
@@ -1553,17 +1693,14 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     });
 
-    testWidgets('⭐ 推荐模式冷启动也有「下次更新」（它不在计划戳里，按固定作息算）', (tester) async {
-      // `next_slot_at_ms` 是**轮播**的概念（引擎把计划落盘时写进 daily.json），
-      // 推荐路径从不写它。而首页原来只读那个字段 —— 于是推荐模式下这一行永远
-      // 是空的，只有"保存过一次设置"之后才出现（那条路会把固定作息算出来的值
-      // 塞进 `_nextSlotAt`）。冷启动和保存后必须走同一个来源。
-      //
-      // 这条用例刻意用 `has_assets: false`：那行文案讲的是**作息**，不是照片，
-      // 所以它必须在任何同步之前就算出来 —— 也让这条测试完全不碰下载与渲染。
+    testWidgets('推荐模式冷启动：服务端确认无素材时隐藏下次更新承诺', (tester) async {
+      // 当前无素材状态不承诺更新照片；作息设置保持推荐，不改成轮播。
       SharedPreferences.setMockInitialValues(<String, Object>{
         'bloom.device_id': credentials.deviceId,
         'bloom.identity_version': 2,
+        // 当前登录流程只接受已由服务端下发的设备令牌。
+        'bloom.device_token_issued': true,
+        'bloom.photo_account_owner': 'acc-test',
         'bloom.display_mode': 'recommend',
         'bloom.carousel_interval_minutes': 720,
         'bloom.carousel_active_start': '06:00',
@@ -1597,6 +1734,7 @@ void main() {
             identity: DeviceIdentityRepository(
               readToken: (_) async => credentials.deviceToken,
               writeToken: (_, _) async {},
+              mirrorToWidget: (_, _) async {},
             ),
             api: client,
             displayPreferences: DisplayPreferences(api: client),
@@ -1606,13 +1744,21 @@ void main() {
           ),
         ),
       );
-      // `settle` 推进 720ms 假时钟，够 `_paintLocalContent` 那 600ms 有界等待超时
-      // （测试里没有平台通道，它必然超时；真机上它在毫秒级就返回）。
-      await settle(tester);
+      // 启动读取真实文件缓存，释放实际 I/O 后推进桥接的有界等待。
+      for (var i = 0; i < 3; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)),
+        );
+        await settle(tester);
+      }
 
       final label = find.byKey(const ValueKey('bloom-next-slot'));
-      expect(label, findsOneWidget, reason: '推荐的节奏由固定作息唯一决定，冷启动就该有这一行');
-      expect(tester.widget<Text>(label).data ?? '', startsWith('下次更新 '));
+      expect(requests.any((r) => r.url.path.endsWith('/status')), isTrue);
+      expect(label, findsNothing, reason: '无素材时不能承诺下次更新照片');
+      expect(
+        (await SharedPreferences.getInstance()).getString('bloom.display_mode'),
+        'recommend',
+      );
 
       await tester.pumpWidget(const SizedBox());
     });
@@ -1675,13 +1821,8 @@ void main() {
       await settle(tester);
 
       expect(selectedId, frame.deviceId);
-      // 切到相框时不能假装它的照片取得到。
-      //
-      // ⚠️ 这里原先断言的是"登录后可查看此设备的照片"。那句话在 F1 落地后
-      // **依然兑现不了**：相框的照片由 `/carousel/plan` 提供，而它认的是相框
-      // 自己的设备令牌，用户会话解不开（服务端也没有对应的用户会话取图接口）。
-      // 所以文案改成了实话，这条断言跟着改 —— 它守的是"不许承诺做不到的事"。
-      expect(find.text('照片显示在这台相框上'), findsOneWidget);
+      // No confirmed cache yet: never show this phone's picture as the frame.
+      expect(find.text('正在从设备拉取图片'), findsOneWidget);
       expect(find.text('登录后可查看此设备的照片'), findsNothing);
 
       await tester.tap(find.byKey(const ValueKey('bloom-device-switcher')));

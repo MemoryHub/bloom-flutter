@@ -445,7 +445,22 @@ struct BloomProvider: TimelineProvider {
     // The ready shared timeline is always returned during this provider pass.
     BloomWidgetSync.shared.refill()
     let (entries, next) = BloomWidgetRemoteLoader.timeline(family: family)
+    logSubmittedTimeline(entries, next: next)
     completion(Timeline(entries: entries, policy: .after(next)))
+  }
+
+  private func logSubmittedTimeline(_ entries: [BloomEntry], next: Date) {
+    guard let root = BloomSharedState.cacheDirectory() else { return }
+    let file = root.appendingPathComponent("widget-provider.log")
+    if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 64 * 1024 {
+      try? FileManager.default.removeItem(at: file)
+    }
+    let formatter = ISO8601DateFormatter()
+    let items = entries.map { "\($0.itemID ?? 0)@\(formatter.string(from: $0.date))" }.joined(separator: ",")
+    let line = "\(formatter.string(from: Date())) timeline submitted family=\(family) items=[\(items)] refill=\(formatter.string(from: next))\n"
+    if let handle = try? FileHandle(forWritingTo: file) {
+      handle.seekToEndOfFile(); handle.write(Data(line.utf8)); try? handle.close()
+    } else { try? Data(line.utf8).write(to: file, options: .completeFileProtectionUntilFirstUserAuthentication) }
   }
 }
 

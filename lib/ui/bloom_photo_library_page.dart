@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import '../core/api/bloom_api_client.dart';
+import '../core/storage/photo_time_trace.dart';
 import 'bloom_glass_home.dart';
 import 'bloom_sign_in_prompt.dart';
 import 'bloom_photo_detail_page.dart';
@@ -216,26 +217,50 @@ class _BloomPhotoLibraryPageState extends State<BloomPhotoLibraryPage> {
             ),
       ),
     );
+    PhotoTimeTrace.shared.record(PhotoTimeStage.libraryReturned);
     if (!mounted || token != widget.token) return;
     if (result?['deleted'] == true) {
-      await widget.onChanged?.call();
+      await _notifyContentChanged(token);
+      if (!mounted || token != widget.token) return;
       await _refresh();
     } else {
+      Map<String, dynamic> detail;
       try {
-        final detail = await widget.api.userRequest(
-          token,
-          'photos/${photo['id']}',
-        );
+        detail = await widget.api.userRequest(token, 'photos/${photo['id']}');
+      } catch (_) {
+        // Keep the successful thumbnail when offline.
+        await _notifyContentChanged(token);
+        return;
+      }
+      if (!mounted || token != widget.token) return;
+      if (detail['photo']['taken_at'] != photo['taken_at']) {
+        // A changed date moves the photo to a different heading/month and
+        // invalidates page offsets. Also covers iOS interactive-back returns.
+        PhotoTimeTrace.shared.record(PhotoTimeStage.libraryIndexStarted);
+        await _refresh();
+        PhotoTimeTrace.shared.record(PhotoTimeStage.libraryIndexFinished);
         if (!mounted || token != widget.token) return;
+      } else {
         setState(
           () =>
               photo['scores'] =
                   detail['photo']['analysis']?['scores'] ?? photo['scores'],
         );
-      } catch (_) {
-        /* Keep the successful thumbnail when offline. */
       }
+      await _notifyContentChanged(token);
+    }
+  }
+
+  Future<void> _notifyContentChanged(String token) async {
+    if (!mounted || token != widget.token) return;
+    PhotoTimeTrace.shared.record(PhotoTimeStage.contentRefreshStarted);
+    try {
       await widget.onChanged?.call();
+      PhotoTimeTrace.shared.record(PhotoTimeStage.contentRefreshFinished);
+    } catch (_) {
+      // Saving already succeeded. A separate background refresh failure must
+      // not escape the tap callback or retry the entire refresh a second time.
+      PhotoTimeTrace.shared.record(PhotoTimeStage.contentRefreshFailed);
     }
   }
 

@@ -15,7 +15,10 @@ final class BloomWidgetSync: NSObject, URLSessionDownloadDelegate {
     private var storedSession: URLSession?
     private var eventsCompletions: [() -> Void] = []
     private let eventsLock = NSLock()
-    private var changed = false
+    // Main-queue coalescing only; a slow future download must never hold the
+    // notification for an already committed current/future entry.
+    private var reloadWork: DispatchWorkItem?
+    private static let reloadStampKey = "bloom.widgetRefillRequestedContent.v2"
 
     private var session: URLSession {
         sessionLock.lock(); defer { sessionLock.unlock() }
@@ -245,7 +248,6 @@ final class BloomWidgetSync: NSObject, URLSessionDownloadDelegate {
                 queue(job, path: devicePath(device, "carousel/prepare"), token: token, body: ["item_id": id])
             }
         }
-        eventsLock.lock(); changed = true; eventsLock.unlock()
         coalesceTasks(directory: directory, defaults: defaults)
         log("refill plan=\(planID) candidates=\(candidates.count)")
     }
@@ -298,7 +300,6 @@ final class BloomWidgetSync: NSObject, URLSessionDownloadDelegate {
                 guard let payload = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw SyncError.json }
                 let file = directory.appendingPathComponent("widget-refill-\(UUID().uuidString).metadata")
                 try BloomSharedState.writeJSON(["job": job, "payload": payload], to: file)
-                eventsLock.lock(); changed = true; eventsLock.unlock()
                 let lease = BloomSharedFileLock(directory.appendingPathComponent("carousel-sync.lock"))
                 if lease.acquire() {
                     defer { lease.release() }
@@ -320,25 +321,16 @@ final class BloomWidgetSync: NSObject, URLSessionDownloadDelegate {
                 defer { lease.release() }
                 consumeStaged(directory: directory, defaults: defaults, lease: lease)
             }
-            // Coalesce a batch into one reload at session completion. Staged
-            // bytes remain recoverable if Flutter currently holds the lease.
-            eventsLock.lock(); changed = true; eventsLock.unlock()
+            // Staging alone is not visible content. Publication schedules the
+            // reload; bytes blocked by Flutter's lease remain recoverable.
         } catch { try? FileManager.default.removeItem(at: file); log("stage failed \(error.localizedDescription)") }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let error { log("download failed \(error.localizedDescription); shared photo retained") }
-        // Also completes a batch delivered while the extension is already
-        // alive, without depending on a separate background wake-up event.
-        session.getAllTasks { tasks in
-            guard !tasks.contains(where: { $0.state == .running || $0.state == .suspended }) else { return }
-            DispatchQueue.main.async {
-                self.eventsLock.lock()
-                let shouldReload = self.changed; self.changed = false
-                self.eventsLock.unlock()
-                if shouldReload { WidgetCenter.shared.reloadAllTimelines() }
-            }
-        }
+        // Do not gate a published image on ALL tasks in this persistent
+        // session. Other tasks may be downloading later slots for minutes.
+        scheduleTimelineReload(reason: "task-complete")
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
@@ -346,12 +338,45 @@ final class BloomWidgetSync: NSObject, URLSessionDownloadDelegate {
         let completions = eventsCompletions; eventsCompletions.removeAll()
         eventsLock.unlock()
         DispatchQueue.main.async {
-            self.eventsLock.lock()
-            let shouldReload = self.changed; self.changed = false
-            self.eventsLock.unlock()
-            if shouldReload { WidgetCenter.shared.reloadAllTimelines() }
+            self.reloadWork?.cancel(); self.reloadWork = nil
+            self.reloadTimelineIfNeeded(reason: "background-events-finished")
             completions.forEach { $0() }
         }
+    }
+
+    private func scheduleTimelineReload(reason: String) {
+        DispatchQueue.main.async {
+            guard self.reloadWork == nil else { return }
+            let work = DispatchWorkItem {
+                self.reloadWork = nil
+                self.reloadTimelineIfNeeded(reason: reason)
+            }
+            self.reloadWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
+        }
+    }
+
+    private func reloadTimelineIfNeeded(reason: String) {
+        guard let defaults = UserDefaults(suiteName: BloomSharedState.appGroup),
+              !defaults.bool(forKey: "bloom.signed_out"),
+              let state = BloomSharedState.load(),
+              !BloomSharedState.timelineEntries(state).isEmpty,
+              let content = BloomSharedState.reloadContent(
+                state, mode: defaults.string(forKey: "bloom.display_mode") ?? "recommend",
+                rendererVersion: BloomWidgetRenderer.version
+              ) else { return }
+        let stamp = SHA256.hash(data: content).map { String(format: "%02x", $0) }.joined()
+        guard defaults.string(forKey: Self.reloadStampKey) != stamp else { return }
+        // Persist only a request fingerprint, never call it an onscreen ACK.
+        // A new extension process also detects a committed but unnotified state.
+        WidgetCenter.shared.reloadAllTimelines()
+        defaults.set(stamp, forKey: Self.reloadStampKey)
+        defaults.synchronize()
+        let now = Date().timeIntervalSince1970 * 1000
+        let entries = BloomSharedState.timelineEntries(state)
+        let due = BloomCarouselRule.currentEntry(entries, nowMillis: now)
+        let currentID = (due?["item_id"] as? NSNumber)?.intValue ?? 0
+        log("reload requested reason=\(reason) plan=\(BloomSharedState.planId(state)) current=\(currentID) entries=\(entries.count) signature=\(stamp.prefix(12))")
     }
 
     private func consumeStaged(directory: URL, defaults: UserDefaults, lease: BloomSharedFileLock, budget: TimeInterval = 12) {
@@ -425,7 +450,6 @@ final class BloomWidgetSync: NSObject, URLSessionDownloadDelegate {
                         let merged = BloomSharedState.merging(state, plan: job["plan"] as? [String: Any] ?? [:], grid: grid, ready: [entry], nowMillis: Date().timeIntervalSince1970 * 1000, serverNext: (job["server_next"] as? NSNumber)?.doubleValue)
                         try publish(merged, directory: directory)
                     }
-                    eventsLock.lock(); changed = true; eventsLock.unlock()
                     log("committed item=\(id) pipeline=carousel")
                     discard = true
                 } catch { log("publication failed item=\(id) \(error.localizedDescription)") }
@@ -456,6 +480,7 @@ final class BloomWidgetSync: NSObject, URLSessionDownloadDelegate {
             for key in ["date", "caption_zh", "caption_en", "captured_date_text", "location_text", "source_name", "content_snapshot", "photo_metadata"] { projection[key] = due[key] ?? NSNull() }
         }
         try BloomSharedState.writeJSON(projection, to: directory.appendingPathComponent("daily.json"))
+        scheduleTimelineReload(reason: "published")
     }
 
     private func timelineEntry(_ item: [String: Any], directory: URL) -> [String: Any] {

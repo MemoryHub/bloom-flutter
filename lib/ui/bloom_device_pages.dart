@@ -15,20 +15,22 @@ import 'bloom_keep_alive_card.dart';
 import 'bloom_sign_in_prompt.dart';
 import 'bloom_discover_page.dart';
 import 'bloom_device_sharing_page.dart';
+import 'bloom_confirmation_dialog.dart';
 
 /// 已确认归属的设备在界面中的展示记录。
 class BloomDevice {
   const BloomDevice({
     required this.deviceId,
-    required this.name,
+    required String name,
     required this.type,
     this.isLocal = false,
     this.isOnline,
     this.canManage = true,
-  });
+  }) : _name = name;
 
   final String deviceId;
-  final String name;
+  final String _name;
+  String get name => isFrame ? bloomInkDeviceName : _name;
 
   /// Either `eink` (the frame) or `mobile` (this phone's home-screen widget).
   final String type;
@@ -48,9 +50,7 @@ class BloomDevice {
   /// app bar): `type · state`, or just the state when the device's name already
   /// *is* its type.
   ///
-  /// The whole product calls the frame `e-ink` and the phone's widget 手机小组件,
-  /// so the name and the type now coincide and the pair would read "e-ink · —"
-  /// over "e-ink". One place computes the line, and both surfaces use it.
+  /// 相框名称和类型统一为 Bloom-Ink，避免重复显示类型。
   String get metaLabel =>
       typeLabel == name ? presenceLabel : '$typeLabel · $presenceLabel';
 
@@ -58,7 +58,7 @@ class BloomDevice {
   String get presenceLabel =>
       isOnline == null ? '离线' : (isOnline! ? '在线' : '离线');
 
-  String get typeLabel => isFrame ? 'E-Ink' : '手机小组件';
+  String get typeLabel => isFrame ? bloomInkDeviceName : '手机小组件';
 
   /// Server settings record this device reads and writes: the frame owns the
   /// `eink` record, the phone's widget owns the `mobile` one.
@@ -82,7 +82,7 @@ class BloomDevice {
 /// 让设备列表全部来自服务端（F1 已经做到），并给未登录态一个空状态。
 const bloomBundledFrame = BloomDevice(
   deviceId: 'bloom-eink-94a990f4e394-b',
-  name: 'E-Ink',
+  name: bloomInkDeviceName,
   type: BloomApiClient.settingsTargetEink,
 );
 
@@ -119,7 +119,7 @@ List<BloomDevice> bloomDevicesFromRemote(
         name:
             (device.name?.trim().isNotEmpty ?? false)
                 ? device.name!.trim()
-                : (device.isFrame ? 'E-Ink' : '手机小组件'),
+                : (device.isFrame ? bloomInkDeviceName : '手机小组件'),
         type: device.deviceType,
         canManage: device.canManage,
         isLocal: isLocal,
@@ -1433,36 +1433,37 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
 
   @override
   Widget build(BuildContext context) {
-    // The frame's mode is a server read-out (its firmware ignores it), so it
-    // shows what the server holds; the phone's is the live edit.
     final carousel =
         (widget.device.isFrame ? _displayMode : _draft.mode) ==
         BloomDisplayMode.carousel;
-    final topInset = MediaQuery.paddingOf(context).top;
-    // The floating bar is 56 tall and 6 below the status bar; the body has to
-    // start under it.
-    final barHeight = topInset + 68.0;
-    // The floating save belongs to the forms on this page, and those differ by mode:
-    // 轮播 has the cadence form, 推荐 has none — but **both** have the「照片来源」
-    // card, which is a form too. Gating this on `carousel` alone is what made 来源
-    // impossible to save in 推荐：点一下只改草稿，而页面上根本没有提交它的按钮。
-    //
-    // 推荐模式下没动过任何东西时仍然不显示按钮（那才是"一个什么都不做的按钮"）；
-    // 碰过来源它就会出现。它也随总开关一起消失。
+    // 推荐模式只在来源草稿有修改时显示保存；模式切换仍立即提交。
     final showSave = _widgetEnabled && (carousel || _sourcesTouched);
     final toast = _toast;
     return Scaffold(
-      // The bar is glass, so the content has to run *under* it: that is what the
-      // lens has to refract, and it is why this is not a solid AppBar any more.
-      extendBodyBehindAppBar: true,
-      backgroundColor: BloomGlassHome.backgroundColor,
-      appBar: PreferredSize(
-        preferredSize: Size.fromHeight(barHeight),
-        child: Padding(
-          padding: EdgeInsets.fromLTRB(12, topInset + 6, 12, 0),
-          child: SizedBox(height: 56, child: _topBar(carousel)),
-        ),
-      ),
+      backgroundColor: BloomInk.page,
+      appBar: _topBar(carousel),
+      bottomNavigationBar:
+          showSave
+              ? ColoredBox(
+                color: BloomInk.page,
+                child: SafeArea(
+                  top: false,
+                  minimum: const EdgeInsets.fromLTRB(
+                    BloomSurface.pageInset,
+                    12,
+                    BloomSurface.pageInset,
+                    20,
+                  ),
+                  child: BloomPrimaryButton(
+                    key: const ValueKey('bloom-device-save'),
+                    label: '保存',
+                    loadingLabel: '正在保存…',
+                    loading: _saving,
+                    onPressed: _saving ? null : _save,
+                  ),
+                ),
+              )
+              : null,
       body: BloomPhotoBackdrop(
         imagePath: widget.photoPath,
         revision: 0,
@@ -1472,19 +1473,15 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
               physics: const BouncingScrollPhysics(),
               padding: EdgeInsets.fromLTRB(
                 BloomSurface.pageInset,
-                barHeight + 8,
+                16,
                 BloomSurface.pageInset,
-                showSave ? 108 : 40,
+                MediaQuery.paddingOf(context).bottom + 64,
               ),
               children: [
                 if (!_widgetEnabled)
                   _OffCard(onEnable: () => _setWidgetEnabled(true))
                 else ...[
-                  // No section headings and no descriptions anywhere on this
-                  // page: the mode is the switch in the bar, and the rest is a
-                  // form. The user deleted every line of explanation here
-                  // ("这些文字完全不要了"), so what is left is only what can be
-                  // changed or read.
+                  // 模式在导航栏下独立显示，内容区域只保留设置和必要说明。
                   if (carousel) _cadenceCard() else _RecommendationCard(),
                   if (widget.device.isFrame && _orientationMode != null)
                     BloomPanel(
@@ -1565,73 +1562,31 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
                 ],
                 const SizedBox(height: 28),
                 _deviceInfo(),
-                if (widget.device.isFrame && widget.onUnbind != null)
-                  TextButton(
-                    onPressed:
-                        _saving
-                            ? null
-                            : () async {
-                              final yes = await showDialog<bool>(
-                                context: context,
-                                builder:
-                                    (context) => AlertDialog(
-                                      title: const Text('解除相框绑定？'),
-                                      content: const Text(
-                                        '相框将从你的设备中移除，照片原文件保留。重新使用时需要配对。',
-                                      ),
-                                      actions: [
-                                        TextButton(
-                                          onPressed:
-                                              () =>
-                                                  Navigator.pop(context, false),
-                                          child: const Text('取消'),
-                                        ),
-                                        FilledButton(
-                                          onPressed:
-                                              () =>
-                                                  Navigator.pop(context, true),
-                                          child: const Text('解除绑定'),
-                                        ),
-                                      ],
-                                    ),
-                              );
-                              if (yes != true) return;
-                              setState(() => _saving = true);
-                              try {
-                                await widget.onUnbind!();
-                                if (context.mounted) Navigator.pop(context);
-                              } catch (_) {
-                                if (mounted) {
-                                  _showToast('解除绑定未完成，请稍后重试', isError: true);
-                                }
-                              } finally {
-                                if (mounted) setState(() => _saving = false);
-                              }
-                            },
+                if (widget.device.isFrame && widget.onUnbind != null) ...[
+                  const SizedBox(height: 24),
+                  OutlinedButton(
+                    key: const ValueKey('bloom-device-unbind'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: BloomInk.danger,
+                      side: const BorderSide(color: BloomInk.danger),
+                      minimumSize: const Size.fromHeight(52),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(
+                          BloomSurface.controlRadius,
+                        ),
+                      ),
+                      textStyle: BloomType.button,
+                    ),
+                    onPressed: _saving ? null : _unbind,
                     child: const Text('解除绑定'),
                   ),
+                ],
               ],
             ),
-            if (showSave)
-              Positioned(
-                left: BloomSurface.pageInset,
-                right: BloomSurface.pageInset,
-                bottom: 78,
-                child: _GlassAction(
-                  label: '保存',
-                  loadingLabel: '正在保存…',
-                  loading: _saving,
-                  onPressed: _saving ? null : _save,
-                ),
-              ),
-            // **Lower-middle, not the top.** The message used to sit just under
-            // the bar — a spot chosen to clear the Xiaomi 14's punch-hole camera
-            // — and the user read it as "弹窗还在上面" no matter what I did to the
-            // option sheets. It now floats above the action, in the half of the
-            // screen a thumb and an eye are already in.
+            // 结果提示位于内容底部，保留与底部保存区的间隔。
             if (toast != null)
               Positioned(
-                bottom: showSave ? 146 : 88,
+                bottom: 20,
                 left: 20,
                 right: 20,
                 child: BloomMessage(message: toast, isError: _toastIsError),
@@ -1642,79 +1597,69 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
     );
   }
 
-  /// The **floating glass bar**: the same material as the nav bar at the other
-  /// end of the app, carrying everything that is above the page's content.
-  ///
-  /// Left: back and the device's own name, sharing the back button's line — the
-  /// user asked for "小组件" to be vertically centred with the arrow. Centre: the
-  /// mode switcher, borrowed from the reference they sent (a two-segment capsule
-  /// with a travelling tab). Right: the master switch, which now names its own
-  /// state ("在线" / "离线") because an unlabelled toggle told nobody anything.
-  Widget _topBar(bool carousel) {
-    final switchable = _widgetEnabled;
-    return LiquidGlassLens(
-      style: BloomGlassHome.barStyle,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 6),
-        child: Stack(
-          // Centre, because a Stack pins its non-positioned children to
-          // `topStart` by default — which is exactly why the back button, the
-          // name and the switch all sat high in a 56px bar.
-          alignment: Alignment.center,
-          children: [
-            // The mode switcher is centred on the **bar**, not on what is left
-            // over between the title and the switch: on the frame there is no
-            // switch, and "between two Spacers" put the pill right of centre.
-            if (switchable)
-              Center(
+  Future<void> _unbind() async {
+    final confirmed = await confirmBloomAction(
+      context,
+      title: '解除相框绑定？',
+      message: '相框将从你的设备中移除，照片原文件保留。重新使用时需要配对。',
+      confirmLabel: '解除绑定',
+      destructive: true,
+    );
+    if (!confirmed || !mounted) return;
+    setState(() => _saving = true);
+    try {
+      await widget.onUnbind!();
+      if (mounted) Navigator.pop(context);
+    } catch (_) {
+      if (mounted) _showToast('解除绑定未完成，请稍后重试', isError: true);
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  /// 使用其他详情页的导航样式；模式切换独占第二行，标题不会覆盖它。
+  AppBar _topBar(bool carousel) => AppBar(
+    backgroundColor: BloomInk.page,
+    surfaceTintColor: Colors.transparent,
+    foregroundColor: BloomInk.text,
+    leading: IconButton(
+      onPressed: () => Navigator.of(context).maybePop(),
+      icon: const Icon(Icons.arrow_back_rounded),
+    ),
+    title: Text(
+      widget.device.isLocal ? '小组件' : widget.device.name,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: BloomType.pageTitle,
+    ),
+    actions: [
+      if (widget.device.isLocal)
+        Padding(
+          padding: const EdgeInsets.only(right: BloomSurface.pageInset),
+          child: BloomSwitch(
+            key: const ValueKey('bloom-widget-switch'),
+            value: _widgetEnabled,
+            semanticLabel: '小组件',
+            onLabel: '在线',
+            offLabel: '离线',
+            onChanged: _saving ? null : _setWidgetEnabled,
+          ),
+        ),
+    ],
+    bottom:
+        _widgetEnabled
+            ? PreferredSize(
+              preferredSize: const Size.fromHeight(56),
+              child: Padding(
+                padding: const EdgeInsets.only(bottom: 12, top: 6),
                 child: _ModePill(
                   carousel: carousel,
-                  // 相框现在也能改模式：服务器按 frame_device_settings.mode
-                  // 选排序方式，固件只是照做，改模式不需要重烧固件。
                   onChanged: _saving ? null : _selectMode,
                 ),
               ),
-            Row(
-              children: [
-                SizedBox(
-                  width: 44,
-                  height: 44,
-                  child: IconButton(
-                    padding: EdgeInsets.zero,
-                    onPressed: () => Navigator.of(context).maybePop(),
-                    icon: const Icon(
-                      Icons.arrow_back_rounded,
-                      size: 20,
-                      color: BloomInk.text,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 2),
-                Text(
-                  widget.device.isLocal ? '小组件' : widget.device.name,
-                  style: BloomType.rowTitle,
-                ),
-                const Spacer(),
-                // The master switch belongs to **this phone's widget** and nothing
-                // else. On the frame it is absent: the frame's online state is the
-                // device's own business (it is whether the ESP32 is awake), which the
-                // app reads from the server and cannot toggle.
-                if (widget.device.isLocal)
-                  BloomSwitch(
-                    key: const ValueKey('bloom-widget-switch'),
-                    value: switchable,
-                    semanticLabel: '小组件',
-                    onLabel: '在线',
-                    offLabel: '离线',
-                    onChanged: _saving ? null : _setWidgetEnabled,
-                  ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
+            )
+            : null,
+  );
 
   /// The cadence form: two fields, no heading.
   Widget _cadenceCard() => BloomPanel(
@@ -1917,74 +1862,6 @@ class _ModeSegment extends StatelessWidget {
   );
 }
 
-/// The primary action as a piece of glass.
-///
-/// The user's note: "把这个也做成液态玻璃风格的，这个颜色可以保留，但是要透明度
-/// 和液态玻璃要保持和咱的保持一致". So the green stays, as the *tint* of a smoked
-/// lens instead of a flat fill — the same material as the bar above it, which is
-/// what makes the page feel like one object.
-class _GlassAction extends StatelessWidget {
-  const _GlassAction({
-    required this.label,
-    required this.loadingLabel,
-    required this.loading,
-    required this.onPressed,
-  });
-
-  final String label;
-  final String loadingLabel;
-  final bool loading;
-  final VoidCallback? onPressed;
-
-  @override
-  Widget build(BuildContext context) {
-    final enabled = onPressed != null && !loading;
-    return Opacity(
-      opacity: enabled || loading ? 1 : .45,
-      child: LiquidGlassLens(
-        style: BloomGlassHome.accentGlassStyle,
-        child: Material(
-          color: Colors.transparent,
-          child: InkWell(
-            onTap: enabled ? onPressed : null,
-            splashColor: const Color(0x1FEDF2EF),
-            highlightColor: const Color(0x14EDF2EF),
-            child: SizedBox(
-              height: 54,
-              width: double.infinity,
-              child: Center(
-                child:
-                    loading
-                        ? Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const SizedBox(
-                              width: 17,
-                              height: 17,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 1.8,
-                                color: Color(0xCCEDF2EF),
-                              ),
-                            ),
-                            const SizedBox(width: 9),
-                            Text(
-                              loadingLabel,
-                              style: BloomType.button.copyWith(
-                                color: const Color(0xCCEDF2EF),
-                              ),
-                            ),
-                          ],
-                        )
-                        : Text(label, style: BloomType.button),
-              ),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
 /// What 推荐 actually does, in the user's terms.
 ///
 /// The mode's *description* in the switcher is gone, so this card is the only
@@ -2165,9 +2042,7 @@ class _OffCard extends StatelessWidget {
           style: BloomType.body,
         ),
         const SizedBox(height: 18),
-        // The same glass action as 保存: the page has exactly one primary
-        // action in it, and it should look like the same thing in both states.
-        _GlassAction(
+        BloomPrimaryButton(
           label: '重新开启',
           loadingLabel: '正在开启…',
           loading: false,

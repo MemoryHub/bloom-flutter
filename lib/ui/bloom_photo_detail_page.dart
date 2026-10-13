@@ -2,11 +2,13 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import '../core/api/bloom_api_client.dart';
+import '../core/storage/photo_time_trace.dart';
 import 'bloom_glass_home.dart';
 import 'bloom_discover_page.dart';
 import 'bloom_photo_library_page.dart';
 import 'bloom_confirmation_dialog.dart';
 import 'bloom_photo_location_page.dart';
+import 'bloom_photo_time_page.dart';
 
 const _types = {
   0: '其他',
@@ -81,6 +83,7 @@ class _BloomPhotoDetailPageState extends State<BloomPhotoDetailPage> {
   Timer? _poll;
   bool _busy = false, _loading = true, _changed = false;
   String? _error, _revisionMessage;
+  int _metadataGeneration = 0;
   String get _id => widget.photo['id'] as String;
   @override
   void initState() {
@@ -97,9 +100,10 @@ class _BloomPhotoDetailPageState extends State<BloomPhotoDetailPage> {
   }
 
   Future<void> _load() async {
+    final generation = _metadataGeneration;
     try {
       final result = await widget.api.userRequest(widget.token, 'photos/$_id');
-      if (!mounted) return;
+      if (!mounted || generation != _metadataGeneration) return;
       setState(() {
         _detail = Map<String, dynamic>.from(result['photo']);
         _analysis =
@@ -114,7 +118,7 @@ class _BloomPhotoDetailPageState extends State<BloomPhotoDetailPage> {
         _poll = Timer(const Duration(seconds: 5), () => unawaited(_load()));
       }
     } catch (_) {
-      if (mounted) {
+      if (mounted && generation == _metadataGeneration) {
         setState(() {
           _error = '暂时无法读取照片信息，请重试。';
           _loading = false;
@@ -411,6 +415,37 @@ class _BloomPhotoDetailPageState extends State<BloomPhotoDetailPage> {
     });
   }
 
+  Future<void> _editTime() async {
+    _metadataGeneration++;
+    _poll?.cancel();
+    final photo = await Navigator.push<Map<String, dynamic>>(
+      context,
+      MaterialPageRoute(
+        builder:
+            (_) => BloomPhotoTimePage(
+              api: widget.api,
+              token: widget.token,
+              assetId: _id,
+              takenAt:
+                  (_detail?['taken_at'] ?? widget.photo['taken_at'])
+                      ?.toString(),
+            ),
+      ),
+    );
+    PhotoTimeTrace.shared.record(PhotoTimeStage.detailReturned);
+    if (!mounted) return;
+    if (photo == null) {
+      unawaited(_load());
+      return;
+    }
+    setState(() {
+      _detail = photo;
+      _analysis = (photo['analysis'] as Map?)?.cast<String, dynamic>();
+      _changed = true;
+    });
+    unawaited(_load());
+  }
+
   String _location(Map info) {
     final named = info['location_text']?.toString().trim() ?? '';
     if (named.isNotEmpty) return named;
@@ -437,11 +472,21 @@ class _BloomPhotoDetailPageState extends State<BloomPhotoDetailPage> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        _text(
-          '拍摄时间',
-          taken == null
-              ? '未知'
-              : '${bloomPhotoDay(taken.toIso8601String())} ${taken.hour.toString().padLeft(2, '0')}:${taken.minute.toString().padLeft(2, '0')}',
+        Row(
+          children: [
+            Expanded(
+              child: _text(
+                '拍摄时间',
+                taken == null
+                    ? '未知'
+                    : '${bloomPhotoDay(taken.toIso8601String())} ${taken.hour.toString().padLeft(2, '0')}:${taken.minute.toString().padLeft(2, '0')}',
+              ),
+            ),
+            TextButton(
+              onPressed: _busy ? null : _editTime,
+              child: const Text('编辑时间', style: BloomType.button),
+            ),
+          ],
         ),
         _compact('文件名', _detail?['filename'] ?? widget.photo['filename']),
         _text(
@@ -568,11 +613,26 @@ class _BloomPhotoDetailPageState extends State<BloomPhotoDetailPage> {
               spacing: 12,
               runSpacing: 8,
               children: [
-                Text(
-                  bloomPhotoDay(
-                    _detail?['taken_at'] ?? widget.photo['taken_at'],
+                InkWell(
+                  key: const ValueKey('bloom-photo-time-entry'),
+                  onTap: _busy ? null : _editTime,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        bloomPhotoDay(
+                          _detail?['taken_at'] ?? widget.photo['taken_at'],
+                        ),
+                        style: BloomType.meta,
+                      ),
+                      const SizedBox(width: 4),
+                      const Icon(
+                        Icons.edit_outlined,
+                        size: 12,
+                        color: BloomInk.textFaint,
+                      ),
+                    ],
                   ),
-                  style: BloomType.meta,
                 ),
                 InkWell(
                   onTap: _busy ? null : _editLocation,

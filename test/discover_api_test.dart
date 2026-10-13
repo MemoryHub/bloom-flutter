@@ -6,6 +6,39 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 void main() {
+  test('作品资料一次返回国旗内容，不额外请求国旗接口', () async {
+    var requests = 0;
+    final flag = {
+      'country': 'SE',
+      'version': 'revision1',
+      'media_type': 'image/png',
+      'data_base64': 'iVBORw0KGgo=',
+    };
+    final api = BloomApiClient(
+      client: MockClient((_) async {
+        requests++;
+        return http.Response(
+          jsonEncode({
+            'items': [
+              {
+                'artist_country_code': 'SE',
+                'artist_country_display_name': '瑞典',
+                'artist_flag': flag,
+              },
+            ],
+            'has_more': false,
+          }),
+          200,
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      }),
+    );
+    final result = await api.discoverCollection('example');
+    final work = (result['items'] as List).single as Map;
+    expect(work['artist_flag'], flag);
+    expect(requests, 1);
+    expect(work.containsKey('artist_flag_url'), isFalse);
+  });
   test('作品加入用账号权限和目标相框，保持幂等操作语义', () async {
     final requests = <http.Request>[];
     final api = BloomApiClient(

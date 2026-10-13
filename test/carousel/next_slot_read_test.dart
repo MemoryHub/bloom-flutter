@@ -66,6 +66,24 @@ void main() {
   int minutesFromNow(int minutes) =>
       DateTime.now().add(Duration(minutes: minutes)).millisecondsSinceEpoch;
 
+  test('读取小组件日志保留证据，追加和轮转后仍能读取', () async {
+    final file = File('${dir.path}/widget-timeline.log');
+    const old = '2026-10-12T07:25:00Z timeline first\n';
+    await file.writeAsString(old);
+    final repository = DailyContentRepository(api: BloomApiClient());
+    await repository.drainWidgetTimelineLog();
+    await repository.drainWidgetTimelineLog();
+    expect(await file.readAsString(), old);
+    const added = '2026-10-12T07:30:00Z timeline second\n';
+    await file.writeAsString(added, mode: FileMode.append);
+    await repository.drainWidgetTimelineLog();
+    expect(await file.readAsString(), old + added);
+    const rotated = '2026-10-12T08:00:00Z timeline rotated\n';
+    await file.writeAsString(rotated);
+    await repository.drainWidgetTimelineLog();
+    expect(await file.readAsString(), rotated);
+  });
+
   Future<int?> read() =>
       DailyContentRepository(api: BloomApiClient()).nextSlotAtMillis();
 
@@ -140,11 +158,11 @@ void main() {
     expect(await read(), isNull);
   });
 
-  test('状态文件缺失（旧版本残留）：退回 daily.json 的行为不变', () async {
+  test('计划缺失时不采用旧投影里的下次时间，避免切模式后复活旧计划', () async {
     final cached = minutesFromNow(20);
     await writeProjection(cached);
 
-    expect(await read(), cached);
+    expect(await read(), isNull);
   });
 
   test('两份文件都没有：返回 null 而不是抛错', () async {
