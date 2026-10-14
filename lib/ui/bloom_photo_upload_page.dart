@@ -11,9 +11,11 @@ class BloomPhotoUploadPage extends StatefulWidget {
     super.key,
     required this.api,
     required this.token,
+    this.onCompleted,
   });
   final BloomApiClient api;
   final String token;
+  final VoidCallback? onCompleted;
   @override
   State<BloomPhotoUploadPage> createState() => _BloomPhotoUploadPageState();
 }
@@ -218,6 +220,19 @@ class _BloomPhotoUploadPageState extends State<BloomPhotoUploadPage> {
           icon: const Icon(Icons.arrow_back_rounded),
         ),
       ),
+      bottomNavigationBar:
+          widget.onCompleted != null &&
+                  !_running &&
+                  _completed > 0 &&
+                  !_items.any((i) => !i.done)
+              ? SafeArea(
+                minimum: const EdgeInsets.all(20),
+                child: BloomPrimaryButton(
+                  label: '完成',
+                  onPressed: widget.onCompleted,
+                ),
+              )
+              : null,
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(BloomSurface.pageInset),

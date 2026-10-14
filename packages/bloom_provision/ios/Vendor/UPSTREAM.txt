@@ -1,0 +1,5 @@
+https://github.com/espressif/esp-idf-provisioning-ios
+commit: 78e58f010f8539f800bce063a26d3e4c4ac596b9
+Apache-2.0
+Bloom patches (2026-10-14): main-queue async request serialization; all GATT descriptor callbacks must finish before one session-ready callback; reset connection maps; ignore callbacks from other peripherals; explicit Bloom provisioning service; fallback service discovery without advertised UUID; distinguish Bluetooth state from empty scans. Stage-only diagnostics exclude secrets and packet data.
+Security1/session cryptography/protobuf retained. Upstream verbose logs disabled.

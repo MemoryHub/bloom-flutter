@@ -7,7 +7,6 @@ import '../core/api/bloom_api_client.dart';
 import 'bloom_device_pages.dart';
 import 'bloom_glass_home.dart';
 import 'bloom_confirmation_dialog.dart';
-import '../core/models/device_models.dart';
 
 String? bloomDeviceInvitationToken(String raw) {
   final text = raw.trim();
@@ -31,12 +30,15 @@ String _sharingError(Object error) =>
 Future<bool> joinBloomDevice(
   BuildContext context,
   BloomApiClient api,
-  String token,
-) async {
-  final raw = await Navigator.push<String>(
-    context,
-    MaterialPageRoute(builder: (_) => const BloomDeviceScannerPage()),
-  );
+  String token, {
+  String? rawCode,
+}) async {
+  final raw =
+      rawCode ??
+      await Navigator.push<String>(
+        context,
+        MaterialPageRoute(builder: (_) => const BloomDeviceScannerPage()),
+      );
   if (raw == null || !context.mounted) return false;
   final code = bloomDeviceInvitationToken(raw);
   if (code == null) {
@@ -46,28 +48,19 @@ Future<bool> joinBloomDevice(
     return false;
   }
   try {
-    final preview = await api.userRequest(
-      token,
-      'device-invitations/preview',
-      method: 'POST',
-      body: {'token': code},
-    );
-    if (!context.mounted) return false;
-    if (!await confirmBloomAction(
-      context,
-      title:
-          '向「${preview['device_type'] == 'eink' ? bloomInkDeviceName : preview['name'] ?? '设备'}」提供照片？',
-      message: '你的整个个人图库将加入这台设备的播放内容。你仍只查看自己的照片；播放时间与艺术作品由设备主人设置。',
-      confirmLabel: '加入设备',
-    )) {
-      return false;
-    }
-    await api.userRequest(
+    final joined = await api.userRequest(
       token,
       'device-invitations/join',
       method: 'POST',
       body: {'token': code},
     );
+    if (context.mounted) {
+      final type = joined['device_type'] == 'eink' ? '相框' : '手机小组件';
+      final name = joined['name'] as String? ?? '设备';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已加入$type「$name」', style: BloomType.body)),
+      );
+    }
     return true;
   } catch (error) {
     if (context.mounted) {
@@ -435,6 +428,10 @@ class _BloomDeviceScannerPageState extends State<BloomDeviceScannerPage>
                   child: Text('相机暂时不可用，可以粘贴设备码', style: BloomType.body),
                 ),
           ),
+        ),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(20, 12, 20, 0),
+          child: Text('扫码加入后，你的个人图库将用于这台设备的展示', style: BloomType.meta),
         ),
         SafeArea(
           top: false,

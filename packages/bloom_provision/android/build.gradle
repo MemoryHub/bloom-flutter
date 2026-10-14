@@ -1,0 +1,25 @@
+group = 'com.bloom.provision'
+version = '0.1.0'
+buildscript {
+ repositories { google(); mavenCentral() }
+ dependencies { classpath 'com.android.tools.build:gradle:8.7.0'; classpath 'com.google.protobuf:protobuf-gradle-plugin:0.9.4' }
+}
+apply plugin: 'com.android.library'
+apply plugin: 'com.google.protobuf'
+android {
+ namespace 'com.bloom.provision'
+ compileSdk 35
+ defaultConfig { minSdk 23 }
+ sourceSets { main.java.srcDirs += '../vendor/android/java'; main.proto.srcDirs += '../vendor/android/proto' }
+ compileOptions { sourceCompatibility JavaVersion.VERSION_11; targetCompatibility JavaVersion.VERSION_11 }
+}
+protobuf {
+ protoc { artifact = 'com.google.protobuf:protoc:3.21.12' }
+ generateProtoTasks { all().each { task -> task.builtins { java { option 'lite' } } } }
+}
+dependencies {
+ implementation 'androidx.core:core:1.13.1'
+ implementation 'org.greenrobot:eventbus:3.3.1'
+ implementation 'com.google.protobuf:protobuf-javalite:3.21.12'
+ implementation 'com.google.crypto.tink:tink-android:1.12.0'
+}

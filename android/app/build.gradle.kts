@@ -24,7 +24,7 @@ android {
         applicationId = "com.bloom.bloom"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        minSdk = 23 // Security1 provisioning crypto requires Android 6.0+.
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

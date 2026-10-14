@@ -21,10 +21,17 @@ import 'ui/bloom_auth_pages.dart';
 import 'ui/bloom_device_pages.dart';
 import 'ui/bloom_photo_library_page.dart';
 import 'ui/bloom_device_sharing_page.dart';
+import 'ui/bloom_frame_setup_page.dart';
+import 'ui/bloom_frame_network_page.dart';
+import 'core/provisioning/frame_setup_controller.dart';
 import 'ui/bloom_confirmation_dialog.dart';
 import 'package:bloom_widget_bridge/bloom_widget_bridge.dart';
 import 'ui/bloom_glass_home.dart';
 import 'ui/bloom_discover_page.dart';
+import 'core/firmware/firmware_update_controller.dart';
+import 'core/provisioning/frame_playback_controller.dart';
+import 'ui/bloom_frame_playback_page.dart';
+import 'ui/bloom_firmware_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -59,8 +66,25 @@ Future<void> main() async {
   runApp(const BloomApp());
 }
 
-class BloomApp extends StatelessWidget {
+class BloomApp extends StatefulWidget {
   const BloomApp({super.key});
+
+  @override
+  State<BloomApp> createState() => _BloomAppState();
+}
+
+class _BloomAppState extends State<BloomApp> {
+  final _navigatorKey = GlobalKey<NavigatorState>();
+  late final _firmwareUpdates = FirmwareUpdateController();
+  late final _framePlayback = FramePlaybackController(
+    api: _firmwareUpdates.api,
+  );
+  @override
+  void dispose() {
+    _firmwareUpdates.dispose();
+    _framePlayback.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) => MaterialApp(
@@ -75,7 +99,22 @@ class BloomApp extends StatelessWidget {
     themeMode: ThemeMode.dark,
     theme: _bloomDarkTheme,
     darkTheme: _bloomDarkTheme,
-    home: const BloomHomePage(),
+    navigatorKey: _navigatorKey,
+    builder:
+        (context, child) => BloomFramePlaybackOverlay(
+          controller: _framePlayback,
+          navigatorKey: _navigatorKey,
+          child: BloomFirmwareOverlay(
+            updates: _firmwareUpdates,
+            navigatorKey: _navigatorKey,
+            child: child ?? const SizedBox.shrink(),
+          ),
+        ),
+    home: BloomHomePage(
+      api: _firmwareUpdates.api,
+      firmwareUpdates: _firmwareUpdates,
+      framePlayback: _framePlayback,
+    ),
   );
 }
 
@@ -105,6 +144,8 @@ class BloomHomePage extends StatefulWidget {
     this.api,
     this.displayPreferences,
     this.auth,
+    this.firmwareUpdates,
+    this.framePlayback,
   });
 
   /// Test seams. Production passes nothing and the state builds the real
@@ -117,6 +158,8 @@ class BloomHomePage extends StatefulWidget {
 
   /// 账号会话（F1）。生产不传，由状态自己建。
   final AuthRepository? auth;
+  final FirmwareUpdateController? firmwareUpdates;
+  final FramePlaybackController? framePlayback;
 
   @override
   State<BloomHomePage> createState() => _BloomHomePageState();
@@ -1035,6 +1078,26 @@ class _BloomHomePageState extends State<BloomHomePage>
 
   // ---------- F1 账号 ----------
 
+  void _syncFirmwareSession() {
+    final updates = widget.firmwareUpdates;
+    final account = _auth.account;
+    final ready = account?.immichReady == true;
+    unawaited(
+      updates?.setSession(
+            ready ? _auth.token : null,
+            ready ? account!.id : null,
+          ) ??
+          Future<void>.value(),
+    );
+    unawaited(
+      widget.framePlayback?.setSession(
+            ready ? _auth.token : null,
+            ready ? account!.id : null,
+          ) ??
+          Future<void>.value(),
+    );
+  }
+
   /// 启动时恢复本地会话，并向服务端确认它还有效。
   ///
   /// 两步分开是刻意的：本地恢复不发网络请求，所以登录状态在离线时也立刻可用；
@@ -1044,6 +1107,7 @@ class _BloomHomePageState extends State<BloomHomePage>
     if (!mounted) return;
     setState(() => _account = _auth.account);
     if (_account != null) await _prepareAccountCache(_account!.id);
+    _syncFirmwareSession();
     if (_account?.immichReady == true && await _identity.hasServerToken()) {
       final revision = _settingsRevision;
       final local = await _displayPreferences.readLocal();
@@ -1081,6 +1145,7 @@ class _BloomHomePageState extends State<BloomHomePage>
       final account = await _auth.refresh();
       if (!mounted || (token != _auth.token && _auth.token != null)) return;
       setState(() => _account = account);
+      _syncFirmwareSession();
       if (account == null) {
         if (token != null && _auth.token == null) await _clearAccountContent();
         return;
@@ -1173,6 +1238,7 @@ class _BloomHomePageState extends State<BloomHomePage>
   /// 取回当前账号绑定的设备。失败时静默保留旧列表 —— 设备列表是展示信息，
   /// 一次网络抖动不该把页面清空。
   Future<void> _loadRemoteDevices() async {
+    _syncFirmwareSession();
     final token = _auth.token;
     if (token == null) {
       if (mounted) setState(() => _remoteDevices = const []);
@@ -1268,6 +1334,8 @@ class _BloomHomePageState extends State<BloomHomePage>
   }
 
   Future<void> _clearAccountContent() async {
+    await widget.firmwareUpdates?.setSession(null, null);
+    await widget.framePlayback?.setSession(null, null);
     _displayRefreshToken = null;
     _remotePlanWake?.cancel();
     await _devicePlanPreviews.clear();
@@ -1402,21 +1470,66 @@ class _BloomHomePageState extends State<BloomHomePage>
     setState(() => _photoDeviceId = deviceId);
   }
 
-  Future<void> _showAddDeviceNotice() async {
+  Future<void> _showAddDeviceNotice({FrameSetupCode? code}) async {
     if (_auth.token == null) {
       await _openAuth();
       return;
     }
-    final paired = await joinBloomDevice(context, _api, _auth.token!);
-    if (paired) {
-      await _loadRemoteDevices();
-      _notify('已向设备提供你的图库');
+    final token = _auth.token!;
+    final result = await Navigator.push<FrameSetupResult>(
+      context,
+      MaterialPageRoute(
+        builder:
+            (_) => BloomFrameSetupPage(api: _api, token: token, code: code),
+      ),
+    );
+    if (!mounted || _auth.token != token) return;
+    await _loadRemoteDevices();
+    if (!mounted || _auth.token != token || result == null) return;
+    setState(() {
+      _photoDeviceId = result.deviceId;
+      _selectedTab = 0;
+    });
+    unawaited(_refreshDevicePlanPreviews());
+  }
+
+  Future<void> _scanDevice() async {
+    if (_auth.token == null) {
+      await _openAuth();
+      return;
     }
+    final token = _auth.token!;
+    final raw = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(builder: (_) => const BloomDeviceScannerPage()),
+    );
+    if (!mounted || _auth.token != token || raw == null) return;
+    final setup = FrameSetupCode.parse(raw);
+    if (setup != null) {
+      await _showAddDeviceNotice(code: setup);
+      return;
+    }
+    final joined = await joinBloomDevice(context, _api, token, rawCode: raw);
+    if (joined && mounted && _auth.token == token) await _loadRemoteDevices();
   }
 
   Future<void> _deviceContentChanged() async {
     await _loadRemoteDevices();
     if (mounted) unawaited(_load(showSpinner: false));
+  }
+
+  Future<void> _connectFrameWifi(BloomDevice device) async {
+    final token = _auth.token;
+    if (token == null || !device.isFrame || !device.canManage) return;
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder:
+            (_) =>
+                BloomFrameNetworkPage(api: _api, token: token, device: device),
+      ),
+    );
+    if (mounted && _auth.token == token) await _deviceContentChanged();
   }
 
   Future<void> _openDeviceDetail(BloomDevice device) async {
@@ -1452,6 +1565,7 @@ class _BloomHomePageState extends State<BloomHomePage>
       // The page paints the same photo the home page does, so its glass has
       // something to refract.
       photoPath: _originalPhotoPath,
+      firmwareUpdates: widget.firmwareUpdates,
       onSaved: (settings) {
         if (_auth.token != accountToken ||
             _credentials?.deviceToken != credentials?.deviceToken) {
@@ -1462,11 +1576,9 @@ class _BloomHomePageState extends State<BloomHomePage>
       onUnbind:
           device.isFrame && _auth.token != null
               ? () async {
-                await _api.userRequest(
-                  _auth.token!,
-                  'devices/${device.deviceId}',
-                  method: 'DELETE',
-                );
+                if (accountToken == null || _auth.token != accountToken) {
+                  throw StateError('账号已变化');
+                }
                 if (mounted) setState(() => _photoDeviceId = null);
                 await _loadRemoteDevices();
               }
@@ -1736,6 +1848,8 @@ class _BloomHomePageState extends State<BloomHomePage>
     onDeviceChanged: _changePhotoDevice,
     onOpenDevice: _openDeviceDetail,
     onAddDevice: _showAddDeviceNotice,
+    onScanDevice: _scanDevice,
+    onConnectWifi: _connectFrameWifi,
     onCopyDeviceId: _copyDeviceId,
     account: _account,
     onAccountTap: _openAuth,

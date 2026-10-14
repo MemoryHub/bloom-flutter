@@ -1,0 +1,18 @@
+name: bloom_provision
+description: Bloom secure BLE provisioning bridge using Espressif Security1.
+version: 0.1.0
+publish_to: none
+environment:
+  sdk: ^3.7.2
+  flutter: '>=3.29.0'
+dependencies:
+  flutter:
+    sdk: flutter
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.bloom.provision
+        pluginClass: BloomProvisionPlugin
+      ios:
+        pluginClass: BloomProvisionPlugin

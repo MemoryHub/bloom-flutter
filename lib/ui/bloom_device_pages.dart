@@ -16,6 +16,9 @@ import 'bloom_sign_in_prompt.dart';
 import 'bloom_discover_page.dart';
 import 'bloom_device_sharing_page.dart';
 import 'bloom_confirmation_dialog.dart';
+import '../core/firmware/firmware_update_controller.dart';
+import 'bloom_firmware_page.dart';
+import 'bloom_frame_network_page.dart';
 
 /// 已确认归属的设备在界面中的展示记录。
 class BloomDevice {
@@ -30,7 +33,12 @@ class BloomDevice {
 
   final String deviceId;
   final String _name;
-  String get name => isFrame ? bloomInkDeviceName : _name;
+  String get name =>
+      _name.trim().isNotEmpty
+          ? _name.trim()
+          : isFrame
+          ? bloomInkDeviceName
+          : '手机小组件';
 
   /// Either `eink` (the frame) or `mobile` (this phone's home-screen widget).
   final String type;
@@ -170,6 +178,8 @@ class BloomDeviceListPage extends StatefulWidget {
     required this.devices,
     required this.onOpenDevice,
     required this.onAddDevice,
+    this.onScanDevice,
+    this.onConnectWifi,
     this.widgetEnabled = true,
     this.onWidgetEnabledChanged,
     this.account,
@@ -180,6 +190,8 @@ class BloomDeviceListPage extends StatefulWidget {
   final List<BloomDevice> devices;
   final ValueChanged<BloomDevice> onOpenDevice;
   final VoidCallback onAddDevice;
+  final VoidCallback? onScanDevice;
+  final ValueChanged<BloomDevice>? onConnectWifi;
 
   /// False while the master switch is off: the phone's tile must say 离线 even
   /// though the server still remembers it as reachable.
@@ -274,7 +286,7 @@ class _BloomDeviceListPageState extends State<BloomDeviceListPage> {
                 BloomIconButton(
                   icon: Icons.qr_code_scanner_rounded,
                   loading: false,
-                  onTap: onAddDevice,
+                  onTap: widget.onScanDevice ?? onAddDevice,
                 ),
                 const SizedBox(width: 2),
                 BloomIconButton(
@@ -352,6 +364,10 @@ class _BloomDeviceListPageState extends State<BloomDeviceListPage> {
                 onlineOverride:
                     devices[index].isLocal && !widgetEnabled ? false : null,
                 onTap: () => onOpenDevice(devices[index]),
+                onConnectWifi:
+                    widget.onConnectWifi == null
+                        ? null
+                        : () => widget.onConnectWifi!(devices[index]),
               ),
             ],
         ],
@@ -378,6 +394,7 @@ class _DeviceCard extends StatelessWidget {
     required this.device,
     required this.onTap,
     this.onlineOverride,
+    this.onConnectWifi,
   });
 
   final BloomDevice device;
@@ -387,6 +404,7 @@ class _DeviceCard extends StatelessWidget {
   /// nothing about: with the widget off there is nothing to be online *about*.
   /// Null means "ask the device record".
   final bool? onlineOverride;
+  final VoidCallback? onConnectWifi;
 
   @override
   Widget build(BuildContext context) {
@@ -499,6 +517,22 @@ class _DeviceCard extends StatelessWidget {
                               style: BloomType.tileTitle,
                             ),
                           ),
+                          if (device.isFrame &&
+                              device.canManage &&
+                              online != true &&
+                              onConnectWifi != null)
+                            TextButton(
+                              key: ValueKey('bloom-wifi-${device.deviceId}'),
+                              onPressed: onConnectWifi,
+                              style: TextButton.styleFrom(
+                                foregroundColor: BloomInk.accent,
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                ),
+                                minimumSize: const Size(0, 32),
+                              ),
+                              child: const Text('连接 Wi-Fi'),
+                            ),
                           const SizedBox(width: 8),
                           const Padding(
                             padding: EdgeInsets.only(bottom: 4),
@@ -584,10 +618,12 @@ class BloomDeviceDetailPage extends StatefulWidget {
     this.photoPath,
     this.onWidgetEnabledChanged,
     this.onUnbind,
+    this.firmwareUpdates,
   });
 
   final BloomDevice device;
   final Future<void> Function()? onUnbind;
+  final FirmwareUpdateController? firmwareUpdates;
   final DisplayPreferences preferences;
 
   /// The values the page renders until its own server read answers, and the
@@ -646,6 +682,7 @@ class BloomDeviceDetailPage extends StatefulWidget {
     String? photoPath,
     ValueChanged<bool>? onWidgetEnabledChanged,
     Future<void> Function()? onUnbind,
+    FirmwareUpdateController? firmwareUpdates,
   }) => Navigator.of(context).push<void>(
     MaterialPageRoute(
       builder:
@@ -662,6 +699,7 @@ class BloomDeviceDetailPage extends StatefulWidget {
             photoPath: photoPath,
             onWidgetEnabledChanged: onWidgetEnabledChanged,
             onUnbind: onUnbind,
+            firmwareUpdates: firmwareUpdates,
           ),
     ),
   );
@@ -779,12 +817,20 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
   @override
   void initState() {
     super.initState();
+    widget.firmwareUpdates?.addListener(_firmwareChanged);
     // Not awaited: the page must render immediately and stay usable if the
     // server never answers.
     unawaited(_readWidgetEnabled());
     unawaited(_loadServerSettings());
     if (widget.device.isFrame) unawaited(_loadOrientation());
   }
+
+  void _firmwareChanged() {
+    if (mounted) setState(() {});
+  }
+
+  bool get _firmwareActive =>
+      widget.firmwareUpdates?.hasActiveFor(widget.device.deviceId) == true;
 
   Future<void> _loadOrientation() async {
     final credentials = widget.credentials;
@@ -1193,6 +1239,7 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
 
   @override
   void dispose() {
+    widget.firmwareUpdates?.removeListener(_firmwareChanged);
     _toastTimer?.cancel();
     super.dispose();
   }
@@ -1478,11 +1525,50 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
                 MediaQuery.paddingOf(context).bottom + 64,
               ),
               children: [
+                if (widget.device.isFrame &&
+                    widget.device.canManage &&
+                    widget.userToken != null) ...[
+                  BloomPanel(
+                    child: ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(
+                        Icons.wifi_rounded,
+                        color: BloomInk.accent,
+                      ),
+                      title: const Text('Wi-Fi', style: BloomType.rowTitle),
+                      subtitle: const Text(
+                        '已保存网络与添加 Wi-Fi',
+                        style: BloomType.meta,
+                      ),
+                      trailing: const Icon(
+                        Icons.chevron_right_rounded,
+                        color: BloomInk.textMuted,
+                      ),
+                      onTap:
+                          _firmwareActive
+                              ? null
+                              : () => Navigator.push(
+                                context,
+                                MaterialPageRoute<void>(
+                                  builder:
+                                      (_) => BloomFrameNetworkPage(
+                                        api: BloomApiClient(),
+                                        token: widget.userToken!,
+                                        device: widget.device,
+                                      ),
+                                ),
+                              ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                ],
                 if (!_widgetEnabled)
                   _OffCard(onEnable: () => _setWidgetEnabled(true))
                 else ...[
                   // 模式在导航栏下独立显示，内容区域只保留设置和必要说明。
                   if (carousel) _cadenceCard() else _RecommendationCard(),
+                  if (widget.device.isFrame && _orientationMode != null)
+                    const SizedBox(height: 16),
                   if (widget.device.isFrame && _orientationMode != null)
                     BloomPanel(
                       padding: const EdgeInsets.all(16),
@@ -1501,12 +1587,15 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
                                 : _pickOrientation,
                       ),
                     ),
+                  const SizedBox(height: 16),
                   _SourcesCard(
                     allowArt: true,
                     selected: _displaySources,
                     onToggle: _saving ? null : _toggleSource,
                   ),
-                  if (widget.userToken != null && !widget.device.isFrame)
+                  if (widget.userToken != null && widget.device.canManage)
+                    const SizedBox(height: 16),
+                  if (widget.userToken != null && widget.device.canManage)
                     BloomPanel(
                       child: ListTile(
                         contentPadding: EdgeInsets.zero,
@@ -1533,6 +1622,7 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
                             ),
                       ),
                     ),
+                  if (widget.userToken != null) const SizedBox(height: 16),
                   if (widget.userToken != null)
                     BloomPanel(
                       child: ListTile(
@@ -1558,7 +1648,10 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
                     ),
                   // 后台保活自检：**这台手机自己的事**，所以只在本机（手机小组件）
                   // 的详情页出现，相框上没有。iOS 上原生返回空列表，卡片整个不渲染。
-                  if (widget.device.isLocal) const BloomKeepAliveCard(),
+                  if (widget.device.isLocal) ...[
+                    const SizedBox(height: 16),
+                    const BloomKeepAliveCard(),
+                  ],
                 ],
                 const SizedBox(height: 28),
                 _deviceInfo(),
@@ -1577,8 +1670,48 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
                       ),
                       textStyle: BloomType.button,
                     ),
-                    onPressed: _saving ? null : _unbind,
-                    child: const Text('解除绑定'),
+                    onPressed: _saving || _firmwareActive ? null : _unbind,
+                    child: Text(_firmwareActive ? '更新期间无法重置' : '解绑并重置'),
+                  ),
+                ],
+                if (widget.device.isFrame &&
+                    widget.device.canManage &&
+                    widget.userToken != null) ...[
+                  const SizedBox(height: 32),
+                  const Divider(color: BloomInk.divider),
+                  const SizedBox(height: 12),
+                  ListTile(
+                    key: const ValueKey('bloom-firmware-entry'),
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('固件更新', style: BloomType.rowTitle),
+                    subtitle: const Text('查看版本与更新说明', style: BloomType.meta),
+                    trailing: TextButton(
+                      onPressed:
+                          widget.firmwareUpdates == null
+                              ? null
+                              : () => Navigator.of(context).push(
+                                MaterialPageRoute<void>(
+                                  builder:
+                                      (_) => BloomFirmwarePage(
+                                        deviceId: widget.device.deviceId,
+                                        updates: widget.firmwareUpdates!,
+                                      ),
+                                ),
+                              ),
+                      child: Text(_firmwareActive ? '查看进度' : '检测更新'),
+                    ),
+                    onTap:
+                        widget.firmwareUpdates == null
+                            ? null
+                            : () => Navigator.of(context).push(
+                              MaterialPageRoute<void>(
+                                builder:
+                                    (_) => BloomFirmwarePage(
+                                      deviceId: widget.device.deviceId,
+                                      updates: widget.firmwareUpdates!,
+                                    ),
+                              ),
+                            ),
                   ),
                 ],
               ],
@@ -1598,20 +1731,45 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
   }
 
   Future<void> _unbind() async {
+    if (_firmwareActive) {
+      _showToast('请等待更新完成或确认停止后再解除绑定', isError: true);
+      return;
+    }
     final confirmed = await confirmBloomAction(
       context,
-      title: '解除相框绑定？',
-      message: '相框将从你的设备中移除，照片原文件保留。重新使用时需要配对。',
-      confirmLabel: '解除绑定',
+      title: '解绑并重置相框？',
+      message: '相框会清理 Wi-Fi、私人照片和设置，恢复欢迎页，并移除所有人的供图关系。云端图库保留。相框离线时会等待它连接。',
+      confirmLabel: '解绑并重置',
       destructive: true,
     );
     if (!confirmed || !mounted) return;
     setState(() => _saving = true);
     try {
+      if (widget.userToken == null) return;
+      final done = await Navigator.push<bool>(
+        context,
+        MaterialPageRoute(
+          builder:
+              (_) => BloomFrameResetPage(
+                api: BloomApiClient(),
+                token: widget.userToken!,
+                device: widget.device,
+              ),
+        ),
+      );
+      if (done != true) return;
       await widget.onUnbind!();
       if (mounted) Navigator.pop(context);
-    } catch (_) {
-      if (mounted) _showToast('解除绑定未完成，请稍后重试', isError: true);
+    } catch (error) {
+      if (mounted) {
+        _showToast(
+          error is BloomApiException &&
+                  error.code == 'firmware_update_in_progress'
+              ? firmwareErrorMessage(error)
+              : '解除绑定未完成，请稍后重试',
+          isError: true,
+        );
+      }
     } finally {
       if (mounted) setState(() => _saving = false);
     }

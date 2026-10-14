@@ -29,6 +29,11 @@ flutter_ios_podfile_setup
 target 'Runner' do
   use_frameworks!
 
+  # Pin the Security1 SDK runtime to the upstream 1.22.0 revision. Fetch directly
+  # from Apple so building does not depend on the CocoaPods CDN redirect.
+  pod 'SwiftProtobuf', :git => 'https://github.com/apple/swift-protobuf.git',
+                      :commit => 'f25867a208f459d3c5a06935dceb9083b11cd539'
+
   flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
   target 'RunnerTests' do
     inherit! :search_paths

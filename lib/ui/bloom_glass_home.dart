@@ -229,6 +229,8 @@ class BloomGlassHome extends StatelessWidget {
     required this.onDeviceChanged,
     required this.onOpenDevice,
     required this.onAddDevice,
+    this.onScanDevice,
+    this.onConnectWifi,
     required this.onCopyDeviceId,
     this.account,
     this.onAccountTap,
@@ -352,6 +354,8 @@ class BloomGlassHome extends StatelessWidget {
   final ValueChanged<String> onDeviceChanged;
   final ValueChanged<BloomDevice> onOpenDevice;
   final VoidCallback onAddDevice;
+  final VoidCallback? onScanDevice;
+  final ValueChanged<BloomDevice>? onConnectWifi;
   final VoidCallback onCopyDeviceId;
 
   /// The flat colour behind everything: the top stop of [backgroundGradient], so
@@ -665,6 +669,8 @@ class BloomGlassHome extends StatelessWidget {
         onWidgetEnabledChanged: onWidgetEnabledChanged,
         onOpenDevice: onOpenDevice,
         onAddDevice: onAddDevice,
+        onScanDevice: onScanDevice,
+        onConnectWifi: onConnectWifi,
         account: account,
         onAccountTap: onAccountTap,
         accountBusy: accountBusy,

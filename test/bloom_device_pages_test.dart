@@ -203,14 +203,14 @@ void main() {
   ).firstWhere((device) => device.isLocal);
 
   group('设备详情导航与底部安全区', () {
-    test('旧相框名统一显示，设备 ID/类型与手机名称保留', () {
+    test('相框保留用户名称，类型标签与设备 ID 不变', () {
       for (final oldName in ['bloom-ink', 'e-ink', 'E-Ink', '客厅相框']) {
         final device = BloomDevice(
           deviceId: 'frame-original',
           name: oldName,
           type: 'eink',
         );
-        expect(device.name, bloomInkDeviceName);
+        expect(device.name, oldName);
         expect(device.typeLabel, bloomInkDeviceName);
         expect(device.deviceId, 'frame-original');
         expect(device.settingsTarget, 'eink');
@@ -223,7 +223,7 @@ void main() {
                 enabled: true,
               ),
             ]).single;
-        expect(remote.name, bloomInkDeviceName);
+        expect(remote.name, oldName);
       }
       expect(
         const BloomDevice(
@@ -291,7 +291,7 @@ void main() {
           expect(button.style!.foregroundColor!.resolve({}), BloomInk.danger);
           await tester.tap(last);
           await settle(tester);
-          expect(find.text('解除相框绑定？'), findsOneWidget);
+          expect(find.text('解绑并重置相框？'), findsOneWidget);
           expect(unbinds, 0, reason: '打开提醒不解除绑定');
           final confirm = tester.widget<BloomPrimaryButton>(
             find.descendant(
@@ -304,16 +304,7 @@ void main() {
           await settle(tester);
           expect(unbinds, 0);
           expect(find.byType(Dialog), findsNothing);
-          await tester.tap(last);
-          await settle(tester);
-          await tester.tap(
-            find.descendant(
-              of: find.byType(Dialog),
-              matching: find.text('解除绑定'),
-            ),
-          );
-          await settle(tester);
-          expect(unbinds, 1, reason: '仅确认后执行一次解绑回调');
+          expect(unbinds, 0, reason: '物理清理并确认成功前不能解除归属');
         }
         await tester.pumpWidget(const SizedBox.shrink());
       });

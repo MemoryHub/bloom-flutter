@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import '../models/auth_models.dart';
 import '../models/device_models.dart';
+import '../models/firmware_models.dart';
 import '../storage/display_preferences.dart';
 
 class BloomApiException implements Exception {
@@ -700,6 +701,73 @@ class BloomApiClient {
         .timeout(const Duration(seconds: 90));
     _ensure(response, 200);
     return _json(response);
+  }
+
+  Future<FirmwareCheck> checkFirmware(String token, String deviceId) async {
+    final response = await _client
+        .get(
+          _uri(
+            '/api/frame/users/me/devices/${Uri.encodeComponent(deviceId)}/firmware',
+          ),
+          headers: _userHeaders(token),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return FirmwareCheck.fromJson(_json(response));
+  }
+
+  Future<List<FirmwareJob>> firmwareJobs(String token) async {
+    final response = await _client
+        .get(
+          _uri('/api/frame/users/me/firmware/jobs'),
+          headers: _userHeaders(token),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return (_json(response)['jobs'] as List)
+        .map(
+          (value) =>
+              FirmwareJob.fromJson(Map<String, dynamic>.from(value as Map)),
+        )
+        .toList(growable: false);
+  }
+
+  Future<FirmwareJob> startFirmwareUpdate(
+    String token,
+    String deviceId,
+    String releaseId,
+  ) async {
+    final response = await _client
+        .post(
+          _uri(
+            '/api/frame/users/me/devices/${Uri.encodeComponent(deviceId)}/firmware/jobs',
+          ),
+          headers: {..._userHeaders(token), 'Content-Type': 'application/json'},
+          body: jsonEncode({'release_id': releaseId}),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return FirmwareJob.fromJson(
+      Map<String, dynamic>.from(_json(response)['job'] as Map),
+    );
+  }
+
+  Future<FirmwareJob> cancelFirmwareUpdate(
+    String token,
+    FirmwareJob job,
+  ) async {
+    final response = await _client
+        .post(
+          _uri(
+            '/api/frame/users/me/devices/${Uri.encodeComponent(job.deviceId)}/firmware/jobs/${Uri.encodeComponent(job.id)}/cancel',
+          ),
+          headers: _userHeaders(token),
+        )
+        .timeout(_requestTimeout);
+    _ensure(response, 200);
+    return FirmwareJob.fromJson(
+      Map<String, dynamic>.from(_json(response)['job'] as Map),
+    );
   }
 
   Map<String, String> _userHeaders(String userToken) => {

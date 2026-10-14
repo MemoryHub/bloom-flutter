@@ -1,4 +1,7 @@
 PODS:
+  - bloom_provision (0.1.1):
+    - Flutter
+    - SwiftProtobuf (= 1.22.0)
   - Flutter (1.0.0)
   - flutter_secure_storage (6.0.0):
     - Flutter
@@ -15,10 +18,12 @@ PODS:
   - shared_preferences_foundation (0.0.1):
     - Flutter
     - FlutterMacOS
+  - SwiftProtobuf (1.22.0)
   - workmanager (0.0.1):
     - Flutter
 
 DEPENDENCIES:
+  - bloom_provision (from `.symlinks/plugins/bloom_provision/ios`)
   - Flutter (from `Flutter`)
   - flutter_secure_storage (from `.symlinks/plugins/flutter_secure_storage/ios`)
   - image_picker_ios (from `.symlinks/plugins/image_picker_ios/ios`)
@@ -26,9 +31,12 @@ DEPENDENCIES:
   - mobile_scanner (from `.symlinks/plugins/mobile_scanner/darwin`)
   - path_provider_foundation (from `.symlinks/plugins/path_provider_foundation/darwin`)
   - shared_preferences_foundation (from `.symlinks/plugins/shared_preferences_foundation/darwin`)
+  - SwiftProtobuf (from `https://github.com/apple/swift-protobuf.git`, commit `f25867a208f459d3c5a06935dceb9083b11cd539`)
   - workmanager (from `.symlinks/plugins/workmanager/ios`)
 
 EXTERNAL SOURCES:
+  bloom_provision:
+    :path: ".symlinks/plugins/bloom_provision/ios"
   Flutter:
     :path: Flutter
   flutter_secure_storage:
@@ -43,10 +51,19 @@ EXTERNAL SOURCES:
     :path: ".symlinks/plugins/path_provider_foundation/darwin"
   shared_preferences_foundation:
     :path: ".symlinks/plugins/shared_preferences_foundation/darwin"
+  SwiftProtobuf:
+    :commit: f25867a208f459d3c5a06935dceb9083b11cd539
+    :git: https://github.com/apple/swift-protobuf.git
   workmanager:
     :path: ".symlinks/plugins/workmanager/ios"
 
+CHECKOUT OPTIONS:
+  SwiftProtobuf:
+    :commit: f25867a208f459d3c5a06935dceb9083b11cd539
+    :git: https://github.com/apple/swift-protobuf.git
+
 SPEC CHECKSUMS:
+  bloom_provision: 8d7a7a614e0603f32d2d6dd3afb072d149dffd1f
   Flutter: e0871f40cf51350855a761d2e70bf5af5b9b5de7
   flutter_secure_storage: d33dac7ae2ea08509be337e775f6b59f1ff45f12
   image_picker_ios: c560581cceedb403a6ff17f2f816d7fea1421fc1
@@ -54,8 +71,9 @@ SPEC CHECKSUMS:
   mobile_scanner: 77265f3dc8d580810e91849d4a0811a90467ed5e
   path_provider_foundation: 2b6b4c569c0fb62ec74538f866245ac84301af46
   shared_preferences_foundation: fcdcbc04712aee1108ac7fda236f363274528f78
+  SwiftProtobuf: 40bd808372cb8706108f22d28f8ab4a6b9bc6989
   workmanager: 0afdcf5628bbde6924c21af7836fed07b42e30e6
 
-PODFILE CHECKSUM: d153d1025c48afed7f22dad456a4652f0e77c9a1
+PODFILE CHECKSUM: efe7b80e22e5f8f9f13d10b6d790f0394b3c33a2
 
 COCOAPODS: 1.17.0

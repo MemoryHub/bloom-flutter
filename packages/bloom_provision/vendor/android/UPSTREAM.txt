@@ -1,0 +1,6 @@
+https://github.com/espressif/esp-idf-provisioning-android
+commit: 7ba3cba8aeffd57786a543cc583063d681ba2df3
+Apache-2.0
+Android: omit SDK camera/QR manager; disable SDK logging. Security/session/protobuf and transport protocol unchanged.
+
+Bloom connection events carry their emitting ESPDevice/transport instance; bridge ignores stale callbacks from a previous frame. Security/session/protobuf unchanged.
