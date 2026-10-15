@@ -83,6 +83,11 @@ public final class BloomProvisionPlugin implements FlutterPlugin, ActivityAware,
         if("scan".equals(pendingOperation))scan();return true;
     }
     @Override public void onMethodCall(@NonNull MethodCall call,@NonNull MethodChannel.Result result){
+        if(call.method.equals("sign_admin")){
+            try{result.success(android.util.Base64.encodeToString(FrameAdminCrypto.sign(call.argument("message"),call.argument("key")),android.util.Base64.NO_WRAP));}
+            catch(Exception e){result.error("local_admin_denied","local_admin_denied",null);}
+            return;
+        }
         if(call.method.equals("disconnect")){close();result.success(null);return;}
         if(call.method.equals("settings")){if(activity!=null)activity.startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS));result.success(null);return;}
         if(pending!=null){result.error("busy","busy",null);return;}
@@ -124,7 +129,10 @@ public final class BloomProvisionPlugin implements FlutterPlugin, ActivityAware,
             public void onPeripheralFound(BluetoothDevice device,ScanResult scan){
                 String name=scan.getScanRecord()==null?null:scan.getScanRecord().getDeviceName();
                 if(name==null || !name.matches("BLOOM_[A-F0-9]{12}"))return;
-                devices.put(name,device);Map<String,Object> item=new HashMap<>();item.put("ble_name",name);item.put("rssi",scan.getRssi());found.put(name,item);
+                devices.put(name,device);Map<String,Object> item=new HashMap<>();item.put("ble_name",name);item.put("rssi",scan.getRssi());
+                byte[] manufacturer=scan.getScanRecord().getManufacturerSpecificData(0xffff);
+                item.put("busy",manufacturer!=null && manufacturer.length==1 && manufacturer[0]==1);
+                found.put(name,item);
             }
             public void scanCompleted(){finish(new ArrayList<>(found.values()),null,current);}
             public void onFailure(Exception e){finish(null,"scan_failed",current);}

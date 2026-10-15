@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:bloom_provision/bloom_provision.dart';
 import '../api/bloom_api_client.dart';
+import 'frame_local_admin.dart';
 
 class FrameSetupCode {
   const FrameSetupCode(this.bleName, this.pop);
@@ -33,6 +34,15 @@ String frameSetupError(Object error) {
           ? error.code
           : null;
   return switch (code) {
+    'configuration_busy' || 'busy' => '相框正在处理另一项操作，请稍后重试。',
+    'device_busy' => '相框正在被其他手机操作，请稍后重试。',
+    'permission_or_credentials_invalid' => '网络信息或管理授权无效，请检查后重新连接。',
+    'frame_busy' || 'playback_interrupted' => '相框正在刷新画面，请稍后重试。',
+    'local_admin_unsupported' => '请先更新相框固件，再使用新的 Wi-Fi 管理功能。',
+    'local_admin_denied' => '本机的相框管理授权已失效，请联网重新获取授权。',
+    'account_changed' => '登录账号已改变，请返回设备页后重试。',
+    'management_not_ready' => '相框网络管理尚未就绪，请重新连接。',
+    'cancelled' => '操作已取消。',
     'bluetooth_off' => '请开启手机蓝牙，再寻找相框。',
     'permission_required' ||
     'permission_denied' => '请在 iPhone 设置 → Bloom 中允许蓝牙访问，然后重试。',
@@ -79,6 +89,7 @@ class FrameSetupController extends ChangeNotifier {
   final String token;
   final BloomProvisionBridge bridge;
   final String? existingDeviceId;
+  bool _standbyCapable = false;
   String name;
   int step = 0;
   bool busy = false, scanning = false, connected = false, completed = false;
@@ -260,6 +271,9 @@ class FrameSetupController extends ChangeNotifier {
     if (!found.any((v) => v['ble_name'] == selectedName)) {
       throw PlatformException(code: 'device_not_found');
     }
+    if (found.any((v) => v['ble_name'] == selectedName && v['busy'] == true)) {
+      throw PlatformException(code: 'device_busy');
+    }
     await bridge.connect(selectedName, credentials['pop'] as String);
     if (!_valid(g)) return;
     final hello = await bridge.data({'op': 'hello'});
@@ -267,6 +281,7 @@ class FrameSetupController extends ChangeNotifier {
       throw PlatformException(code: 'identity_mismatch');
     }
     if (!_valid(g)) return;
+    _standbyCapable = hello['ble_standby'] == true;
     connected = true;
   }
 
@@ -291,6 +306,21 @@ class FrameSetupController extends ChangeNotifier {
       if (!_valid(g)) return;
       phase = 'wifi_scanning';
       _notify();
+      if (_standbyCapable) {
+        await bridge.data({'op': 'setup_scan'});
+        if (!_valid(g)) return;
+        var ready = false;
+        for (var attempt = 0; attempt < 25; attempt++) {
+          final status = await bridge.data({'op': 'setup_radio_status'});
+          if (!_valid(g)) return;
+          if (status['ready'] == true) {
+            ready = true;
+            break;
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+        }
+        if (!ready) throw PlatformException(code: 'wifi_scan_failed');
+      }
       final found = await bridge.networks();
       if (!_valid(g)) return;
       final unique = <String, Map<String, dynamic>>{};
@@ -382,6 +412,13 @@ class FrameSetupController extends ChangeNotifier {
           if (!_valid(g)) return;
           hasExistingPhotos = completedSetup['has_existing_photos'] == true;
           claimed = true;
+          // Optional for older firmware/backends; it must not invalidate pairing.
+          try {
+            await FrameLocalAdmin(
+              api: api,
+              token: token,
+            ).prime(deviceId!, bridge);
+          } catch (_) {}
         }
         if (claimed && phase == 'ready' && status['owned'] == true) {
           completed = true;

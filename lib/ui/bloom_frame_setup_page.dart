@@ -337,7 +337,10 @@ class _BloomFrameSetupPageState extends State<BloomFrameSetupPage>
         for (final d in c.nearby)
           card(
             InkWell(
-              onTap: c.busy ? null : () => c.select(d['ble_name'] as String),
+              onTap:
+                  c.busy || d['busy'] == true
+                      ? null
+                      : () => c.select(d['ble_name'] as String),
               child: Row(
                 children: [
                   const Icon(
@@ -352,7 +355,9 @@ class _BloomFrameSetupPageState extends State<BloomFrameSetupPage>
                       children: [
                         Text('Bloom-Ink', style: style(20)),
                         Text(
-                          '标识 · ${(d['ble_name'] as String).substring(14)}',
+                          d['busy'] == true
+                              ? '正在被其他手机操作'
+                              : '标识 · ${(d['ble_name'] as String).substring(14)}',
                           style: style(13, color: muted),
                         ),
                       ],

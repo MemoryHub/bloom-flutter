@@ -1,10 +1,10 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:bloom_provision/bloom_provision.dart';
 import '../core/api/bloom_api_client.dart';
 import '../core/provisioning/frame_setup_controller.dart';
+import '../core/provisioning/frame_local_admin.dart';
+import '../core/provisioning/frame_network_controller.dart';
 import 'bloom_device_pages.dart';
-import 'bloom_frame_setup_page.dart';
 import 'bloom_glass_home.dart';
 import 'bloom_confirmation_dialog.dart';
 
@@ -22,158 +22,123 @@ class BloomFrameNetworkPage extends StatefulWidget {
   State<BloomFrameNetworkPage> createState() => _BloomFrameNetworkPageState();
 }
 
-class _BloomFrameNetworkPageState extends State<BloomFrameNetworkPage> {
+class _BloomFrameNetworkPageState extends State<BloomFrameNetworkPage>
+    with WidgetsBindingObserver {
   Map<String, dynamic>? _network;
   String? _error;
-  bool _busy = false;
+  late final FrameNetworkController c;
   String get _base => 'devices/${Uri.encodeComponent(widget.device.deviceId)}';
   @override
   void initState() {
     super.initState();
-    unawaited(_load());
+    WidgetsBinding.instance.addObserver(this);
+    c = FrameNetworkController(
+      api: widget.api,
+      token: widget.token,
+      deviceId: widget.device.deviceId,
+    )..addListener(_changed);
+    unawaited(_load()); // HTTP/cache only. Never scan or connect on page entry.
+  }
+
+  void _changed() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      unawaited(c.cancel());
+    }
   }
 
   Future<void> _load() async {
+    Map<String, dynamic>? cached;
+    try {
+      final store = FrameAdminStore();
+      final account = await store.accountId();
+      if (account != null) {
+        final value = await store.read(account, widget.device.deviceId);
+        if (value?['network'] is Map) {
+          cached = Map<String, dynamic>.from(value!['network'] as Map);
+        }
+      }
+      if (mounted && cached != null) setState(() => _network = cached);
+    } catch (_) {}
     try {
       final data = await widget.api.userRequest(widget.token, '$_base/wifi');
+      final remote =
+          data['network'] is Map
+              ? Map<String, dynamic>.from(data['network'] as Map)
+              : null;
+      final localAt = DateTime.tryParse(cached?['seen_at'] as String? ?? '');
+      final remoteAt = DateTime.tryParse(remote?['seen_at'] as String? ?? '');
       if (mounted) {
         setState(() {
-          _network = data['network'] as Map<String, dynamic>?;
+          _network =
+              localAt != null && (remoteAt == null || localAt.isAfter(remoteAt))
+                  ? cached
+                  : remote;
           _error = null;
         });
       }
     } catch (e) {
-      if (mounted) setState(() => _error = frameSetupError(e));
+      if (mounted && cached == null) {
+        setState(() => _error = frameSetupError(e));
+      }
     }
   }
 
   Future<void> _add() async {
-    if (_busy) return;
-    setState(() => _busy = true);
-    String? job;
-    try {
-      final result = await widget.api.userRequest(
-        widget.token,
-        '$_base/commands/open_wifi',
-        method: 'POST',
-      );
-      job = (result['command'] as Map)['id'] as String;
-      if (!mounted) return;
-      await Navigator.push<FrameSetupResult>(
-        context,
-        MaterialPageRoute(
-          builder:
-              (_) => BloomFrameSetupPage(
-                api: widget.api,
-                token: widget.token,
-                deviceId: widget.device.deviceId,
-                deviceName: widget.device.name,
-              ),
-        ),
-      );
-      if (mounted) await _load();
-    } catch (e) {
-      if (mounted) setState(() => _error = frameSetupError(e));
-    } finally {
-      if (job != null) {
-        try {
-          await widget.api.userRequest(
-            widget.token,
-            '$_base/commands/$job',
-            method: 'DELETE',
-          );
-        } catch (_) {
-          /* A completed command or expired login needs no cancellation. */
-        }
-      }
-      if (mounted) setState(() => _busy = false);
+    final summary = await Navigator.push<Map<String, dynamic>>(
+      context,
+      MaterialPageRoute(
+        builder:
+            (_) => BloomFrameWifiAddPage(
+              api: widget.api,
+              token: widget.token,
+              device: widget.device,
+            ),
+      ),
+    );
+    if (!mounted) return;
+    if (summary != null) {
+      setState(() {
+        _network = summary;
+        _error = null;
+      });
     }
   }
 
   Future<void> _forget(String ssid) async {
-    if (_busy) return;
+    final last = (_network?['saved_networks'] as List? ?? []).length == 1;
     if (!await confirmBloomAction(
       context,
       title: '移除这个 Wi-Fi？',
-      message: '「$ssid」的密码会从相框中移除。如果这是当前网络，相框会寻找其他已保存网络或保持蓝牙配网。',
+      message:
+          last
+              ? '这是最后一个已保存网络。移除后相框将无法通过它联网；靠近相框即可重新添加 Wi-Fi。'
+              : '「$ssid」的密码会从相框中移除。如果正在使用它，相框会尝试其他已保存网络。',
       confirmLabel: '移除',
       destructive: true,
     )) {
       return;
     }
     if (!mounted) return;
-    setState(() => _busy = true);
-    const bridge = BloomProvisionBridge();
-    String? job;
-    try {
-      final command = await widget.api.userRequest(
-        widget.token,
-        '$_base/commands/open_wifi',
-        method: 'POST',
-      );
-      job = (command['command'] as Map)['id'] as String;
-      final list = await bridge.scan();
-      final name = _network?['ble_name'] as String?;
-      if (name == null || !list.any((n) => n['ble_name'] == name)) {
-        throw StateError('device_not_found');
-      }
-      final credentials = await widget.api.userRequest(
-        widget.token,
-        'frame-setup/$name',
-      );
-      if (credentials['device_id'] != widget.device.deviceId) {
-        throw StateError('identity_mismatch');
-      }
-      await bridge.connect(name, credentials['pop'] as String);
-      final hello = await bridge.data({'op': 'hello'});
-      if (hello['device_id'] != widget.device.deviceId) {
-        throw StateError('identity_mismatch');
-      }
-      final ticket = await widget.api.userRequest(
-        widget.token,
-        '$_base/setup-ticket',
-        method: 'POST',
-        body: {'nonce': hello['nonce'], 'action': 'forget'},
-      );
-      await bridge.data({'op': 'forget', 'ssid': ssid, ...ticket});
-      bool removed = false;
-      for (int i = 0; i < 20; ++i) {
-        final status = await bridge.data({'op': 'status'});
-        if (status['saved_networks'] is List &&
-            !(status['saved_networks'] as List).contains(ssid)) {
-          removed = true;
-          break;
-        }
-        await Future<void>.delayed(const Duration(milliseconds: 500));
-      }
-      if (!removed) throw StateError('network_remove_failed');
-      if (mounted) {
-        setState(
-          () =>
-              _network = {
-                ...?_network,
-                'saved_networks': [
-                  for (final s in (_network?['saved_networks'] as List? ?? []))
-                    if (s != ssid) s,
-                ],
-              },
-        );
-      }
-    } catch (e) {
-      if (mounted) setState(() => _error = frameSetupError(e));
-    } finally {
-      await bridge.disconnect();
-      if (job != null) {
-        try {
-          await widget.api.userRequest(
-            widget.token,
-            '$_base/commands/$job',
-            method: 'DELETE',
-          );
-        } catch (_) {}
-      }
-      if (mounted) setState(() => _busy = false);
+    if (await c.removeNetwork(ssid) && mounted) {
+      setState(() {
+        _network = c.summary;
+        _error = null;
+      });
     }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    c.removeListener(_changed);
+    c.dispose();
+    super.dispose();
   }
 
   @override
@@ -197,7 +162,7 @@ class _BloomFrameNetworkPageState extends State<BloomFrameNetworkPage> {
         ),
         if (_network?['seen_at'] != null)
           Text(
-            '相框上次报告：${DateTime.tryParse(_network!['seen_at'] as String)?.toLocal() ?? _network!['seen_at']}',
+            '信息更新时间：${DateTime.tryParse(_network!['seen_at'] as String)?.toLocal() ?? _network!['seen_at']}',
             style: BloomType.meta,
           ),
         const SizedBox(height: 20),
@@ -211,7 +176,7 @@ class _BloomFrameNetworkPageState extends State<BloomFrameNetworkPage> {
                 contentPadding: EdgeInsets.zero,
                 title: Text(ssid as String, style: BloomType.body),
                 trailing: IconButton(
-                  onPressed: _busy ? null : () => _forget(ssid),
+                  onPressed: c.busy ? null : () => _forget(ssid),
                   icon: const Icon(
                     Icons.remove_circle_outline,
                     color: BloomInk.textMuted,
@@ -220,22 +185,184 @@ class _BloomFrameNetworkPageState extends State<BloomFrameNetworkPage> {
               ),
             ),
           ),
-        const SizedBox(height: 16),
-        BloomPrimaryButton(
-          label: '添加 Wi-Fi',
-          loading: _busy,
-          onPressed: _busy ? null : _add,
-        ),
+        if (c.busy) ...[
+          const LinearProgressIndicator(),
+          const SizedBox(height: 12),
+          Text(c.progress, style: BloomType.body),
+          const SizedBox(height: 16),
+        ],
+        BloomPrimaryButton(label: '添加 Wi-Fi', onPressed: c.busy ? null : _add),
         const SizedBox(height: 14),
-        const Text(
-          '离线相框会持续开放蓝牙。已联网但正在休眠时，请等待下一次联网接收请求，或重新上电后再试。',
-          style: BloomType.meta,
-        ),
-        if (_error != null)
+        const Text('添加或移除网络时，请让手机靠近相框并开启蓝牙。', style: BloomType.meta),
+        if (c.error ?? _error case final String message)
           Padding(
             padding: const EdgeInsets.only(top: 20),
-            child: Text(_error!, style: BloomType.body),
+            child: Text(message, style: BloomType.body),
           ),
+      ],
+    ),
+  );
+}
+
+class BloomFrameWifiAddPage extends StatefulWidget {
+  const BloomFrameWifiAddPage({
+    super.key,
+    required this.api,
+    required this.token,
+    required this.device,
+  });
+  final BloomApiClient api;
+  final String token;
+  final BloomDevice device;
+  @override
+  State<BloomFrameWifiAddPage> createState() => _BloomFrameWifiAddPageState();
+}
+
+class _BloomFrameWifiAddPageState extends State<BloomFrameWifiAddPage>
+    with WidgetsBindingObserver {
+  late final FrameNetworkController c;
+  final password = TextEditingController();
+  Map<String, dynamic>? selected;
+  bool obscure = true;
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    c = FrameNetworkController(
+      api: widget.api,
+      token: widget.token,
+      deviceId: widget.device.deviceId,
+    )..addListener(_changed);
+    unawaited(c.startAdding()); // This route is entered only by the Add button.
+  }
+
+  void _changed() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      unawaited(c.cancel());
+    }
+  }
+
+  Future<void> _connect() async {
+    if (selected == null) return;
+    if (await c.connectWifi(selected!['ssid'] as String, password.text) &&
+        mounted) {
+      password.clear();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    c.removeListener(_changed);
+    c.dispose();
+    password.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: BloomInk.page,
+    appBar: AppBar(
+      backgroundColor: BloomInk.page,
+      foregroundColor: BloomInk.text,
+      title: const Text('添加 Wi-Fi', style: BloomType.pageTitle),
+    ),
+    body: ListView(
+      padding: const EdgeInsets.all(24),
+      children: [
+        Text(widget.device.name, style: BloomType.sectionTitle),
+        const SizedBox(height: 12),
+        if (c.success) ...[
+          const Icon(
+            Icons.check_circle_outline,
+            color: BloomInk.accent,
+            size: 56,
+          ),
+          const SizedBox(height: 20),
+          const Text('Wi-Fi 配置成功', style: BloomType.sectionTitle),
+          const SizedBox(height: 24),
+          BloomPrimaryButton(
+            label: '完成',
+            onPressed: () => Navigator.pop(context, c.summary),
+          ),
+        ] else if (c.busy) ...[
+          const SizedBox(height: 40),
+          const Center(child: CircularProgressIndicator()),
+          const SizedBox(height: 24),
+          Text(
+            c.progress,
+            style: BloomType.sectionTitle,
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            '请保持手机靠近相框。',
+            style: BloomType.body,
+            textAlign: TextAlign.center,
+          ),
+        ] else ...[
+          const Text('选择 2.4 GHz Wi-Fi', style: BloomType.rowTitle),
+          const SizedBox(height: 16),
+          for (final network in c.networks)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 10),
+              child: BloomPanel(
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(network['ssid'] as String, style: BloomType.body),
+                  leading: Icon(
+                    selected?['ssid'] == network['ssid']
+                        ? Icons.check_circle
+                        : Icons.wifi,
+                    color: BloomInk.accent,
+                  ),
+                  onTap:
+                      () => setState(() {
+                        selected = network;
+                        password.clear();
+                      }),
+                ),
+              ),
+            ),
+          if (c.networks.isEmpty && c.error == null)
+            const Text('暂未发现网络，请重新搜索。', style: BloomType.body),
+          if (selected != null) ...[
+            const SizedBox(height: 16),
+            Text(selected!['ssid'] as String, style: BloomType.rowTitle),
+            if (selected!['auth'] != 0)
+              TextField(
+                controller: password,
+                obscureText: obscure,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: InputDecoration(
+                  labelText: 'Wi-Fi 密码',
+                  suffixIcon: IconButton(
+                    onPressed: () => setState(() => obscure = !obscure),
+                    icon: Icon(
+                      obscure
+                          ? Icons.visibility_outlined
+                          : Icons.visibility_off_outlined,
+                    ),
+                  ),
+                ),
+              ),
+            const SizedBox(height: 20),
+            BloomPrimaryButton(label: '连接 Wi-Fi', onPressed: _connect),
+          ],
+          const SizedBox(height: 16),
+          TextButton(
+            onPressed: () => unawaited(c.startAdding()),
+            child: Text(c.error == null ? '重新搜索' : '重新连接并搜索'),
+          ),
+          if (c.error != null) Text(c.error!, style: BloomType.body),
+        ],
       ],
     ),
   );

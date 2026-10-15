@@ -1,6 +1,7 @@
 import Flutter
 import Foundation
 import CoreBluetooth
+import CryptoKit
 
 public final class BloomProvisionPlugin: NSObject, FlutterPlugin, ESPDeviceConnectionDelegate {
     private var devices: [String: ESPDevice] = [:]
@@ -25,6 +26,23 @@ public final class BloomProvisionPlugin: NSObject, FlutterPlugin, ESPDeviceConne
         }
     }
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        if call.method == "sign_admin" {
+            guard let args = call.arguments as? [String: Any], let key = args["key"] as? String,
+                  key.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
+                  let message = args["message"] as? String, message.utf8.count <= 256 else {
+                result(FlutterError(code: "local_admin_denied", message: "local_admin_denied", details: nil)); return
+            }
+            do {
+                let bytes = stride(from: 0, to: 64, by: 2).map { offset -> UInt8 in
+                    let begin = key.index(key.startIndex, offsetBy: offset)
+                    return UInt8(key[begin..<key.index(begin, offsetBy: 2)], radix: 16)!
+                }
+                let privateKey = try P256.Signing.PrivateKey(rawRepresentation: Data(bytes))
+                let signature = try privateKey.signature(for: Data(message.utf8))
+                result(signature.derRepresentation.base64EncodedString())
+            } catch { result(FlutterError(code: "local_admin_denied", message: "local_admin_denied", details: nil)) }
+            return
+        }
         if call.method == "disconnect" {
             generation += 1
             selected?.disconnect(); selected = nil
@@ -70,7 +88,11 @@ public final class BloomProvisionPlugin: NSObject, FlutterPlugin, ESPDeviceConne
                 }
                 guard let list = list else { self.finish([], nil, current); return }
                 for device in list where device.name.range(of: "^BLOOM_[A-F0-9]{12}$", options: .regularExpression) != nil { self.devices[device.name] = device }
-                self.finish(self.devices.keys.sorted().map { ["ble_name": $0] }, nil, current)
+                self.finish(self.devices.keys.sorted().map { name -> [String: Any] in
+                    let data = self.devices[name]?.advertisementData?[CBAdvertisementDataManufacturerDataKey] as? Data
+                    let busy = data?.count == 3 && data?[0] == 0xff && data?[1] == 0xff && data?[2] == 1
+                    return ["ble_name": name, "busy": busy]
+                }, nil, current)
             }
         case "connect":
             guard let name = args["ble_name"] as? String, let pop = args["pop"] as? String, let device = devices[name] else { finish(nil, "device_not_found", current); return }

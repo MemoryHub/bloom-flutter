@@ -12,9 +12,14 @@ import 'package:bloom/ui/bloom_device_pages.dart';
 import 'package:bloom/ui/bloom_frame_setup_page.dart';
 
 class LocalBridge extends BloomProvisionBridge {
-  LocalBridge({this.actualId = 'frame-one', this.failWifi = false});
+  LocalBridge({
+    this.actualId = 'frame-one',
+    this.failWifi = false,
+    this.standby = false,
+  });
   final String actualId;
   final bool failWifi;
+  final bool standby;
   final messages = <Map<String, dynamic>>[];
   bool claimed = false, closed = false;
   @override
@@ -34,8 +39,10 @@ class LocalBridge extends BloomProvisionBridge {
   Future<Map<String, dynamic>> data(Map<String, dynamic> value) async {
     messages.add(value);
     if (value['op'] == 'hello') {
-      return {'device_id': actualId, 'nonce': 'a' * 32};
+      return {'device_id': actualId, 'nonce': 'a' * 32, 'ble_standby': standby};
     }
+    if (value['op'] == 'setup_scan') return {'status': 'accepted'};
+    if (value['op'] == 'setup_radio_status') return {'ready': true};
     if (value['op'] == 'connect') return {'status': 'accepted'};
     if (value['op'] == 'status') {
       return {
@@ -152,6 +159,20 @@ void main() {
         FrameSetupCode.parse('https://setup/BLOOM_001122334455?pop=$pop'),
         isNull,
       );
+    },
+  );
+  test(
+    'first setup enables Wi-Fi only after the user advances past naming',
+    () async {
+      final bridge = LocalBridge(standby: true);
+      final c = controller(bridge, []);
+      await c.discover(code: const FrameSetupCode('BLOOM_001122334455', pop));
+      expect(bridge.messages.any((m) => m['op'] == 'setup_scan'), false);
+      await c.chooseName('客厅');
+      expect(bridge.messages.any((m) => m['op'] == 'setup_scan'), true);
+      expect(bridge.messages.any((m) => m['op'] == 'setup_radio_status'), true);
+      expect(c.networks, isNotEmpty);
+      c.dispose();
     },
   );
   test(

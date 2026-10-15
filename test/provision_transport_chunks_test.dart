@@ -7,6 +7,81 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   const channel = MethodChannel('bloom/provision');
   test(
+    'long UTF-8 network replies are reassembled from bounded encrypted reads',
+    () async {
+      final result = {
+        'phase': 'network_removed',
+        'saved_networks': List.generate(6, (i) => '家庭网络$i${'测试' * 12}'),
+      };
+      final bytes = utf8.encode(jsonEncode(result));
+      const id = '0123456789abcdef';
+      final count = (bytes.length + 95) ~/ 96;
+      var expected = 0;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            final message =
+                jsonDecode((call.arguments as Map)['json'] as String) as Map;
+            final index =
+                message['op'] == 'status' ? 0 : message['index'] as int;
+            expect(index, expected++);
+            if (index != 0) {
+              expect(message['op'], 'read_response');
+              expect(message['id'], id);
+            }
+            final end =
+                (index + 1) * 96 < bytes.length
+                    ? (index + 1) * 96
+                    : bytes.length;
+            final reply = jsonEncode({
+              'status': 'response_chunk',
+              'id': id,
+              'index': index,
+              'count': count,
+              'data': base64Encode(bytes.sublist(index * 96, end)),
+            });
+            expect(utf8.encode(reply).length, lessThanOrEqualTo(220));
+            return reply;
+          });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(channel, null),
+      );
+      expect(await const BloomProvisionBridge().data({'op': 'status'}), result);
+      expect(expected, count);
+    },
+  );
+  test(
+    'a changed response request id cannot be mixed into the first response',
+    () async {
+      var reads = 0;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            final index = reads++;
+            return jsonEncode({
+              'status': 'response_chunk',
+              'id': index == 0 ? '0123456789abcdef' : 'fedcba9876543210',
+              'index': index,
+              'count': 2,
+              'data': base64Encode(utf8.encode('{}')),
+            });
+          });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(channel, null),
+      );
+      await expectLater(
+        const BloomProvisionBridge().data({'op': 'status'}),
+        throwsA(
+          isA<PlatformException>().having(
+            (e) => e.code,
+            'code',
+            'response_chunk_invalid',
+          ),
+        ),
+      );
+    },
+  );
+  test(
     'signed Wi-Fi payload is reassembled unchanged from bounded secure writes',
     () async {
       final payload = {
