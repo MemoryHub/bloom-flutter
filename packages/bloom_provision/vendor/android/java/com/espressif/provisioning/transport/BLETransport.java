@@ -57,12 +57,16 @@ public class BLETransport implements Transport {
     private BluetoothGattService service;
     private ResponseListener currentResponseListener;
     private Semaphore transportToken;
+    // Only data requests acquire this permit. The initial protocol-version
+    // probe is a plain GATT read, so releasing the permit for that read would
+    // inflate the semaphore and make the next Security1 request race with
+    // the callback that announced the connection.
+    private boolean transportTokenHeld = false;
     private ExecutorService dispatcherThreadPool;
     private HashMap<String, String> uuidMap = new HashMap<>();
     private ArrayList<String> charUuidList = new ArrayList<>();
 
     private String serviceUuid;
-    private boolean isReadingDescriptors = false;
     public ArrayList<String> deviceCapabilities = new ArrayList<>();
     public String versionInfo;
 
@@ -98,17 +102,22 @@ public class BLETransport implements Transport {
             if (characteristic != null) {
                 try {
                     this.transportToken.acquire();
+                    this.transportTokenHeld = true;
                     characteristic.setValue(data);
-                    bluetoothGatt.writeCharacteristic(characteristic);
                     currentResponseListener = listener;
+                    if (!bluetoothGatt.writeCharacteristic(characteristic)) {
+                        currentResponseListener = null;
+                        this.transportTokenHeld = false;
+                        this.transportToken.release();
+                        throw new IllegalStateException("BLE write was not started");
+                    }
                 } catch (Exception e) {
                     /* Bloom: no credential logs. */
-                    listener.onFailure(e);
-                    this.transportToken.release();
-                    currentResponseListener = listener;
-                    if (currentResponseListener != null) {
-                        currentResponseListener.onFailure(e);
+                    if (this.transportTokenHeld) {
+                        this.transportTokenHeld = false;
+                        this.transportToken.release();
                     }
+                    listener.onFailure(e);
                 }
             } else {
                 /* Bloom: SDK logging disabled. */;
@@ -133,6 +142,14 @@ public class BLETransport implements Transport {
      * @param primaryServiceUuid Primary Service UUID
      */
     public void connect(BluetoothDevice bluetoothDevice, UUID primaryServiceUuid) {
+        uuidMap.clear();
+        charUuidList.clear();
+        deviceCapabilities.clear();
+        currentResponseListener = null;
+        if (transportTokenHeld) {
+            transportTokenHeld = false;
+            transportToken.release();
+        }
         this.currentDevice = bluetoothDevice;
         this.serviceUuid = primaryServiceUuid.toString();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -176,6 +193,7 @@ public class BLETransport implements Transport {
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
 
             super.onConnectionStateChange(gatt, status, newState);
+            if (gatt != bluetoothGatt) return;
             /* Bloom: SDK logging disabled. */;
 
             if (status == BluetoothGatt.GATT_FAILURE) {
@@ -202,6 +220,7 @@ public class BLETransport implements Transport {
         public void onServicesDiscovered(BluetoothGatt gatt, int status) {
 
             super.onServicesDiscovered(gatt, status);
+            if (gatt != bluetoothGatt) return;
             /* Bloom: SDK logging disabled. */;
 
             if (status != BluetoothGatt.GATT_SUCCESS) {
@@ -239,6 +258,7 @@ public class BLETransport implements Transport {
         @Override
         public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
 
+            if (gatt != bluetoothGatt) return;
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 /* Bloom: SDK logging disabled. */;
             } else {
@@ -249,46 +269,21 @@ public class BLETransport implements Transport {
 
         @Override
         public void onDescriptorRead(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
-
-            /* Bloom: SDK logging disabled. */;
+            if (gatt != bluetoothGatt) return;
             byte[] data = descriptor.getValue();
+            if (status != BluetoothGatt.GATT_SUCCESS || data == null || data.length == 0) {
+                failConnection();
+                return;
+            }
             String charUuid = descriptor.getCharacteristic().getUuid().toString();
-
-            if (status != BluetoothGatt.GATT_SUCCESS) {
-                /* Bloom: SDK logging disabled. */;
-                charUuidList.remove(charUuid);
-//                EventBus.getDefault().post(new DeviceConnectionEvent(ESPConstants.EVENT_DEVICE_CONNECTION_FAILED, BLETransport.this));
-//                return;
-            }
-
-            if (data == null) {
-                /* Bloom: SDK logging disabled. */;
-                charUuidList.remove(charUuid);
-            } else {
-                String value = new String(data, StandardCharsets.UTF_8);
-                uuidMap.put(value, charUuid);
-                /* Bloom: SDK logging disabled. */;
-            }
-
-            if (isReadingDescriptors) {
-
-                readNextDescriptor();
-
-            } else {
-
-                BluetoothGattCharacteristic characteristic = service.getCharacteristic(UUID.fromString(uuidMap.get(ESPConstants.HANDLER_PROTO_VER)));
-
-                if (characteristic != null) {
-                    // Write anything. It doesn't matter. We need to read characteristic and for that we need to write something.
-                    characteristic.setValue("ESP");
-                    bluetoothGatt.writeCharacteristic(characteristic);
-                }
-            }
+            uuidMap.put(new String(data, StandardCharsets.UTF_8), charUuid);
+            readNextDescriptor();
         }
 
         @Override
         public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
             super.onMtuChanged(gatt, mtu, status);
+            if (gatt != bluetoothGatt) return;
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 /* Bloom: SDK logging disabled. */;
             }
@@ -297,6 +292,7 @@ public class BLETransport implements Transport {
 
         @Override
         public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
+            if (gatt != bluetoothGatt) return;
             /* Bloom: SDK logging disabled. */;
             super.onCharacteristicChanged(gatt, characteristic);
         }
@@ -306,10 +302,30 @@ public class BLETransport implements Transport {
                                          final BluetoothGattCharacteristic characteristic,
                                          int status) {
 
+            if (gatt != bluetoothGatt) return;
+
             /* Bloom: SDK logging disabled. */;
             super.onCharacteristicRead(gatt, characteristic, status);
 
-            if (uuidMap.get((ESPConstants.HANDLER_PROTO_VER)).equals(characteristic.getUuid().toString())) {
+            final String protoUuid = uuidMap.get(ESPConstants.HANDLER_PROTO_VER);
+            final boolean isProtoVersion = protoUuid != null
+                    && protoUuid.equals(characteristic.getUuid().toString());
+
+            if (status != BluetoothGatt.GATT_SUCCESS || characteristic.getValue() == null) {
+                final ResponseListener responseListener = currentResponseListener;
+                currentResponseListener = null;
+                if (responseListener != null) {
+                    responseListener.onFailure(new Exception("Read from BLE failed"));
+                }
+                if (transportTokenHeld) {
+                    transportTokenHeld = false;
+                    transportToken.release();
+                }
+                failConnection();
+                return;
+            }
+
+            if (isProtoVersion) {
 
                 String data = new String(characteristic.getValue(), StandardCharsets.UTF_8);
                 /* Bloom: SDK logging disabled. */;
@@ -335,10 +351,28 @@ public class BLETransport implements Transport {
                     /* Bloom: SDK logging disabled. */;
                 }
 
+                // The event subscriber starts Security1 immediately. Release
+                // the previous data operation before publishing the event so
+                // Android cannot block its GATT callback thread on the same
+                // semaphore.
+            }
+
+            final ResponseListener responseListener = currentResponseListener;
+            currentResponseListener = null;
+            final boolean hadResponse = responseListener != null;
+            if (hadResponse && status != BluetoothGatt.GATT_SUCCESS) {
+                responseListener.onFailure(new Exception("Read from BLE failed"));
+            }
+            if (transportTokenHeld) {
+                transportTokenHeld = false;
+                transportToken.release();
+            }
+
+            if (isProtoVersion) {
                 EventBus.getDefault().post(new DeviceConnectionEvent(ESPConstants.EVENT_DEVICE_CONNECTED, BLETransport.this));
             }
 
-            if (currentResponseListener != null) {
+            if (hadResponse && status == BluetoothGatt.GATT_SUCCESS) {
 
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     /*
@@ -346,27 +380,21 @@ public class BLETransport implements Transport {
                      * might decide to enqueue another send operation on success
                      * of the first.
                      */
-                    final ResponseListener responseListener = currentResponseListener;
                     dispatcherThreadPool.submit(new Runnable() {
                         @Override
                         public void run() {
-                            currentResponseListener = null;
                             byte[] charValue = characteristic.getValue();
                             responseListener.onSuccess(charValue);
                         }
                     });
-                } else {
-
-                    currentResponseListener.onFailure(new Exception("Read from BLE failed"));
-//                    EventBus.getDefault().post(new DeviceProvEvent(LibConstants.EVENT_DEVICE_COMMUNICATION_FAILED));
                 }
             }
-            transportToken.release();
         }
 
         @Override
         public void onCharacteristicWrite(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
 
+            if (gatt != bluetoothGatt) return;
             /* Bloom: SDK logging disabled. */;
             /* Bloom: SDK logging disabled. */;
             super.onCharacteristicWrite(gatt, characteristic, status);
@@ -378,15 +406,15 @@ public class BLETransport implements Transport {
                     currentResponseListener.onFailure(new Exception("Write to BLE failed"));
 //                    EventBus.getDefault().post(new DeviceProvEvent(LibConstants.EVENT_DEVICE_COMMUNICATION_FAILED));
                 }
-                transportToken.release();
+                if (transportTokenHeld) {
+                    transportTokenHeld = false;
+                    transportToken.release();
+                }
             }
         }
     };
 
     private void readNextDescriptor() {
-
-        boolean found = false;
-
         for (int i = 0; i < charUuidList.size(); i++) {
 
             String uuid = charUuidList.get(i);
@@ -396,35 +424,35 @@ public class BLETransport implements Transport {
                 // Read descriptor
                 BluetoothGattCharacteristic characteristic = service.getCharacteristic(UUID.fromString(uuid));
                 if (characteristic == null) {
-                    /* Bloom: SDK logging disabled. */;
-                    disconnect();
-                    EventBus.getDefault().post(new DeviceConnectionEvent(ESPConstants.EVENT_DEVICE_CONNECTION_FAILED, BLETransport.this));
+                    failConnection();
                     return;
                 }
 
                 for (BluetoothGattDescriptor descriptor : characteristic.getDescriptors()) {
                     String desUuid = descriptor.getUuid().toString();
                     if (desUuid.contains(ESPConstants.USER_DESCRIPTION_UUID)) {
-                        /* Bloom: SDK logging disabled. */;
+                        // Reading 0x2901 supplies the endpoint name. Removing
+                        // SDK logs must never remove this GATT operation.
+                        if (!bluetoothGatt.readDescriptor(descriptor)) failConnection();
+                        return; // One operation at a time; continue in callback.
                     }
                 }
-                found = true;
-                break;
+                // Characteristics without a user description are not endpoints.
             }
         }
-
-        if (found) {
-            isReadingDescriptors = true;
-        } else {
-
-            isReadingDescriptors = false;
-
-            BluetoothGattCharacteristic characteristic = service.getCharacteristic(UUID.fromString(uuidMap.get(ESPConstants.HANDLER_PROTO_VER)));
-
-            if (characteristic != null) {
-                characteristic.setValue("ESP");
-                bluetoothGatt.writeCharacteristic(characteristic);
-            }
+        String protoUuid = uuidMap.get(ESPConstants.HANDLER_PROTO_VER);
+        BluetoothGattCharacteristic characteristic = protoUuid == null ? null
+                : service.getCharacteristic(UUID.fromString(protoUuid));
+        if (characteristic == null) {
+            failConnection();
+            return;
         }
+        characteristic.setValue("ESP");
+        if (!bluetoothGatt.writeCharacteristic(characteristic)) failConnection();
+    }
+
+    private void failConnection() {
+        disconnect();
+        EventBus.getDefault().post(new DeviceConnectionEvent(ESPConstants.EVENT_DEVICE_CONNECTION_FAILED, BLETransport.this));
     }
 }

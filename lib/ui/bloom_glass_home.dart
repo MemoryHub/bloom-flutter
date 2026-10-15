@@ -10,6 +10,7 @@ import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
 import '../core/models/auth_models.dart';
 import '../core/models/device_models.dart';
+import '../core/provisioning/frame_playback_controller.dart';
 import '../core/rendering/mobile_artwork_renderer.dart';
 import '../core/storage/display_preferences.dart';
 import 'bloom_device_pages.dart';
@@ -236,6 +237,7 @@ class BloomGlassHome extends StatelessWidget {
     this.onAccountTap,
     this.onSignOut,
     this.accountBusy = false,
+    this.framePlayback,
     this.credentials,
     this.discoverPage,
     this.photoLibraryPage,
@@ -327,6 +329,7 @@ class BloomGlassHome extends StatelessWidget {
   final VoidCallback? onAccountTap;
   final VoidCallback? onSignOut;
   final bool accountBusy;
+  final FramePlaybackController? framePlayback;
 
   /// The master switch, for the same reason as the device page's own switch:
   /// one fact, one owner.
@@ -680,6 +683,7 @@ class BloomGlassHome extends StatelessWidget {
         onSignIn: onAccountTap,
         onSignOut: onSignOut,
         busy: accountBusy,
+        framePlayback: framePlayback,
       ),
     ];
 

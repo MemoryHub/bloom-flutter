@@ -1855,5 +1855,6 @@ class _BloomHomePageState extends State<BloomHomePage>
     onAccountTap: _openAuth,
     onSignOut: _signOut,
     accountBusy: _accountBusy,
+    framePlayback: widget.framePlayback,
   );
 }

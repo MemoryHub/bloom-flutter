@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 
 import '../core/models/auth_models.dart';
+import '../core/provisioning/frame_playback_controller.dart';
+import 'bloom_frame_playback_page.dart';
 import 'bloom_glass_home.dart';
 import 'bloom_sign_in_prompt.dart';
 
@@ -18,6 +20,7 @@ class BloomProfilePage extends StatelessWidget {
     required this.onSignIn,
     this.onSignOut,
     this.busy = false,
+    this.framePlayback,
   });
 
   final AccountInfo? account;
@@ -26,6 +29,7 @@ class BloomProfilePage extends StatelessWidget {
 
   /// 登录/登出进行中，期间禁用操作。
   final bool busy;
+  final FramePlaybackController? framePlayback;
 
   @override
   Widget build(BuildContext context) => SafeArea(
@@ -44,9 +48,7 @@ class BloomProfilePage extends StatelessWidget {
           child: Padding(
             // 给底部导航栏让出位置，否则内容会被玻璃条压住。
             padding: const EdgeInsets.only(bottom: 96),
-            child: account == null
-                ? _signedOut()
-                : _signedIn(account!),
+            child: account == null ? _signedOut() : _signedIn(account!),
           ),
         ),
       ],
@@ -66,6 +68,13 @@ class BloomProfilePage extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _accountCard(account),
+        if (framePlayback != null) ...[
+          const SizedBox(height: 18),
+          AnimatedBuilder(
+            animation: framePlayback!,
+            builder: (context, _) => _activityCard(context, framePlayback!),
+          ),
+        ],
         const SizedBox(height: 26),
         _signOutButton(),
         const SizedBox(height: 18),
@@ -126,10 +135,7 @@ class BloomProfilePage extends StatelessWidget {
         ),
         if (account.isProvisioning) ...[
           const SizedBox(height: 16),
-          Text(
-            '正在准备你的图库，稍后就能看到照片了。',
-            style: BloomType.meta,
-          ),
+          Text('正在准备你的图库，稍后就能看到照片了。', style: BloomType.meta),
         ] else if (account.provisionFailed) ...[
           const SizedBox(height: 16),
           Text(
@@ -140,6 +146,54 @@ class BloomProfilePage extends StatelessWidget {
       ],
     ),
   );
+
+  Widget _activityCard(
+    BuildContext context,
+    FramePlaybackController controller,
+  ) {
+    final jobs = controller.jobs.where((job) => job.active).toList();
+    if (jobs.isEmpty) return const SizedBox.shrink();
+    return BloomPanel(
+      padding: const EdgeInsets.all(18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('正在进行', style: BloomType.rowTitle),
+          const SizedBox(height: 8),
+          for (final job in jobs) ...[
+            Text(job.name, style: BloomType.body),
+            const SizedBox(height: 4),
+            Text(
+              job.phase == 'downloading_first' && job.percent != null
+                  ? '下载第一张照片 · ${job.percent}%'
+                  : job.pendingSetup
+                  ? '等待开始播放'
+                  : '正在准备第一张照片',
+              style: BloomType.meta,
+            ),
+            if (job.progress != null) ...[
+              const SizedBox(height: 8),
+              LinearProgressIndicator(value: job.progress),
+            ],
+            const SizedBox(height: 10),
+            BloomPrimaryButton(
+              label: '查看进度',
+              onPressed:
+                  () => Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder:
+                          (_) => BloomFramePlaybackPage(
+                            controller: controller,
+                            deviceId: job.deviceId,
+                          ),
+                    ),
+                  ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
 
   Widget _signOutButton() => Center(
     child: SizedBox(

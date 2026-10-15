@@ -82,7 +82,12 @@ class _BloomFramePlaybackPageState extends State<BloomFramePlaybackPage> {
       'refreshing_screen',
     ];
     const labels = ['获取轮播计划', '准备第一张照片', '下载第一张照片', '刷新相框屏幕'];
-    final current = completed ? phases.length : phases.indexOf(phase);
+    final current =
+        completed
+            ? phases.length
+            : (_initialRequest || widget.controller.starting(widget.deviceId))
+            ? 0
+            : phases.indexOf(phase);
     final failed = job?.failed == true;
     final idle =
         pending || job == null && !widget.controller.starting(widget.deviceId);
@@ -200,7 +205,9 @@ class _BloomFramePlaybackPageState extends State<BloomFramePlaybackPage> {
                                 child: Padding(
                                   padding: const EdgeInsets.only(top: 2),
                                   child: Text(
-                                    labels[i],
+                                    i == 2 && job?.percent != null
+                                        ? '${labels[i]} · ${job!.percent}%'
+                                        : labels[i],
                                     style: TextStyle(
                                       fontSize: 17,
                                       color: i <= current ? ink : muted,
@@ -210,6 +217,23 @@ class _BloomFramePlaybackPageState extends State<BloomFramePlaybackPage> {
                               ),
                             ],
                           ),
+                        if (job?.phase == 'downloading_first') ...[
+                          const SizedBox(height: 18),
+                          LinearProgressIndicator(
+                            value: job?.progress,
+                            minHeight: 6,
+                            borderRadius: BorderRadius.circular(8),
+                            backgroundColor: const Color(0xFFDFE2D8),
+                            color: green,
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            job?.percent != null
+                                ? '正在下载第一张照片 · ${job!.percent}%'
+                                : '正在下载第一张照片',
+                            style: const TextStyle(color: muted),
+                          ),
+                        ],
                         if (widget.controller.offline)
                           const Padding(
                             padding: EdgeInsets.only(top: 16),

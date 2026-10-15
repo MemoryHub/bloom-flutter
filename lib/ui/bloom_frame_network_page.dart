@@ -426,6 +426,34 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
   String get _base => 'devices/${Uri.encodeComponent(widget.device.deviceId)}';
   String? get _state => _job?['state'] as String?;
   bool get _terminal => {'succeeded', 'failed', 'cancelled'}.contains(_state);
+  static const _resetSteps = [
+    '已向服务器登记解绑任务',
+    '等待相框或手机接手',
+    '蓝牙授权相框清理',
+    '相框恢复欢迎页',
+    '服务器确认解绑',
+    '相框清除 Wi-Fi 并重启',
+    '解绑完成',
+  ];
+
+  int get _resetStep {
+    if (_state == 'succeeded') return _resetSteps.length;
+    if (_state == 'failed' || _state == 'cancelled') {
+      final stage = (_job?['stage'] as num?)?.toInt();
+      return (stage ?? 0).clamp(0, _resetSteps.length).toInt();
+    }
+    return switch (_job?['phase']) {
+      'ble_reset' || 'ble_reset_v2' => 3,
+      'ble_commit' || 'ble_commit_v2' => 5,
+      'resetting' => 4,
+      'reset_syncing' => 5,
+      _ => _state == 'running' ? 2 : 1,
+    };
+  }
+
+  bool get _timelineLoading =>
+      !_terminal && (_starting || _connecting || _state == 'running');
+
   @override
   void initState() {
     super.initState();
@@ -439,9 +467,7 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
       _error = null;
     });
     if (_terminal) _timer?.cancel();
-    if (_state == 'succeeded') {
-      Navigator.pop(context, true);
-    } else if (_state == 'failed') {
+    if (_state == 'failed') {
       setState(() => _error = '相框报告重置未完成，请保留供电并检查相框状态。');
     }
   }
@@ -563,7 +589,15 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
                     : '尚未确认取消，任务仍保留。请检查网络后重试。',
       );
       // Refresh after a claim/cancel race; never mark cancelled locally.
-      if (e is BloomApiException && e.statusCode == 409) await _poll();
+      if (e is BloomApiException && e.statusCode == 409) {
+        // The 409 itself is the server's durable acknowledgement that the
+        // device claimed the task. Show that state immediately while the
+        // follow-up GET fills in its exact phase.
+        if (mounted && _job != null) {
+          setState(() => _job = {..._job!, 'state': 'running'});
+        }
+        await _poll();
+      }
     } finally {
       if (mounted) setState(() => _cancelling = false);
     }
@@ -582,7 +616,10 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
     appBar: AppBar(
       backgroundColor: BloomInk.page,
       foregroundColor: BloomInk.text,
-      title: const Text('解绑并重置', style: BloomType.pageTitle),
+      title: Text(
+        _state == 'running' ? '正在清理相框' : '解绑并重置',
+        style: BloomType.pageTitle,
+      ),
     ),
     body: ListView(
       padding: const EdgeInsets.all(24),
@@ -606,6 +643,14 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
           style: BloomType.body,
         ),
         const SizedBox(height: 20),
+        if (_state == 'queued')
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton(
+              onPressed: _cancelling ? null : _cancel,
+              child: const Text('取消等待并保留绑定'),
+            ),
+          ),
         if (_starting ||
             _connecting ||
             _cancelling ||
@@ -619,6 +664,65 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
           const LinearProgressIndicator(),
           const SizedBox(height: 20),
         ],
+        const Text('解绑进度', style: BloomType.rowTitle),
+        const SizedBox(height: 14),
+        for (var i = 0; i < _resetSteps.length; i++)
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Column(
+                children: [
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 220),
+                    width: 24,
+                    height: 24,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color:
+                          i < _resetStep ? BloomInk.accent : BloomInk.divider,
+                    ),
+                    child:
+                        i < _resetStep
+                            ? const Icon(
+                              Icons.check,
+                              size: 15,
+                              color: Colors.white,
+                            )
+                            : i == _resetStep && _timelineLoading
+                            ? const Padding(
+                              padding: EdgeInsets.all(5),
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                            : null,
+                  ),
+                  if (i < _resetSteps.length - 1)
+                    Container(
+                      width: 2,
+                      height: 24,
+                      color:
+                          i < _resetStep ? BloomInk.accent : BloomInk.divider,
+                    ),
+                ],
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 2, bottom: 12),
+                  child: Text(
+                    _resetSteps[i],
+                    style: TextStyle(
+                      color:
+                          i < _resetStep ? BloomInk.text : BloomInk.textMuted,
+                      fontSize: 16,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
         if (_state == 'queued' ||
             (_state == 'running' &&
                 {
@@ -634,11 +738,6 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
             onPressed: _connecting || _cancelling ? null : _wake,
           ),
           const SizedBox(height: 12),
-          if (_state == 'queued')
-            TextButton(
-              onPressed: _cancelling ? null : _cancel,
-              child: const Text('取消等待并保留绑定'),
-            ),
         ],
         if (_connection != null && _state != 'cancelled')
           Text(_connection!, style: BloomType.meta),
@@ -651,6 +750,11 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
           BloomPrimaryButton(
             label: '返回设备详情',
             onPressed: () => Navigator.pop(context, false),
+          ),
+        if (_state == 'succeeded')
+          BloomPrimaryButton(
+            label: '返回设备列表',
+            onPressed: () => Navigator.pop(context, true),
           ),
         if (_state == 'failed')
           TextButton(

@@ -13,6 +13,18 @@ class FramePlaybackJob {
   String get name => data['device_name'] as String? ?? '相框';
   String get state => data['state'] as String? ?? 'queued';
   String get phase => data['phase'] as String? ?? '';
+  int get receivedBytes => (data['received_bytes'] as num?)?.toInt() ?? 0;
+  int get totalBytes => (data['total_bytes'] as num?)?.toInt() ?? 0;
+  double? get progress {
+    if (totalBytes <= 0 || receivedBytes < 0) return null;
+    return ((receivedBytes / totalBytes).clamp(0.0, 1.0)).toDouble();
+  }
+
+  int? get percent {
+    final value = progress;
+    return value == null ? null : (value * 100).round().clamp(0, 100).toInt();
+  }
+
   DateTime get createdAt =>
       DateTime.tryParse(data['created_at']?.toString() ?? '') ?? DateTime(1970);
   bool get pendingSetup => state == 'awaiting_start';
