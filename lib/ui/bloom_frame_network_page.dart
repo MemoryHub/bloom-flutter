@@ -422,6 +422,7 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
       _cancelling = false,
       _starting = true;
   int _revision = 0;
+  FrameNetworkController? _resetController;
   String get _base => 'devices/${Uri.encodeComponent(widget.device.deviceId)}';
   String? get _state => _job?['state'] as String?;
   bool get _terminal => {'succeeded', 'failed', 'cancelled'}.contains(_state);
@@ -464,7 +465,12 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
           const Duration(seconds: 3),
           (_) => unawaited(_poll()),
         );
-        if (widget.wakeOnStart && _state == 'queued') unawaited(_wake());
+        if (widget.wakeOnStart &&
+            (_state == 'queued' ||
+                _job?['phase'] == 'ble_reset' ||
+                _job?['phase'] == 'ble_commit')) {
+          unawaited(_wake());
+        }
       }
     } catch (e) {
       if (mounted) setState(() => _error = frameSetupError(e));
@@ -474,19 +480,30 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
   }
 
   Future<void> _wake() async {
-    if (_connecting || _cancelling || _state != 'queued') return;
+    if (_connecting || _cancelling || _terminal || _job == null) return;
     setState(() {
       _connecting = true;
       _connection = '正在连接相框…';
     });
-    final result = await requestFrameCloudCheck(
+    final controller = FrameNetworkController(
       api: widget.api,
       token: widget.token,
       deviceId: widget.device.deviceId,
-      onProgress: (message) {
-        if (mounted) setState(() => _connection = message);
-      },
     );
+    _resetController = controller;
+    void progress() {
+      if (mounted) setState(() => _connection = controller.progress);
+    }
+
+    controller.addListener(progress);
+    final done = await controller.resetThroughPhone(_job!['id'] as String);
+    final result =
+        done
+            ? '相框已重置，服务器已确认解绑，云端照片保留。'
+            : '尚未完成：${controller.error ?? '请重新连接继续'}。任务已保留，重新连接会从已完成的步骤继续。';
+    controller.removeListener(progress);
+    controller.dispose();
+    if (_resetController == controller) _resetController = null;
     if (!mounted) return;
     setState(() {
       _connecting = false;
@@ -505,6 +522,7 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
         '$_base/commands/${_job!['id']}',
       );
       if (!mounted || revision != _revision) return;
+      if (_connecting && (data['command'] as Map?)?['state'] == 'succeeded') return;
       _apply(data['command'] as Map<String, dynamic>);
     } catch (_) {
       if (mounted && revision == _revision) {
@@ -550,6 +568,7 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
   @override
   void dispose() {
     _timer?.cancel();
+    _resetController?.dispose();
     super.dispose();
   }
 
@@ -571,34 +590,41 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
           'running' => '正在清理相框',
           'cancelled' => '已取消重置',
           'failed' => '重置未完成',
-          _ => _starting ? '正在提交重置请求' : '等待相框联网领取任务',
+          _ => _starting ? '正在提交重置请求' : '等待连接相框',
         }, style: BloomType.sectionTitle),
         const SizedBox(height: 16),
         Text(
           _state == 'cancelled'
               ? '等待任务已取消，绑定关系和云端照片均保留。'
               : _state == 'queued'
-              ? '相框尚未开始清理。请保持供电；相框需要联网才能领取重置任务。等待期间可以取消。'
+              ? '相框尚未开始清理。手机联网并靠近相框后，可通过蓝牙完成重置，相框无需连接 Wi-Fi。开始前可以取消。'
               : '相框会清理保存的 Wi-Fi、私人照片缓存和设置，恢复欢迎页。只有相框确认完成后才移除主人和供图关系；每个人的云端图库都保留。',
           style: BloomType.body,
         ),
         const SizedBox(height: 20),
-        if (_starting || _connecting || _cancelling || _state == 'running') ...[
+        if (_starting ||
+            _connecting ||
+            _cancelling ||
+            (_state == 'running' &&
+                !{'ble_reset', 'ble_commit'}.contains(_job?['phase']))) ...[
           const LinearProgressIndicator(),
           const SizedBox(height: 20),
         ],
-        if (_state == 'queued') ...[
+        if (_state == 'queued' ||
+            (_state == 'running' &&
+                {'ble_reset', 'ble_commit'}.contains(_job?['phase']))) ...[
           BloomPrimaryButton(
-            label: '连接相框并尝试执行',
+            label: _state == 'queued' ? '通过蓝牙重置相框' : '重新连接并继续重置',
             loading: _connecting,
             loadingLabel: _connection ?? '正在连接…',
             onPressed: _connecting || _cancelling ? null : _wake,
           ),
           const SizedBox(height: 12),
-          TextButton(
-            onPressed: _cancelling ? null : _cancel,
-            child: const Text('取消等待并保留绑定'),
-          ),
+          if (_state == 'queued')
+            TextButton(
+              onPressed: _cancelling ? null : _cancel,
+              child: const Text('取消等待并保留绑定'),
+            ),
         ],
         if (_connection != null && _state != 'cancelled')
           Text(_connection!, style: BloomType.meta),

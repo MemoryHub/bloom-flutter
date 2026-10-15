@@ -35,6 +35,81 @@ class Store extends FrameAdminStore {
   ) async {
     value = Map.of(data);
   }
+
+  @override
+  Future<void> remove(String account, String device) async {
+    value = null;
+  }
+}
+
+class RelayBridge extends Bridge {
+  int resetStage = 0;
+  int starts = 0;
+  bool supported = true;
+  final List<String> events;
+  RelayBridge(this.events);
+  @override
+  Future<Map<String, dynamic>> data(Map<String, dynamic> command) async {
+    switch (command['op']) {
+      case 'hello':
+        return {
+          ...await super.data(command),
+          'reset_relay_capable': supported,
+          'reset_relay_job': resetStage > 0 ? 'reset-1' : '',
+          'reset_relay_stage': resetStage,
+        };
+      case 'admin_reset':
+        events.add('device_start');
+        starts++;
+        resetStage = 3;
+        return {'status': 'reset_accepted'};
+      case 'reset_status':
+        return {
+          'job': 'reset-1',
+          'stage': resetStage,
+          'receipt': 'a' * 64,
+          if (resetStage == 5) 'finished_receipt': 'b' * 64,
+        };
+      case 'reset_commit':
+        events.add('device_commit');
+        resetStage = 5;
+        return {'status': 'reset_committed'};
+      default:
+        return super.data(command);
+    }
+  }
+}
+
+class RelayApi extends BloomApiClient {
+  final List<String> events;
+  String? failAt;
+  RelayApi(this.events);
+  @override
+  Future<Map<String, dynamic>> userRequest(
+    String token,
+    String path, {
+    String method = 'GET',
+    Map<String, Object?>? body,
+    String? deviceToken,
+    Map<String, String>? query,
+  }) async {
+    final step =
+        path.endsWith('/finish')
+            ? 'finish'
+            : path.endsWith('/complete')
+            ? 'complete'
+            : 'authorize';
+    events.add('server_$step');
+    if (failAt == step) throw BloomApiException(503, 'offline', 'offline');
+    return {
+      'command': {
+        'id': 'reset-1',
+        'state': step == 'finish' ? 'succeeded' : 'running',
+      },
+      'message': 'signed-fixture',
+      'signature': 'signature-fixture',
+    };
+  }
 }
 
 class Api extends BloomApiClient {
@@ -219,6 +294,63 @@ class Bridge extends BloomProvisionBridge {
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  FrameNetworkController relay(RelayApi api, RelayBridge bridge, Store store) =>
+      FrameNetworkController(
+        api: api,
+        token: 'test',
+        deviceId: 'frame-1',
+        bridge: bridge,
+        store: store,
+        pause: (_) async {},
+      );
+  test(
+    'offline frame resets only after server authorization and both real receipts',
+    () async {
+      final events = <String>[], store = Store();
+      final api = RelayApi(events), bridge = RelayBridge(events);
+      final c = relay(api, bridge, store);
+      expect(await c.resetThroughPhone('reset-1'), true);
+      expect(events, [
+        'server_authorize',
+        'device_start',
+        'server_complete',
+        'device_commit',
+        'server_finish',
+      ]);
+      expect(store.value, isNull);
+      expect(bridge.management, false);
+      c.dispose();
+    },
+  );
+  test('phone without server access cannot begin destructive reset', () async {
+    final events = <String>[], store = Store();
+    final api = RelayApi(events)..failAt = 'authorize',
+        bridge = RelayBridge(events);
+    final c = relay(api, bridge, store);
+    expect(await c.resetThroughPhone('reset-1'), false);
+    expect(bridge.starts, 0);
+    expect(store.value, isNotNull);
+    c.dispose();
+  });
+  for (final failAt in ['complete', 'finish']) {
+    test(
+      'lost $failAt response resumes without wiping the frame again',
+      () async {
+        final events = <String>[], store = Store();
+        final api = RelayApi(events)..failAt = failAt,
+            bridge = RelayBridge(events);
+        final first = relay(api, bridge, store);
+        expect(await first.resetThroughPhone('reset-1'), false);
+        expect(store.value, isNotNull);
+        first.dispose();
+        api.failAt = null;
+        final second = relay(api, bridge, store);
+        expect(await second.resetThroughPhone('reset-1'), true);
+        expect(bridge.starts, 1);
+        second.dispose();
+      },
+    );
+  }
   FrameNetworkController make(Api api, Bridge bridge, Store store) =>
       FrameNetworkController(
         api: api,
@@ -250,7 +382,7 @@ void main() {
     (tester) async {
       final api = ResetApi();
       await resetPage(tester, api);
-      expect(find.text('等待相框联网领取任务'), findsOneWidget);
+      expect(find.text('等待连接相框'), findsOneWidget);
       expect(find.byType(LinearProgressIndicator), findsNothing);
       await tester.ensureVisible(find.text('取消等待并保留绑定'));
       await tester.tap(find.text('取消等待并保留绑定'));

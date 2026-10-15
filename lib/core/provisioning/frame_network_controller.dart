@@ -36,6 +36,9 @@ class FrameNetworkController extends ChangeNotifier {
     'scanning' => '正在获取 Wi-Fi 列表…',
     'wifi_connecting' => '正在连接 Wi-Fi…',
     'network_removing' => '正在移除网络…',
+    'reset_authorizing' => '正在向服务器确认重置授权…',
+    'resetting' => '正在清理相框并恢复欢迎页…',
+    'reset_syncing' => '正在确认相框与服务器的重置结果…',
     'success' => '操作已完成',
     _ => '正在准备…',
   };
@@ -91,7 +94,11 @@ class FrameNetworkController extends ChangeNotifier {
     }
   }
 
-  Future<void> _connect(int generation, {bool management = true}) async {
+  Future<void> _connect(
+    int generation, {
+    bool management = true,
+    String? resetJob,
+  }) async {
     _account = await store.accountId();
     if (_account == null) throw PlatformException(code: 'account_changed');
     await _check(generation);
@@ -123,8 +130,22 @@ class FrameNetworkController extends ChangeNotifier {
     if (hello['local_admin_capable'] != true || hello['ble_standby'] != true) {
       throw PlatformException(code: 'local_admin_unsupported');
     }
-    if (!management && hello['cloud_check_capable'] != true) {
+    if (!management &&
+        resetJob == null &&
+        hello['cloud_check_capable'] != true) {
       throw PlatformException(code: 'cloud_check_unsupported');
+    }
+    if (resetJob != null) {
+      if (hello['reset_relay_capable'] != true) {
+        throw PlatformException(code: 'reset_relay_unsupported');
+      }
+      if (hello['reset_relay_job'] == resetJob &&
+          (hello['reset_relay_stage'] as num? ?? 0) > 0) {
+        // The device's opaque receipts are job-bound. Recovery must also work
+        // after its old local administration key has actually been erased.
+        connected = true;
+        return;
+      }
     }
     phase = 'authenticating';
     _notify();
@@ -199,6 +220,105 @@ class FrameNetworkController extends ChangeNotifier {
     }
     success =
         true; // Request acknowledged, not proof of server synchronization.
+  }, release: true);
+
+  /// An online phone carries signed authorization and device proofs. The frame
+  /// never needs Wi-Fi, and a phone boolean can never release cloud ownership.
+  Future<bool> resetThroughPhone(String job) => _run((generation) async {
+    await _connect(generation, management: false, resetJob: job);
+    var hello = await bridge.data({'op': 'hello'});
+    await _check(generation);
+    final path =
+        'devices/${Uri.encodeComponent(deviceId)}/commands/$job/ble-reset';
+    if (hello['reset_relay_job'] != job ||
+        (hello['reset_relay_stage'] as num? ?? 0) == 0) {
+      phase = 'reset_authorizing';
+      _notify();
+      final grant = await api.userRequest(
+        token,
+        path,
+        method: 'POST',
+        body: {'nonce': hello['nonce']},
+      );
+      await _check(generation);
+      final reply = await bridge.data({
+        'op': 'admin_reset',
+        'job': job,
+        'message': grant['message'],
+        'signature': grant['signature'],
+      });
+      await _check(generation);
+      if (reply['status'] != 'reset_accepted') {
+        throw PlatformException(code: 'reset_authorization_denied');
+      }
+    }
+    phase = 'resetting';
+    _notify();
+    Map<String, dynamic>? status;
+    for (var i = 0; i < 240; i++) {
+      status = await bridge.data({'op': 'reset_status'});
+      await _check(generation);
+      if (status['job'] != job) {
+        throw PlatformException(code: 'identity_mismatch');
+      }
+      if ((status['stage'] as num? ?? 0) >= 3) break;
+      await pause(const Duration(milliseconds: 500));
+      await _check(generation);
+    }
+    if ((status?['stage'] as num? ?? 0) < 3) {
+      throw PlatformException(code: 'timeout');
+    }
+    if ((status!['stage'] as num) < 5) {
+      phase = 'reset_syncing';
+      _notify();
+      final ack = await api.userRequest(
+        token,
+        '$path/complete',
+        method: 'POST',
+        body: {'receipt': status['receipt']},
+      );
+      await _check(generation);
+      final accepted = await bridge.data({
+        'op': 'reset_commit',
+        'message': ack['message'],
+        'signature': ack['signature'],
+      });
+      await _check(generation);
+      if (accepted['status'] != 'reset_committed') {
+        throw PlatformException(code: 'reset_commit_denied');
+      }
+      for (var i = 0; i < 30; i++) {
+        await pause(const Duration(milliseconds: 250));
+        await _check(generation);
+        status = await bridge.data({'op': 'reset_status'});
+        await _check(generation);
+        if (status['job'] != job) {
+          throw PlatformException(code: 'identity_mismatch');
+        }
+        if (status['stage'] == 5) break;
+      }
+    }
+    final finishedStatus = status;
+    if (finishedStatus == null ||
+        finishedStatus['stage'] != 5 ||
+        finishedStatus['finished_receipt'] is! String) {
+      throw PlatformException(code: 'reset_commit_denied');
+    }
+    phase = 'reset_syncing';
+    _notify();
+    final result = await api.userRequest(
+      token,
+      '$path/finish',
+      method: 'POST',
+      body: {'receipt': finishedStatus['finished_receipt']},
+    );
+    await _check(generation);
+    if ((result['command'] as Map?)?['state'] != 'succeeded') {
+      throw PlatformException(code: 'reset_commit_denied');
+    }
+    if (_account != null) await store.remove(_account!, deviceId);
+    success = true;
+    phase = 'success';
   }, release: true);
 
   Future<bool> startAdding() => _run((generation) async {
@@ -334,6 +454,7 @@ class FrameNetworkController extends ChangeNotifier {
 
   @override
   void dispose() {
+    if (_closed) return;
     _closed = true;
     ++_generation;
     unawaited(_release());
