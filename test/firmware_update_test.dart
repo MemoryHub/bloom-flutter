@@ -282,9 +282,11 @@ void main() {
     }
     await updates.cancel(updates.jobFor('frame-1')!);
     await tester.pumpAndSettle();
-    await tester.ensureVisible(
-      find.byKey(const ValueKey('bloom-firmware-start')),
+    await Scrollable.ensureVisible(
+      tester.element(find.byKey(const ValueKey('bloom-firmware-start'))),
+      alignment: .5,
     );
+    await tester.pumpAndSettle();
     await tester.tap(find.byKey(const ValueKey('bloom-firmware-start')));
     await tester.pumpAndSettle();
     expect(starts, 2);

@@ -62,6 +62,42 @@ class Api extends BloomApiClient {
   }
 }
 
+class ResetApi extends BloomApiClient {
+  String state = 'queued';
+  int deletes = 0, gets = 0;
+  bool claimRace = false;
+  Completer<Map<String, dynamic>>? pendingGet;
+  @override
+  Future<Map<String, dynamic>> userRequest(
+    String token,
+    String path, {
+    String method = 'GET',
+    Map<String, Object?>? body,
+    String? deviceToken,
+    Map<String, String>? query,
+  }) async {
+    if (method == 'DELETE') {
+      deletes++;
+      if (claimRace) {
+        state = 'running';
+        throw BloomApiException(
+          409,
+          'device_reset_cannot_cancel',
+          'cannot cancel',
+        );
+      }
+      state = 'cancelled';
+    }
+    if (method == 'GET') {
+      gets++;
+      if (pendingGet != null) return pendingGet!.future;
+    }
+    return {
+      'command': {'id': 'reset-1', 'state': state},
+    };
+  }
+}
+
 class EnrollmentApi extends BloomApiClient {
   EnrollmentApi(this.grant);
   final Map<String, dynamic> grant;
@@ -78,7 +114,7 @@ class EnrollmentApi extends BloomApiClient {
 
 class Bridge extends BloomProvisionBridge {
   int scans = 0, connects = 0, disconnects = 0;
-  bool busyAdvert = false;
+  bool busyAdvert = false, cloudCapable = true, badCloudAck = false;
   bool management = false,
       failWifi = false,
       refreshing = false,
@@ -125,6 +161,7 @@ class Bridge extends BloomProvisionBridge {
           'device_id': actualId,
           'nonce': 'a' * 32,
           'local_admin_capable': true,
+          'cloud_check_capable': cloudCapable,
           'ble_standby': !unsupported,
           'local_admin_epoch': 1,
         };
@@ -135,6 +172,8 @@ class Bridge extends BloomProvisionBridge {
           'MEUCICTfTlIYyG7ehKoFfWCx+VLMHWMwXIPw1azU0ypBfad9AiEAv+lD5wPggacMWYUS54LyJdYWjgRM4VEhHvmVyGXmogM=',
         );
         return {'status': 'authenticated'};
+      case 'admin_check_server':
+        return {'status': badCloudAck ? 'accepted' : 'server_check_requested'};
       case 'admin_begin':
         management = true;
         return {'status': 'accepted'};
@@ -189,6 +228,110 @@ void main() {
         store: store,
         pause: (_) async {},
       );
+  Future<void> resetPage(WidgetTester tester, ResetApi api) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: BloomFrameResetPage(
+          api: api,
+          token: 'test',
+          device: const BloomDevice(
+            deviceId: 'frame-1',
+            name: 'Frame',
+            type: 'eink',
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+  }
+
+  testWidgets(
+    'queued reset shows no fake progress and cancels only after server acknowledgement',
+    (tester) async {
+      final api = ResetApi();
+      await resetPage(tester, api);
+      expect(find.text('等待相框联网领取任务'), findsOneWidget);
+      expect(find.byType(LinearProgressIndicator), findsNothing);
+      await tester.ensureVisible(find.text('取消等待并保留绑定'));
+      await tester.tap(find.text('取消等待并保留绑定'));
+      await tester.pumpAndSettle();
+      expect(api.deletes, 1);
+      expect(find.text('已取消重置'), findsOneWidget);
+      await tester.pump(const Duration(seconds: 6));
+      expect(api.gets, 0);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+  testWidgets(
+    'reset claimed during cancellation stays running and cannot falsely cancel',
+    (tester) async {
+      final api = ResetApi()..claimRace = true;
+      await resetPage(tester, api);
+      await tester.ensureVisible(find.text('取消等待并保留绑定'));
+      await tester.tap(find.text('取消等待并保留绑定'));
+      await tester.pump();
+      await tester.pump();
+      expect(find.text('正在清理相框'), findsOneWidget);
+      expect(find.text('已取消重置'), findsNothing);
+      expect(find.text('取消等待并保留绑定'), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+  testWidgets('late queued poll cannot resurrect a cancelled reset', (
+    tester,
+  ) async {
+    final api = ResetApi();
+    await resetPage(tester, api);
+    api.pendingGet = Completer<Map<String, dynamic>>();
+    await tester.pump(const Duration(seconds: 3));
+    expect(api.gets, 1);
+    await tester.ensureVisible(find.text('取消等待并保留绑定'));
+    await tester.tap(find.text('取消等待并保留绑定'));
+    await tester.pumpAndSettle();
+    api.pendingGet!.complete({
+      'command': {'id': 'reset-1', 'state': 'queued'},
+    });
+    await tester.pumpAndSettle();
+    expect(find.text('已取消重置'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+  });
+  test(
+    'explicit cloud check authenticates but never scans Wi-Fi or sends settings',
+    () async {
+      final api = Api(), bridge = Bridge(), store = Store();
+      final c = make(api, bridge, store);
+      expect(await c.checkServer(), true);
+      expect(bridge.commands.map((x) => x['op']), [
+        'hello',
+        'admin_auth',
+        'admin_check_server',
+        'admin_end',
+      ]);
+      expect(bridge.commands[2], {'op': 'admin_check_server'});
+      expect(c.connected, false);
+      expect(api.requests, 0);
+      c.dispose();
+    },
+  );
+  test('unsupported firmware cannot receive a wake request', () async {
+    final api = Api(), bridge = Bridge()..cloudCapable = false, store = Store();
+    final c = make(api, bridge, store);
+    expect(await c.checkServer(), false);
+    expect(c.error, contains('固件'));
+    expect(bridge.commands.any((x) => x['op'] == 'admin_check_server'), false);
+    c.dispose();
+  });
+  test(
+    'a generic accepted reply is not a confirmed cloud-check request',
+    () async {
+      final api = Api(), bridge = Bridge()..badCloudAck = true, store = Store();
+      final c = make(api, bridge, store);
+      expect(await c.checkServer(), false);
+      expect(c.success, false);
+      expect(c.connected, false);
+      c.dispose();
+    },
+  );
   test('constructor does not discover, connect or fetch credentials', () async {
     final api = Api(), bridge = Bridge(), store = Store();
     final c = make(api, bridge, store);

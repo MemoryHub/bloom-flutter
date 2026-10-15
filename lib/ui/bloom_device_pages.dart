@@ -7,6 +7,7 @@ import 'package:liquid_glass_easy/liquid_glass_easy.dart';
 
 import '../background_sync.dart';
 import '../core/api/bloom_api_client.dart';
+import '../core/provisioning/frame_network_controller.dart';
 import '../core/models/auth_models.dart';
 import '../core/models/device_models.dart';
 import '../core/storage/display_preferences.dart';
@@ -879,12 +880,29 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
       );
       if (!mounted) return;
       setState(() => _orientationMode = saved);
-      _showToast('设置已保存。相框下次唤醒时生效，轻按中键可立即同步。');
+      await _requestSavedFrameCheck();
     } catch (_) {
       if (mounted) _showToast('朝向设置未保存，请稍后重试。', isError: true);
     } finally {
       if (mounted) setState(() => _orientationSaving = false);
     }
+  }
+
+  Future<void> _requestSavedFrameCheck() async {
+    final token = widget.userToken;
+    if (token == null) {
+      if (mounted) _showToast('设置已保存，相框下次联网时同步。');
+      return;
+    }
+    final result = await requestFrameCloudCheck(
+      api: BloomApiClient(),
+      token: token,
+      deviceId: widget.device.deviceId,
+      onProgress: (progress) {
+        if (mounted) _showToast('设置已保存。$progress');
+      },
+    );
+    if (mounted) _showToast('设置已保存。$result');
   }
 
   Future<void> _readWidgetEnabled() async {
@@ -1069,7 +1087,11 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
         // 不清掉的话，推荐模式下「保存」按钮会因为 `_sourcesTouched` 永远亮着。
         _sourcesTouched = false;
       });
-      _showToast(_successMessage(result));
+      if (widget.device.isFrame) {
+        await _requestSavedFrameCheck();
+      } else {
+        _showToast(_successMessage(result));
+      }
       unawaited(HapticFeedback.mediumImpact());
     } on BloomApiException catch (error) {
       if (mounted) _showToast(_describeApiError(error), isError: true);
@@ -1754,6 +1776,7 @@ class _BloomDeviceDetailPageState extends State<BloomDeviceDetailPage> {
                 api: BloomApiClient(),
                 token: widget.userToken!,
                 device: widget.device,
+                wakeOnStart: true,
               ),
         ),
       );

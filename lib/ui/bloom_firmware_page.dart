@@ -23,6 +23,18 @@ Future<void> stopBloomFirmwareUpdate(
   if (!confirmed || !context.mounted) return;
   try {
     await updates.cancel(job);
+    if (updates.jobFor(job.deviceId)?.state == 'cancel_requested' &&
+        context.mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('停止请求已保存，正在尝试连接相框…')));
+      final result = await updates.requestNearbyCheck(job.deviceId);
+      if (context.mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(result)));
+      }
+    }
   } catch (error) {
     if (context.mounted) {
       ScaffoldMessenger.of(
@@ -47,7 +59,8 @@ class BloomFirmwarePage extends StatefulWidget {
 class _BloomFirmwarePageState extends State<BloomFirmwarePage> {
   FirmwareCheck? _check;
   String? _error;
-  bool _loading = true;
+  bool _loading = true, _connecting = false;
+  String? _connectionMessage;
   int _generation = 0;
   String? _observedJobState;
   @override
@@ -100,8 +113,31 @@ class _BloomFirmwarePageState extends State<BloomFirmwarePage> {
     }
     try {
       await widget.updates.start(widget.deviceId, latest);
+      if (mounted && widget.updates.hasActiveFor(widget.deviceId)) {
+        await _connectNearby();
+      }
     } catch (error) {
       if (mounted) setState(() => _error = firmwareErrorMessage(error));
+    }
+  }
+
+  Future<void> _connectNearby() async {
+    if (_connecting) return;
+    setState(() {
+      _connecting = true;
+      _connectionMessage = '正在连接相框…';
+    });
+    final result = await widget.updates.requestNearbyCheck(
+      widget.deviceId,
+      onProgress: (message) {
+        if (mounted) setState(() => _connectionMessage = message);
+      },
+    );
+    if (mounted) {
+      setState(() {
+        _connecting = false;
+        _connectionMessage = result;
+      });
     }
   }
 
@@ -116,7 +152,7 @@ class _BloomFirmwarePageState extends State<BloomFirmwarePage> {
   Widget build(BuildContext context) {
     final job = widget.updates.jobFor(widget.deviceId);
     final release = _check?.release;
-    final busy = widget.updates.busy(widget.deviceId);
+    final busy = widget.updates.busy(widget.deviceId) || _connecting;
     return Scaffold(
       backgroundColor: BloomInk.page,
       appBar: AppBar(
@@ -144,13 +180,23 @@ class _BloomFirmwarePageState extends State<BloomFirmwarePage> {
           Text(
             _check?.presence == 'recently_seen'
                 ? '相框最近已联网，开始更新时将再次确认连接'
-                : '等待相框联网后开始更新',
+                : '开始更新后会尝试通过蓝牙连接附近的相框，离线时保留更新任务',
             style: BloomType.meta,
           ),
           if (_check?.lastSeenAt != null) ...[
             const SizedBox(height: 4),
             Text('最近连接  ${_time(_check!.lastSeenAt!)}', style: BloomType.meta),
           ],
+          if (_connectionMessage != null) ...[
+            const SizedBox(height: 12),
+            Text(_connectionMessage!, style: BloomType.meta),
+            if (_connecting) const LinearProgressIndicator(),
+          ],
+          if (job?.state == 'queued')
+            TextButton(
+              onPressed: _connecting ? null : _connectNearby,
+              child: const Text('连接附近相框并检查更新'),
+            ),
           if (_loading) ...[
             const SizedBox(height: 20),
             const LinearProgressIndicator(),

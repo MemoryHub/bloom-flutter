@@ -32,6 +32,7 @@ class FrameNetworkController extends ChangeNotifier {
   String get progress => switch (phase) {
     'bluetooth_connecting' => '正在连接相框…',
     'authenticating' => '正在验证相框…',
+    'server_check' => '正在请求相框检查服务器…',
     'scanning' => '正在获取 Wi-Fi 列表…',
     'wifi_connecting' => '正在连接 Wi-Fi…',
     'network_removing' => '正在移除网络…',
@@ -90,7 +91,7 @@ class FrameNetworkController extends ChangeNotifier {
     }
   }
 
-  Future<void> _connect(int generation) async {
+  Future<void> _connect(int generation, {bool management = true}) async {
     _account = await store.accountId();
     if (_account == null) throw PlatformException(code: 'account_changed');
     await _check(generation);
@@ -122,6 +123,9 @@ class FrameNetworkController extends ChangeNotifier {
     if (hello['local_admin_capable'] != true || hello['ble_standby'] != true) {
       throw PlatformException(code: 'local_admin_unsupported');
     }
+    if (!management && hello['cloud_check_capable'] != true) {
+      throw PlatformException(code: 'cloud_check_unsupported');
+    }
     phase = 'authenticating';
     _notify();
     if (hello['local_admin_epoch'] != access['epoch']) {
@@ -142,6 +146,7 @@ class FrameNetworkController extends ChangeNotifier {
     });
     await _check(generation);
     connected = true;
+    if (!management) return;
     await bridge.data({'op': 'admin_begin'});
     await _check(generation);
     for (var attempt = 0; attempt < 25; attempt++) {
@@ -181,6 +186,20 @@ class FrameNetworkController extends ChangeNotifier {
     value['network'] = summary;
     await store.write(_account!, deviceId, value);
   }
+
+  /// Explicit user actions only. Never called by discovery, page load or polling.
+  Future<bool> checkServer() => _run((generation) async {
+    await _connect(generation, management: false);
+    phase = 'server_check';
+    _notify();
+    final reply = await bridge.data({'op': 'admin_check_server'});
+    await _check(generation);
+    if (reply['status'] != 'server_check_requested') {
+      throw PlatformException(code: 'server_check_failed');
+    }
+    success =
+        true; // Request acknowledged, not proof of server synchronization.
+  }, release: true);
 
   Future<bool> startAdding() => _run((generation) async {
     await _connect(generation);
@@ -319,5 +338,36 @@ class FrameNetworkController extends ChangeNotifier {
     ++_generation;
     unawaited(_release());
     super.dispose();
+  }
+}
+
+/// The cloud write has already succeeded. A BLE failure must not undo its UI.
+Future<String> requestFrameCloudCheck({
+  required BloomApiClient api,
+  required String token,
+  required String deviceId,
+  void Function(String)? onProgress,
+}) async {
+  final controller = FrameNetworkController(
+    api: api,
+    token: token,
+    deviceId: deviceId,
+  );
+  void progress() => onProgress?.call(controller.progress);
+  controller.addListener(progress);
+  try {
+    final accepted = await controller.checkServer().timeout(
+      const Duration(seconds: 50),
+    );
+    return accepted
+        ? '已请求相框立即联网检查，实际生效以相框回报为准。'
+        : '立即连接未完成：${controller.error ?? '请靠近相框后重试'}。云端操作已保留，相框联网后会继续。';
+  } on TimeoutException {
+    return '连接相框超时，云端操作已保留，相框联网后会继续。';
+  } catch (_) {
+    return '暂时无法连接相框，云端操作已保留，相框联网后会继续。';
+  } finally {
+    controller.removeListener(progress);
+    controller.dispose();
   }
 }

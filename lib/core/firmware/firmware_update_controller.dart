@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/widgets.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../api/bloom_api_client.dart';
+import '../provisioning/frame_network_controller.dart';
 import '../models/firmware_models.dart';
 
 /// Account-scoped observer. Closing routes/app never sends an OTA cancellation.
@@ -192,6 +193,23 @@ class FirmwareUpdateController extends ChangeNotifier
         _changed();
       }
     }
+  }
+
+  /// Called only by the user's update/reconnect button, never by refresh().
+  Future<String> requestNearbyCheck(
+    String deviceId, {
+    void Function(String)? onProgress,
+  }) async {
+    final token = _token, generation = _generation;
+    if (token == null || _disposed) return '请先登录。';
+    final result = await requestFrameCloudCheck(
+      api: api,
+      token: token,
+      deviceId: deviceId,
+      onProgress: onProgress,
+    );
+    if (_disposed || generation != _generation) return '账号已变化，请重新打开设备。';
+    return result;
   }
 
   Future<void> cancel(FirmwareJob job) async {

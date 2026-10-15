@@ -38,6 +38,8 @@ String frameSetupError(Object error) {
     'device_busy' => '相框正在被其他手机操作，请稍后重试。',
     'permission_or_credentials_invalid' => '网络信息或管理授权无效，请检查后重新连接。',
     'frame_busy' || 'playback_interrupted' => '相框正在刷新画面，请稍后重试。',
+    'cloud_check_unsupported' => '相框固件暂不支持立即连接，请更新相框固件。',
+    'server_check_failed' => '相框未确认立即连接请求，请稍后重试。',
     'local_admin_unsupported' => '请先更新相框固件，再使用新的 Wi-Fi 管理功能。',
     'local_admin_denied' => '本机的相框管理授权已失效，请联网重新获取授权。',
     'account_changed' => '登录账号已改变，请返回设备页后重试。',

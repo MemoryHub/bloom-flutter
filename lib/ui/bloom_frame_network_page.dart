@@ -402,70 +402,148 @@ class BloomFrameResetPage extends StatefulWidget {
     required this.api,
     required this.token,
     required this.device,
+    this.wakeOnStart = false,
   });
   final BloomApiClient api;
   final String token;
   final BloomDevice device;
+  // Only a confirmed reset action may initiate a nearby connection.
+  final bool wakeOnStart;
   @override
   State<BloomFrameResetPage> createState() => _BloomFrameResetPageState();
 }
 
 class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
   Map<String, dynamic>? _job;
-  String? _error;
+  String? _error, _connection;
   Timer? _timer;
-  bool _polling = false;
+  bool _polling = false,
+      _connecting = false,
+      _cancelling = false,
+      _starting = true;
+  int _revision = 0;
   String get _base => 'devices/${Uri.encodeComponent(widget.device.deviceId)}';
+  String? get _state => _job?['state'] as String?;
+  bool get _terminal => {'succeeded', 'failed', 'cancelled'}.contains(_state);
   @override
   void initState() {
     super.initState();
     unawaited(_start());
   }
 
+  void _apply(Map<String, dynamic> job) {
+    if (!mounted) return;
+    setState(() {
+      _job = job;
+      _error = null;
+    });
+    if (_terminal) _timer?.cancel();
+    if (_state == 'succeeded') {
+      Navigator.pop(context, true);
+    } else if (_state == 'failed') {
+      setState(() => _error = '相框报告重置未完成，请保留供电并检查相框状态。');
+    }
+  }
+
   Future<void> _start() async {
+    setState(() {
+      _starting = true;
+      _error = null;
+    });
     try {
       final data = await widget.api.userRequest(
         widget.token,
         '$_base/commands/reset',
         method: 'POST',
       );
-      if (mounted) {
-        setState(() => _job = data['command'] as Map<String, dynamic>);
+      if (!mounted) return;
+      _apply(data['command'] as Map<String, dynamic>);
+      if (!_terminal) {
+        _timer?.cancel();
         _timer = Timer.periodic(
           const Duration(seconds: 3),
           (_) => unawaited(_poll()),
         );
+        if (widget.wakeOnStart && _state == 'queued') unawaited(_wake());
       }
     } catch (e) {
       if (mounted) setState(() => _error = frameSetupError(e));
+    } finally {
+      if (mounted) setState(() => _starting = false);
     }
   }
 
+  Future<void> _wake() async {
+    if (_connecting || _cancelling || _state != 'queued') return;
+    setState(() {
+      _connecting = true;
+      _connection = '正在连接相框…';
+    });
+    final result = await requestFrameCloudCheck(
+      api: widget.api,
+      token: widget.token,
+      deviceId: widget.device.deviceId,
+      onProgress: (message) {
+        if (mounted) setState(() => _connection = message);
+      },
+    );
+    if (!mounted) return;
+    setState(() {
+      _connecting = false;
+      _connection = result;
+    });
+    await _poll();
+  }
+
   Future<void> _poll() async {
-    if (_polling || _job == null) return;
+    if (_polling || _job == null || _terminal) return;
     _polling = true;
+    final revision = _revision;
     try {
       final data = await widget.api.userRequest(
         widget.token,
         '$_base/commands/${_job!['id']}',
       );
-      if (!mounted) return;
-      setState(() {
-        _job = data['command'] as Map<String, dynamic>;
-        _error = null;
-      });
-      if (_job!['state'] == 'succeeded') {
-        _timer?.cancel();
-        Navigator.pop(context, true);
-      }
-      if (_job!['state'] == 'failed') {
-        _timer?.cancel();
-        setState(() => _error = '相框重置未完成，主人关系仍保留。请检查相框后重试。');
-      }
+      if (!mounted || revision != _revision) return;
+      _apply(data['command'] as Map<String, dynamic>);
     } catch (_) {
-      if (mounted) setState(() => _error = '暂时无法获取进度，重置任务会保留，正在重试。');
+      if (mounted && revision == _revision) {
+        setState(() => _error = '暂时无法获取进度，任务仍保留，将继续查询。');
+      }
     } finally {
       _polling = false;
+    }
+  }
+
+  Future<void> _cancel() async {
+    if (_cancelling || _state != 'queued') return;
+    // Ignore a stale GET completing after this cancellation response.
+    ++_revision;
+    setState(() {
+      _cancelling = true;
+      _error = null;
+    });
+    try {
+      final data = await widget.api.userRequest(
+        widget.token,
+        '$_base/commands/${_job!['id']}',
+        method: 'DELETE',
+      );
+      if (!mounted) return;
+      _apply(data['command'] as Map<String, dynamic>);
+    } catch (e) {
+      if (!mounted) return;
+      setState(
+        () =>
+            _error =
+                e is BloomApiException && e.statusCode == 409
+                    ? '相框已开始重置，无法取消。正在获取最新状态。'
+                    : '尚未确认取消，任务仍保留。请检查网络后重试。',
+      );
+      // Refresh after a claim/cancel race; never mark cancelled locally.
+      if (e is BloomApiException && e.statusCode == 409) await _poll();
+    } finally {
+      if (mounted) setState(() => _cancelling = false);
     }
   }
 
@@ -483,38 +561,67 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
       foregroundColor: BloomInk.text,
       title: const Text('解绑并重置', style: BloomType.pageTitle),
     ),
-    body: Padding(
+    body: ListView(
       padding: const EdgeInsets.all(24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          const SizedBox(height: 36),
-          const Icon(
-            Icons.restart_alt_rounded,
-            size: 58,
-            color: BloomInk.accent,
-          ),
-          const SizedBox(height: 28),
-          Text(
-            _job?['state'] == 'running' ? '正在清理相框' : '等待相框连接',
-            style: BloomType.sectionTitle,
-          ),
-          const SizedBox(height: 16),
-          const Text(
-            '相框会清理保存的 Wi-Fi、私人照片和设置，并恢复欢迎页。设备确认完成后，会移除主人及所有供图关系。每个人的云端图库都保留。',
-            style: BloomType.body,
-          ),
-          const SizedBox(height: 20),
+      children: [
+        const SizedBox(height: 36),
+        const Icon(Icons.restart_alt_rounded, size: 58, color: BloomInk.accent),
+        const SizedBox(height: 28),
+        Text(switch (_state) {
+          'running' => '正在清理相框',
+          'cancelled' => '已取消重置',
+          'failed' => '重置未完成',
+          _ => _starting ? '正在提交重置请求' : '等待相框联网领取任务',
+        }, style: BloomType.sectionTitle),
+        const SizedBox(height: 16),
+        Text(
+          _state == 'cancelled'
+              ? '等待任务已取消，绑定关系和云端照片均保留。'
+              : _state == 'queued'
+              ? '相框尚未开始清理。请保持供电；相框需要联网才能领取重置任务。等待期间可以取消。'
+              : '相框会清理保存的 Wi-Fi、私人照片缓存和设置，恢复欢迎页。只有相框确认完成后才移除主人和供图关系；每个人的云端图库都保留。',
+          style: BloomType.body,
+        ),
+        const SizedBox(height: 20),
+        if (_starting || _connecting || _cancelling || _state == 'running') ...[
           const LinearProgressIndicator(),
           const SizedBox(height: 20),
-          const Text('可以离开本页，任务会继续。再次打开“解绑并重置”可查看进度。', style: BloomType.meta),
-          if (_error != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 20),
-              child: Text(_error!, style: BloomType.body),
-            ),
         ],
-      ),
+        if (_state == 'queued') ...[
+          BloomPrimaryButton(
+            label: '连接相框并尝试执行',
+            loading: _connecting,
+            loadingLabel: _connection ?? '正在连接…',
+            onPressed: _connecting || _cancelling ? null : _wake,
+          ),
+          const SizedBox(height: 12),
+          TextButton(
+            onPressed: _cancelling ? null : _cancel,
+            child: const Text('取消等待并保留绑定'),
+          ),
+        ],
+        if (_connection != null && _state != 'cancelled')
+          Text(_connection!, style: BloomType.meta),
+        if (!_terminal)
+          const Text('可以离开本页，退出页面不会取消任务。再次打开可查看进度。', style: BloomType.meta),
+        if (_state == 'cancelled')
+          BloomPrimaryButton(
+            label: '返回设备详情',
+            onPressed: () => Navigator.pop(context, false),
+          ),
+        if (_state == 'failed')
+          TextButton(
+            onPressed: _starting ? null : _start,
+            child: const Text('重新提交重置'),
+          ),
+        if (_job == null && !_starting)
+          TextButton(onPressed: _start, child: const Text('重新提交请求')),
+        if (_error != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 20),
+            child: Text(_error!, style: BloomType.body),
+          ),
+      ],
     ),
   );
 }
