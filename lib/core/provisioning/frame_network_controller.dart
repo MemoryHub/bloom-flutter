@@ -226,8 +226,9 @@ class FrameNetworkController extends ChangeNotifier {
   /// never needs Wi-Fi, and a phone boolean can never release cloud ownership.
   Future<bool> resetThroughPhone(String job) => _run((generation) async {
     await _connect(generation, management: false, resetJob: job);
-    var hello = await bridge.data({'op': 'hello'});
+    final hello = await bridge.data({'op': 'hello'});
     await _check(generation);
+    var relayVersion = hello['reset_relay_version'] == 2 ? 2 : 1;
     final path =
         'devices/${Uri.encodeComponent(deviceId)}/commands/$job/ble-reset';
     if (hello['reset_relay_job'] != job ||
@@ -238,11 +239,12 @@ class FrameNetworkController extends ChangeNotifier {
         token,
         path,
         method: 'POST',
-        body: {'nonce': hello['nonce']},
+        body: {'nonce': hello['nonce'], 'relay_version': relayVersion},
       );
       await _check(generation);
       final reply = await bridge.data({
         'op': 'admin_reset',
+        'relay_version': relayVersion,
         'job': job,
         'message': grant['message'],
         'signature': grant['signature'],
@@ -268,14 +270,15 @@ class FrameNetworkController extends ChangeNotifier {
     if ((status?['stage'] as num? ?? 0) < 3) {
       throw PlatformException(code: 'timeout');
     }
-    if ((status!['stage'] as num) < 5) {
+    relayVersion = status!['relay_version'] == 2 ? 2 : 1;
+    if ((status['stage'] as num) < 5) {
       phase = 'reset_syncing';
       _notify();
       final ack = await api.userRequest(
         token,
         '$path/complete',
         method: 'POST',
-        body: {'receipt': status['receipt']},
+        body: {'receipt': status['receipt'], 'relay_version': relayVersion},
       );
       await _check(generation);
       final accepted = await bridge.data({
@@ -295,12 +298,12 @@ class FrameNetworkController extends ChangeNotifier {
         if (status['job'] != job) {
           throw PlatformException(code: 'identity_mismatch');
         }
-        if (status['stage'] == 5) break;
+        if ((status['stage'] as num? ?? 0) >= 5) break;
       }
     }
     final finishedStatus = status;
     if (finishedStatus == null ||
-        finishedStatus['stage'] != 5 ||
+        (finishedStatus['stage'] as num? ?? 0) < 5 ||
         finishedStatus['finished_receipt'] is! String) {
       throw PlatformException(code: 'reset_commit_denied');
     }
@@ -310,11 +313,27 @@ class FrameNetworkController extends ChangeNotifier {
       token,
       '$path/finish',
       method: 'POST',
-      body: {'receipt': finishedStatus['finished_receipt']},
+      body: {
+        'receipt': finishedStatus['finished_receipt'],
+        'relay_version': relayVersion,
+      },
     );
     await _check(generation);
     if ((result['command'] as Map?)?['state'] != 'succeeded') {
       throw PlatformException(code: 'reset_commit_denied');
+    }
+    if (relayVersion == 2 && (finishedStatus['stage'] as num) < 7) {
+      final sealed = await bridge.data({
+        'op': 'reset_finish',
+        'message': result['message'],
+        'signature': result['signature'],
+      });
+      await _check(generation);
+      if (sealed['status'] != 'reset_finished') {
+        throw PlatformException(code: 'reset_commit_denied');
+      }
+      // The acknowledgement is now durable on the frame. It can erase its
+      // quarantined network credentials after power loss without the phone.
     }
     if (_account != null) await store.remove(_account!, deviceId);
     success = true;

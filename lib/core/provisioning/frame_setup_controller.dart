@@ -70,6 +70,7 @@ String frameSetupError(Object error) {
     'device_reset_in_progress' => '相框正在重置，请等待完成。',
     'reset_relay_unsupported' => '相框固件尚不支持手机协助重置，请先更新固件。',
     'reset_authorization_denied' => '重置授权未确认，任务已保留，请重新连接继续。',
+    'reset_finalizing' => '重置结果已同步，相框正在完成清理并重启，请稍后重新连接。',
     'reset_commit_denied' => '重置同步尚未完成，请保持供电并重新连接继续。',
     'wifi_auth_failed' => '相框未通过 Wi-Fi 认证，请检查密码后重试。已有网络已保留。',
     'wifi_not_found' => '相框未找到这个 Wi-Fi，请确认网络可用并重新搜索。已有网络已保留。',
@@ -290,6 +291,34 @@ class FrameSetupController extends ChangeNotifier {
     }
     if (!_valid(g)) return;
     _standbyCapable = hello['ble_standby'] == true;
+    // Cloud finish may have succeeded just before the phone lost BLE. The
+    // next explicit setup attempt can deliver the signed final seal without
+    // an old local admin key; no credentials are exposed by the receipt.
+    final pendingStage = hello['reset_relay_stage'] as num? ?? 0;
+    if (hello['reset_relay_version'] == 2 &&
+        pendingStage >= 5 &&
+        pendingStage < 7) {
+      final status = await bridge.data({'op': 'reset_status'});
+      if (!_valid(g)) return;
+      if (status['relay_version'] == 2 &&
+          status['finished_receipt'] is String) {
+        final job = status['job'] as String;
+        final seal = await api.userRequest(
+          token,
+          'devices/${Uri.encodeComponent(deviceId!)}/commands/${Uri.encodeComponent(job)}/ble-reset/finish',
+          method: 'POST',
+          body: {'relay_version': 2, 'receipt': status['finished_receipt']},
+        );
+        if (!_valid(g)) return;
+        await bridge.data({
+          'op': 'reset_finish',
+          'message': seal['message'],
+          'signature': seal['signature'],
+        });
+        if (!_valid(g)) return;
+        throw PlatformException(code: 'reset_finalizing');
+      }
+    }
     connected = true;
   }
 

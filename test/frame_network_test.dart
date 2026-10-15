@@ -46,6 +46,8 @@ class RelayBridge extends Bridge {
   int resetStage = 0;
   int starts = 0;
   bool supported = true;
+  int version = 1;
+  bool loseSeal = false;
   final List<String> events;
   RelayBridge(this.events);
   @override
@@ -55,6 +57,7 @@ class RelayBridge extends Bridge {
         return {
           ...await super.data(command),
           'reset_relay_capable': supported,
+          'reset_relay_version': version,
           'reset_relay_job': resetStage > 0 ? 'reset-1' : '',
           'reset_relay_stage': resetStage,
         };
@@ -67,9 +70,15 @@ class RelayBridge extends Bridge {
         return {
           'job': 'reset-1',
           'stage': resetStage,
+          'relay_version': version,
           'receipt': 'a' * 64,
           if (resetStage == 5) 'finished_receipt': 'b' * 64,
         };
+      case 'reset_finish':
+        events.add('device_finish');
+        if (loseSeal) throw PlatformException(code: 'disconnected');
+        resetStage = 7;
+        return {'status': 'reset_finished'};
       case 'reset_commit':
         events.add('device_commit');
         resetStage = 5;
@@ -320,6 +329,43 @@ void main() {
       expect(store.value, isNull);
       expect(bridge.management, false);
       c.dispose();
+    },
+  );
+  test(
+    'v2 delivers durable cloud seal before deleting local recovery access',
+    () async {
+      final events = <String>[], store = Store();
+      final api = RelayApi(events), bridge = RelayBridge(events)..version = 2;
+      final c = relay(api, bridge, store);
+      expect(await c.resetThroughPhone('reset-1'), true);
+      expect(events.sublist(events.length - 2), [
+        'server_finish',
+        'device_finish',
+      ]);
+      expect(bridge.resetStage, 7);
+      expect(store.value, isNull);
+      c.dispose();
+    },
+  );
+  test(
+    'lost v2 final seal keeps recovery access and resumes the same task',
+    () async {
+      final events = <String>[], store = Store();
+      final api = RelayApi(events),
+          bridge =
+              RelayBridge(events)
+                ..version = 2
+                ..loseSeal = true;
+      final c = relay(api, bridge, store);
+      expect(await c.resetThroughPhone('reset-1'), false);
+      expect(store.value, isNotNull);
+      c.dispose();
+      bridge.loseSeal = false;
+      final resumed = relay(api, bridge, store);
+      expect(await resumed.resetThroughPhone('reset-1'), true);
+      expect(bridge.starts, 1);
+      expect(bridge.resetStage, 7);
+      resumed.dispose();
     },
   );
   test('phone without server access cannot begin destructive reset', () async {

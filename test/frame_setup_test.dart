@@ -66,6 +66,29 @@ class LocalBridge extends BloomProvisionBridge {
   }
 }
 
+class FinalizingResetBridge extends LocalBridge {
+  @override
+  Future<Map<String, dynamic>> data(Map<String, dynamic> value) async {
+    if (value['op'] == 'hello') {
+      return {
+        ...await super.data(value),
+        'reset_relay_version': 2,
+        'reset_relay_stage': 5,
+      };
+    }
+    messages.add(value);
+    if (value['op'] == 'reset_status') {
+      return {
+        'job': 'old-reset',
+        'relay_version': 2,
+        'finished_receipt': 'b' * 64,
+      };
+    }
+    if (value['op'] == 'reset_finish') return {'status': 'reset_finished'};
+    throw PlatformException(code: 'unknown');
+  }
+}
+
 class FailingConnectionBridge extends LocalBridge {
   int attempts = 0;
   @override
@@ -111,6 +134,12 @@ void main() {
             200,
           );
         }
+        if (request.url.path.endsWith('ble-reset/finish')) {
+          return http.Response(
+            jsonEncode({'message': 'signed-seal', 'signature': 'signed-proof'}),
+            200,
+          );
+        }
         if (request.url.path.endsWith('setup-ticket')) {
           return http.Response(
             jsonEncode({
@@ -142,6 +171,25 @@ void main() {
     );
   }
 
+  test(
+    'new setup can finish a lost reset seal without local admin access',
+    () async {
+      final bridge = FinalizingResetBridge(), requests = <http.Request>[];
+      final c = controller(bridge, requests);
+      await c.select('BLOOM_001122334455');
+      expect(c.connected, false);
+      expect(c.error, contains('重置结果已同步'));
+      expect(
+        requests.any(
+          (r) => r.url.path.endsWith('/commands/old-reset/ble-reset/finish'),
+        ),
+        true,
+      );
+      expect(bridge.messages.any((m) => m['op'] == 'reset_finish'), true);
+      expect(bridge.claimed, false);
+      c.dispose();
+    },
+  );
   test(
     'persistent setup QR is separate from contributor QR and never carries a device token',
     () {

@@ -468,7 +468,9 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
         if (widget.wakeOnStart &&
             (_state == 'queued' ||
                 _job?['phase'] == 'ble_reset' ||
-                _job?['phase'] == 'ble_commit')) {
+                _job?['phase'] == 'ble_commit' ||
+                _job?['phase'] == 'ble_reset_v2' ||
+                _job?['phase'] == 'ble_commit_v2')) {
           unawaited(_wake());
         }
       }
@@ -522,7 +524,9 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
         '$_base/commands/${_job!['id']}',
       );
       if (!mounted || revision != _revision) return;
-      if (_connecting && (data['command'] as Map?)?['state'] == 'succeeded') return;
+      if (_connecting && (data['command'] as Map?)?['state'] == 'succeeded') {
+        return;
+      }
       _apply(data['command'] as Map<String, dynamic>);
     } catch (_) {
       if (mounted && revision == _revision) {
@@ -597,7 +601,7 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
           _state == 'cancelled'
               ? '等待任务已取消，绑定关系和云端照片均保留。'
               : _state == 'queued'
-              ? '相框尚未开始清理。手机联网并靠近相框后，可通过蓝牙完成重置，相框无需连接 Wi-Fi。开始前可以取消。'
+              ? '相框尚未开始清理。相框联网后会执行；手机联网并靠近相框时，也可通过蓝牙协助完成。开始前可以取消。'
               : '相框会清理保存的 Wi-Fi、私人照片缓存和设置，恢复欢迎页。只有相框确认完成后才移除主人和供图关系；每个人的云端图库都保留。',
           style: BloomType.body,
         ),
@@ -606,13 +610,23 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
             _connecting ||
             _cancelling ||
             (_state == 'running' &&
-                !{'ble_reset', 'ble_commit'}.contains(_job?['phase']))) ...[
+                !{
+                  'ble_reset',
+                  'ble_commit',
+                  'ble_reset_v2',
+                  'ble_commit_v2',
+                }.contains(_job?['phase']))) ...[
           const LinearProgressIndicator(),
           const SizedBox(height: 20),
         ],
         if (_state == 'queued' ||
             (_state == 'running' &&
-                {'ble_reset', 'ble_commit'}.contains(_job?['phase']))) ...[
+                {
+                  'ble_reset',
+                  'ble_commit',
+                  'ble_reset_v2',
+                  'ble_commit_v2',
+                }.contains(_job?['phase']))) ...[
           BloomPrimaryButton(
             label: _state == 'queued' ? '通过蓝牙重置相框' : '重新连接并继续重置',
             loading: _connecting,
@@ -629,7 +643,10 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
         if (_connection != null && _state != 'cancelled')
           Text(_connection!, style: BloomType.meta),
         if (!_terminal)
-          const Text('可以离开本页，退出页面不会取消任务。再次打开可查看进度。', style: BloomType.meta),
+          const Text(
+            '可以离开本页，任务会保留。支持接力的新固件可通过 Wi-Fi 继续；相框无网时，请让手机联网并靠近相框继续。',
+            style: BloomType.meta,
+          ),
         if (_state == 'cancelled')
           BloomPrimaryButton(
             label: '返回设备详情',
