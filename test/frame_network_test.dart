@@ -84,6 +84,7 @@ class Bridge extends BloomProvisionBridge {
       refreshing = false,
       unsupported = false;
   String actualId = 'frame-1', stage = 'network_ready';
+  String failureStage = 'wifi_failed';
   List<String> saved = ['Home'];
   final commands = <Map<String, dynamic>>[];
   Completer<void>? scanGate;
@@ -156,7 +157,7 @@ class Bridge extends BloomProvisionBridge {
           'networks': all.skip(offset).take(2).toList(),
         };
       case 'connect':
-        stage = failWifi ? 'wifi_failed' : 'wifi_success';
+        stage = failWifi ? failureStage : 'wifi_success';
         if (!failWifi) saved.add(command['ssid'] as String);
         return {'status': 'accepted'};
       case 'forget':
@@ -273,6 +274,69 @@ void main() {
       expect(c.error, contains('密码'));
       expect(c.connected, false);
       c.dispose();
+    },
+  );
+  for (final failure in [
+    'wifi_auth_failed',
+    'wifi_not_found',
+    'wifi_ip_failed',
+  ]) {
+    test(
+      'connection reason $failure fails without changing saved networks',
+      () async {
+        final api = Api(),
+            bridge =
+                Bridge()
+                  ..failWifi = true
+                  ..failureStage = failure,
+            store = Store();
+        final c = make(api, bridge, store);
+        expect(await c.startAdding(), true);
+        expect(await c.connectWifi('Office', 'test-password'), false);
+        expect(c.success, false);
+        expect(c.error, isNotEmpty);
+        expect(c.error, isNot(contains('操作未完成')));
+        expect(bridge.saved, ['Home']);
+        expect(c.connected, false);
+        c.dispose();
+      },
+    );
+  }
+  testWidgets(
+    'failed connection stays on a visible result with retry and no false success',
+    (tester) async {
+      final api = Api(), bridge = Bridge()..failWifi = true, store = Store();
+      final c = make(api, bridge, store);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: BloomFrameWifiAddPage(
+            api: api,
+            token: 'test',
+            device: BloomDevice(
+              deviceId: 'frame-1',
+              name: 'Frame',
+              type: 'eink',
+            ),
+            controller: c,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Open'));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('连接 Wi-Fi'));
+      await tester.tap(find.text('连接 Wi-Fi'));
+      await tester.pumpAndSettle();
+      expect(find.text('连接未完成'), findsOneWidget);
+      expect(find.text('重试连接').hitTestable(), findsOneWidget);
+      expect(find.text('Wi-Fi 配置成功'), findsNothing);
+      expect(bridge.saved, ['Home']);
+      await tester.tap(find.text('重新选择网络'));
+      await tester.pumpAndSettle();
+      expect(find.text('选择 2.4 GHz Wi-Fi'), findsOneWidget);
+      expect(find.text('连接未完成'), findsNothing);
+      await tester.pumpWidget(const SizedBox());
+      await tester.pumpAndSettle();
     },
   );
   test(

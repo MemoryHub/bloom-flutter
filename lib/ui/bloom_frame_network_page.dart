@@ -210,10 +210,12 @@ class BloomFrameWifiAddPage extends StatefulWidget {
     required this.api,
     required this.token,
     required this.device,
+    this.controller,
   });
   final BloomApiClient api;
   final String token;
   final BloomDevice device;
+  final FrameNetworkController? controller;
   @override
   State<BloomFrameWifiAddPage> createState() => _BloomFrameWifiAddPageState();
 }
@@ -228,11 +230,14 @@ class _BloomFrameWifiAddPageState extends State<BloomFrameWifiAddPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    c = FrameNetworkController(
-      api: widget.api,
-      token: widget.token,
-      deviceId: widget.device.deviceId,
-    )..addListener(_changed);
+    c =
+        (widget.controller ??
+              FrameNetworkController(
+                api: widget.api,
+                token: widget.token,
+                deviceId: widget.device.deviceId,
+              ))
+          ..addListener(_changed);
     unawaited(c.startAdding()); // This route is entered only by the Add button.
   }
 
@@ -306,6 +311,29 @@ class _BloomFrameWifiAddPageState extends State<BloomFrameWifiAddPage>
             style: BloomType.body,
             textAlign: TextAlign.center,
           ),
+        ] else if (c.error != null) ...[
+          const Icon(Icons.error_outline, color: BloomInk.textMuted, size: 48),
+          const SizedBox(height: 20),
+          const Text('连接未完成', style: BloomType.sectionTitle),
+          const SizedBox(height: 12),
+          if (selected != null)
+            Text(selected!['ssid'] as String, style: BloomType.rowTitle),
+          const SizedBox(height: 12),
+          Text(c.error!, style: BloomType.body),
+          const SizedBox(height: 24),
+          BloomPrimaryButton(
+            label: selected != null ? '重试连接' : '重新连接并搜索',
+            onPressed:
+                selected != null ? _connect : () => unawaited(c.startAdding()),
+          ),
+          if (selected != null)
+            TextButton(
+              onPressed: () {
+                setState(() => selected = null);
+                c.clearError();
+              },
+              child: const Text('重新选择网络'),
+            ),
         ] else ...[
           const Text('选择 2.4 GHz Wi-Fi', style: BloomType.rowTitle),
           const SizedBox(height: 16),

@@ -269,6 +269,9 @@ class FrameNetworkController extends ChangeNotifier {
       }
       if ({
         'wifi_failed',
+        'wifi_auth_failed',
+        'wifi_not_found',
+        'wifi_ip_failed',
         'storage_failed',
         'playback_interrupted',
         'network_full',
@@ -291,6 +294,13 @@ class FrameNetworkController extends ChangeNotifier {
     } catch (_) {}
     connected = false;
     if (_lease == this) _lease = null;
+  }
+
+  void clearError() {
+    if (busy || _closed) return;
+    error = null;
+    phase = 'network_ready';
+    _notify();
   }
 
   Future<void> cancel() async {
