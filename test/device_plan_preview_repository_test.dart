@@ -101,7 +101,19 @@ void main() {
         false,
       );
       final afterFirstDownload = calls.length;
-      await repo.refresh('account', 'account-token', {'frame-a', 'frame-b'});
+      await repo.refresh(
+        'account',
+        'account-token',
+        {'frame-a', 'frame-b'},
+        onChanged: () {
+          expect(
+            repo.snapshots['frame-a']!.loading,
+            false,
+            reason: 'same-image background refresh must never flash a spinner',
+          );
+          expect(repo.snapshots['frame-b']!.loading, false);
+        },
+      );
       expect(
         calls.length,
         afterFirstDownload + 3,
@@ -139,7 +151,7 @@ void main() {
   );
 
   test(
-    'refresh immediately masks cached photos and completes each device independently',
+    'revalidation keeps a labelled cached plan until the server changes its image',
     () async {
       final list = Completer<http.Response>();
       final slowImage = Completer<http.Response>();
@@ -187,8 +199,8 @@ void main() {
       );
       expect(
         repo.snapshots['frame-a']!.loading,
-        isTrue,
-        reason: 'before plan response, old cache cannot appear as current',
+        isFalse,
+        reason: 'revalidating the same plan must not blank the decoded image',
       );
       expect(
         repo.snapshots['frame-a']!.imagePath,

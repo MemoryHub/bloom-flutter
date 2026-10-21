@@ -168,7 +168,7 @@ void main() {
       expect(find.byKey(const ValueKey('bloom-remote-screen')), findsOneWidget);
       expect(find.byKey(const ValueKey('bloom-next-slot')), findsNothing);
       expect(find.byKey(const ValueKey('remote-next-frame')), findsOneWidget);
-      expect(find.textContaining('计划时间'), findsNothing);
+      expect(find.textContaining('屏幕同步待确认'), findsNothing);
       final labelFinder = find.byKey(const ValueKey('remote-next-frame'));
       final frameRect = tester.getRect(frameFinder);
       expect(frameRect.top, localFrame.top);
@@ -220,7 +220,7 @@ void main() {
       expect(labelRect.top, greaterThanOrEqualTo(frameRect.bottom + 7));
       expect((labelRect.right - frameRect.right).abs(), lessThan(1));
       expect(tester.widget<Text>(labelFinder).style, BloomType.meta);
-      expect(tester.widget<Text>(labelFinder).data, startsWith('下次更新 '));
+      expect(tester.widget<Text>(labelFinder).data, contains('下次计划 '));
       expect(find.textContaining('设备确认'), findsNothing);
       expect(find.textContaining('联网确认'), findsNothing);
       await tester.tap(find.byKey(const ValueKey('bloom-remote-screen')));
@@ -324,7 +324,7 @@ void main() {
         find.byKey(const ValueKey('bloom-remote-loading')),
         findsOneWidget,
       );
-      expect(find.text('正在从设备拉取图片'), findsOneWidget);
+      expect(find.text('正在加载计划预览'), findsOneWidget);
       expect(find.byKey(const ValueKey('bloom-remote-screen')), findsNothing);
       expect(
         find.descendant(of: frame, matching: find.byType(Image)),

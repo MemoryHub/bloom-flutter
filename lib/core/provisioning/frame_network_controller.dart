@@ -29,6 +29,7 @@ class FrameNetworkController extends ChangeNotifier {
   String? error, _account;
   List<Map<String, dynamic>> networks = [];
   Map<String, dynamic>? summary;
+  bool serverCheckRequested = false;
   String get progress => switch (phase) {
     'bluetooth_connecting' => '正在连接相框…',
     'authenticating' => '正在验证相框…',
@@ -71,6 +72,7 @@ class FrameNetworkController extends ChangeNotifier {
     _lease = this;
     busy = true;
     success = false;
+    serverCheckRequested = false;
     error = null;
     final generation = ++_generation;
     _notify();
@@ -109,8 +111,16 @@ class FrameNetworkController extends ChangeNotifier {
     await _check(generation);
     await bridge.disconnect();
     await _check(generation);
-    final found = await bridge.scan();
+    var found = await bridge.scan();
     await _check(generation);
+    // A just-disconnected link needs time to become discoverable again.
+    // Retry discovery before requesting any destructive authorization.
+    if (!found.any((device) => device['ble_name'] == access['ble_name'])) {
+      await pause(const Duration(seconds: 1));
+      await _check(generation);
+      found = await bridge.scan();
+      await _check(generation);
+    }
     if (!found.any((device) => device['ble_name'] == access['ble_name'])) {
       throw PlatformException(code: 'device_not_found');
     }
@@ -394,6 +404,16 @@ class FrameNetworkController extends ChangeNotifier {
     await bridge.data({'op': 'connect', 'ssid': ssid, 'password': password});
     await _check(generation);
     await _waitResult(generation, 'wifi_success');
+    // Wi-Fi association + DHCP has succeeded. Ask the existing scheduler to
+    // read its authoritative server plan after this management session ends.
+    // A lost hint must not turn a confirmed network save into a failed save.
+    try {
+      final reply = await bridge.data({'op': 'admin_check_server'});
+      serverCheckRequested = reply['status'] == 'server_check_requested';
+    } catch (_) {
+      serverCheckRequested = false;
+    }
+    await _check(generation);
     success = true;
     phase = 'success';
   }, release: true);

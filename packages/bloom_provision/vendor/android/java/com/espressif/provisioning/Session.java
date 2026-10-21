@@ -111,8 +111,9 @@ public class Session {
                 });
             }
         } catch (RuntimeException e) {
-            if (response == null && sessionListener != null) {
-                sessionListener.OnSessionEstablishFailed(new RuntimeException("Session could not be established"));
+            isSessionEstablished = false;
+            if (sessionListener != null) {
+                sessionListener.OnSessionEstablishFailed(e);
             }
         }
     }

@@ -128,7 +128,7 @@ public class BleScanner {
      */
     @RequiresPermission(allOf = {Manifest.permission.BLUETOOTH_ADMIN, Manifest.permission.BLUETOOTH})
     public void stopScan() {
-
+        if (!isScanning) return;
         /* Bloom: SDK logging disabled. */;
         handler.removeCallbacks(stopScanTask);
 
@@ -170,7 +170,7 @@ public class BleScanner {
         @Override
         @RequiresPermission(Manifest.permission.BLUETOOTH)
         public void onScanResult(int callbackType, ScanResult result) {
-
+            if (!isScanning || result.getScanRecord() == null) return;
             String deviceName = result.getScanRecord().getDeviceName();
 
             if (result.getDevice() != null && !TextUtils.isEmpty(deviceName)) {
@@ -188,6 +188,7 @@ public class BleScanner {
         @Override
         public void onBatchScanResults(List<ScanResult> results) {
             super.onBatchScanResults(results);
+            for (ScanResult result : results) onScanResult(0, result);
             /* Bloom: SDK logging disabled. */;
         }
 

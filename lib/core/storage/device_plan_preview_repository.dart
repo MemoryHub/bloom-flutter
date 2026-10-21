@@ -64,7 +64,8 @@ class DevicePlanPreviewRepository {
   int _generation = 0;
   final Map<String, DevicePlanPreview> snapshots = {};
 
-  /// 缓存只用于复用已下载文件；确认当前计划前不能当作当前照片显示。
+  /// Revalidate a labelled plan preview without removing the same decoded image.
+  /// Only mask it once the server confirms that a different image is due.
   void beginRefresh(String account, Set<String> allowed) {
     if (_account != account) {
       _account = account;
@@ -73,6 +74,13 @@ class DevicePlanPreviewRepository {
     }
     snapshots.removeWhere((id, _) => !allowed.contains(id));
     for (final id in allowed) {
+      final previous = snapshots[id];
+      if (previous?.status == 'ready' &&
+          previous?.imagePath != null &&
+          previous?.offline == false &&
+          previous?.loading == false) {
+        continue;
+      }
       snapshots[id] =
           snapshots[id]?.loadingCurrent() ??
           DevicePlanPreview(deviceId: id, status: 'loading', loading: true);
@@ -230,6 +238,10 @@ class DevicePlanPreviewRepository {
                 throw const FormatException('invalid display key');
               }
               final path = '${dir.path}/${_name(id)}-$key.png';
+              if (snapshots[id]?.imageKey != key) {
+                snapshots[id] = snapshots[id]!.loadingCurrent();
+                onChanged?.call();
+              }
               if (!await File(path).exists()) {
                 final bytes = await api.devicePlanPreviewImage(
                   token,

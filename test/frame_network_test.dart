@@ -198,6 +198,7 @@ class EnrollmentApi extends BloomApiClient {
 
 class Bridge extends BloomProvisionBridge {
   int scans = 0, connects = 0, disconnects = 0;
+  int emptyScans = 0;
   bool busyAdvert = false, cloudCapable = true, badCloudAck = false;
   bool management = false,
       failWifi = false,
@@ -212,6 +213,7 @@ class Bridge extends BloomProvisionBridge {
   Future<List<Map<String, dynamic>>> scan() async {
     scans++;
     if (scanGate != null) await scanGate!.future;
+    if (scans <= emptyScans) return [];
     return [
       {'ble_name': 'BLOOM_001122334455', 'rssi': -40, 'busy': busyAdvert},
     ];
@@ -312,6 +314,19 @@ void main() {
         store: store,
         pause: (_) async {},
       );
+  test(
+    'just-disconnected frame is rediscovered before reset authorization',
+    () async {
+      final events = <String>[];
+      final bridge = RelayBridge(events)..emptyScans = 1;
+      final c = relay(RelayApi(events), bridge, Store());
+      expect(await c.resetThroughPhone('reset-1'), true);
+      expect(bridge.scans, 2);
+      expect(bridge.starts, 1);
+      c.dispose();
+    },
+  );
+
   test(
     'offline frame resets only after server authorization and both real receipts',
     () async {
@@ -565,9 +580,32 @@ void main() {
       expect(await c.connectWifi('Office', 'test-only-password'), true);
       expect(c.success, true);
       expect(c.summary!['saved_networks'], contains('Office'));
+      expect(c.serverCheckRequested, isTrue);
+      final ops = bridge.commands.map((c) => c['op']).toList();
+      expect(
+        ops.indexOf('admin_check_server'),
+        greaterThan(ops.indexOf('connect')),
+      );
+      expect(
+        ops.lastIndexOf('admin_end'),
+        greaterThan(ops.indexOf('admin_check_server')),
+      );
       expect(bridge.management, false);
       expect(c.connected, false);
       expect(api.requests, 0);
+      c.dispose();
+    },
+  );
+  test(
+    'lost cloud-check acknowledgement keeps a confirmed Wi-Fi save',
+    () async {
+      final api = Api(), bridge = Bridge()..badCloudAck = true, store = Store();
+      final c = make(api, bridge, store);
+      expect(await c.connectWifi('Office', 'test-only-password'), true);
+      expect(c.success, true);
+      expect(c.serverCheckRequested, false);
+      expect(c.summary!['saved_networks'], contains('Office'));
+      expect(bridge.management, false);
       c.dispose();
     },
   );
@@ -767,4 +805,56 @@ void main() {
       messenger.setMockMethodCallHandler(secure, null);
     },
   );
+  for (final fail in [false, true]) {
+    testWidgets(
+      'remove Wi-Fi dialog waits for device confirmation (failure=$fail)',
+      (tester) async {
+        const secure = MethodChannel(
+          'plugins.it_nomads.com/flutter_secure_storage',
+        );
+        final messenger =
+            TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+        messenger.setMockMethodCallHandler(secure, (call) async => null);
+        addTearDown(() => messenger.setMockMethodCallHandler(secure, null));
+        final api = Api(),
+            bridge = Bridge()..refreshing = fail,
+            store = Store();
+        final gate = Completer<void>();
+        bridge.scanGate = gate;
+        final c = make(api, bridge, store);
+        await tester.pumpWidget(
+          MaterialApp(
+            home: BloomFrameNetworkPage(
+              api: api,
+              token: 'test',
+              controller: c,
+              device: const BloomDevice(
+                deviceId: 'frame-1',
+                name: '客厅',
+                type: 'eink',
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(find.byIcon(Icons.remove_circle_outline));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('移除'));
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+        expect(find.text('正在移除 Wi-Fi'), findsOneWidget);
+        expect(find.text('Wi-Fi 已移除'), findsNothing);
+        expect(find.text('知道了'), findsNothing);
+        gate.complete();
+        await tester.pumpAndSettle();
+        expect(find.text(fail ? '尚未确认移除' : 'Wi-Fi 已移除'), findsOneWidget);
+        expect(bridge.saved, fail ? ['Home'] : isEmpty);
+        if (!fail) expect(find.textContaining('当前没有已保存网络'), findsOneWidget);
+        await tester.tap(find.text('知道了'));
+        await tester.pumpAndSettle();
+        expect(find.byType(Dialog), findsNothing);
+        await tester.pumpWidget(const SizedBox());
+      },
+    );
+  }
 }

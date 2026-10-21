@@ -1357,7 +1357,7 @@ class _PhotoPage extends StatelessWidget {
                 child: BloomSignInPrompt(
                   key: const ValueKey('bloom-home-signed-out'),
                   title: '登录后查看相框内容',
-                  message: '你的相框和手机小组件都绑在账号下，登录后这里会显示它们正在展示的照片。',
+                  message: '登录后可查看相框的计划预览和手机小组件的照片。',
                   onSignIn: onSignIn,
                 ),
               ),
@@ -1443,7 +1443,7 @@ class _PhotoPage extends StatelessWidget {
                                 remoteDisplay
                                     ?.nextCheckAt
                                     ?.millisecondsSinceEpoch,
-                              )
+                              )?.replaceFirst('下次更新', '下次计划')
                               : null)
                           : nextSlotText;
                   // Match the row gap while keeping the widget's original
@@ -1453,7 +1453,7 @@ class _PhotoPage extends StatelessWidget {
                           ? _RemoteDeviceCard.aspectRatio
                           : _LetterPhotoCard.aspectRatio;
                   const nextSlotGap = 8.0;
-                  const nextSlotHeight = 15.0;
+                  final nextSlotHeight = remoteSelected ? 32.0 : 15.0;
                   final cardBox = math.max(
                     0.0,
                     constraints.maxHeight -
@@ -1615,7 +1615,8 @@ class _PhotoPage extends StatelessWidget {
                                       ? 'remote-next-${selected.deviceId}'
                                       : 'bloom-next-slot',
                                 ),
-                                maxLines: 1,
+                                maxLines: 2,
+                                textAlign: TextAlign.right,
                                 overflow: TextOverflow.ellipsis,
                                 style: BloomType.meta,
                               ),
@@ -1866,7 +1867,7 @@ class _RemoteDeviceCard extends StatelessWidget {
                   ? '还没到首次展示时间'
                   : screen.status == 'empty'
                   ? '相框还没有可展示的照片'
-                  : '正在读取设备画面',
+                  : '正在读取计划预览',
               textAlign: TextAlign.center,
               style: BloomType.rowTitle,
             ),
@@ -1910,7 +1911,7 @@ class _RemotePreviewLoading extends StatelessWidget {
             ),
           ),
           SizedBox(height: 16),
-          Text('正在从设备拉取图片', style: BloomType.rowTitle),
+          Text('正在加载计划预览', style: BloomType.rowTitle),
         ],
       ),
     ),

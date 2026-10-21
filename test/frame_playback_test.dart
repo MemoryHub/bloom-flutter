@@ -32,6 +32,17 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   setUp(() => SharedPreferences.setMockInitialValues({}));
 
+  test('没有设备字节回报时显示等待，真实字节决定百分比', () {
+    final data = {
+      ...job('running', phase: 'downloading_first'),
+      'received_bytes': 0,
+      'total_bytes': 960000,
+    };
+    expect(FramePlaybackJob(data).percent, isNull);
+    expect(FramePlaybackJob({...data, 'received_bytes': 480000}).percent, 50);
+    expect(FramePlaybackJob({...data, 'received_bytes': 960000}).percent, 100);
+  });
+
   test('退出后台和重开保留设备真实进度，不发送取消命令', () async {
     bool offline = false;
     final requests = <http.Request>[];

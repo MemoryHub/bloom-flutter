@@ -40,38 +40,152 @@ Future<bool> joinBloomDevice(
         MaterialPageRoute(builder: (_) => const BloomDeviceScannerPage()),
       );
   if (raw == null || !context.mounted) return false;
-  final code = bloomDeviceInvitationToken(raw);
-  if (code == null) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('请扫描设备二维码。', style: BloomType.body)),
-    );
-    return false;
+  return await joinBloomDeviceInvitation(context, api, token, raw) != null;
+}
+
+/// Both scan entry points await the same visible server result before leaving.
+Future<Map<String, dynamic>?> joinBloomDeviceInvitation(
+  BuildContext context,
+  BloomApiClient api,
+  String token,
+  String raw,
+) => showDialog<Map<String, dynamic>>(
+  context: context,
+  barrierDismissible: false,
+  builder: (_) => _JoinDeviceDialog(api: api, token: token, raw: raw),
+);
+
+class _JoinDeviceDialog extends StatefulWidget {
+  const _JoinDeviceDialog({
+    required this.api,
+    required this.token,
+    required this.raw,
+  });
+  final BloomApiClient api;
+  final String token, raw;
+  @override
+  State<_JoinDeviceDialog> createState() => _JoinDeviceDialogState();
+}
+
+class _JoinDeviceDialogState extends State<_JoinDeviceDialog> {
+  bool _finished = false;
+  Map<String, dynamic>? _result;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_join());
+    });
   }
-  try {
-    final joined = await api.userRequest(
-      token,
-      'device-invitations/join',
-      method: 'POST',
-      body: {'token': code},
-    );
-    if (context.mounted) {
-      final type = joined['device_type'] == 'eink' ? '相框' : '手机小组件';
-      final name = joined['name'] as String? ?? '设备';
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('已加入$type「$name」', style: BloomType.body)),
-      );
+
+  Future<void> _join() async {
+    final code = bloomDeviceInvitationToken(widget.raw);
+    Map<String, dynamic>? result;
+    String? error;
+    if (code == null) {
+      error = '请扫描主人 App 中的设备二维码。';
+    } else {
+      try {
+        final reply = await widget.api.userRequest(
+          widget.token,
+          'device-invitations/join',
+          method: 'POST',
+          body: {'token': code},
+        );
+        if (reply['status'] != 'joined' ||
+            reply['device_id'] is! String ||
+            (reply['device_id'] as String).isEmpty) {
+          throw const FormatException('join not confirmed');
+        }
+        result = reply;
+      } catch (e) {
+        error =
+            e is BloomApiException && e.code == 'device_code_invalid'
+                ? '设备二维码已失效，请主人打开设备二维码页面后重新扫码。'
+                : e is BloomApiException && e.statusCode == 401
+                ? '登录已失效，请重新登录后扫码。'
+                : '暂时无法确认加入结果，请检查手机网络。可在“设备 → 我加入的”查看，也可重新扫码确认。';
+      }
     }
-    return true;
-  } catch (error) {
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          backgroundColor: BloomInk.panel,
-          content: Text(_sharingError(error), style: BloomType.body),
+    if (!mounted) return;
+    setState(() {
+      _finished = true;
+      _result = result;
+      _error = error;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final joined = _result != null;
+    final owner = _result?['relationship'] == 'owner';
+    final type = _result?['device_type'] == 'eink' ? '相框' : '手机小组件';
+    final name = _result?['name'] as String? ?? '设备';
+    return PopScope(
+      canPop: _finished,
+      child: Dialog(
+        backgroundColor: Colors.transparent,
+        child: BloomPanel(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              AnimatedSwitcher(
+                duration: const Duration(milliseconds: 240),
+                child: SizedBox(
+                  key: ValueKey(_finished ? joined : null),
+                  height: 56,
+                  child: Center(
+                    child:
+                        !_finished
+                            ? const CircularProgressIndicator(
+                              color: BloomInk.accent,
+                            )
+                            : Icon(
+                              joined
+                                  ? Icons.check_circle_outline_rounded
+                                  : Icons.error_outline_rounded,
+                              size: 44,
+                              color: BloomInk.accent,
+                            ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 18),
+              Text(
+                !_finished
+                    ? '正在加入设备'
+                    : joined
+                    ? (owner ? '这是你的设备' : '已成功加入')
+                    : '尚未确认加入',
+                style: BloomType.sectionTitle,
+              ),
+              const SizedBox(height: 12),
+              Text(
+                !_finished
+                    ? '正在向服务器确认，请稍候。'
+                    : joined
+                    ? owner
+                        ? '「$name」已经在“我的设备”中。'
+                        : '已加入$type「$name」。可在“设备 → 我加入的”查看。供图关系已保存，相框会在下次联网同步时获取新计划。'
+                    : _error!,
+                style: BloomType.body,
+              ),
+              if (_finished) ...[
+                const SizedBox(height: 24),
+                BloomPrimaryButton(
+                  label: joined ? '完成' : '知道了',
+                  onPressed: () => Navigator.pop(context, _result),
+                ),
+              ],
+            ],
+          ),
         ),
-      );
-    }
-    return false;
+      ),
+    );
   }
 }
 
@@ -257,18 +371,38 @@ class _BloomJoinedDevicePageState extends State<BloomJoinedDevicePage> {
     if (!mounted) return;
     setState(() => _busy = true);
     try {
-      await widget.api.userRequest(
+      final response = await widget.api.userRequest(
         widget.token,
         'devices/${widget.device.deviceId}/contribution',
         method: 'DELETE',
       );
+      if (response['status'] != 'left') {
+        throw const FormatException('leave not confirmed');
+      }
       if (mounted) Navigator.pop(context, true);
     } catch (error) {
       if (mounted) {
+        // A committed exit can lose its response. The existing server returns
+        // this exact absence result on retry; other 404s remain errors.
+        if (error is BloomApiException &&
+            error.statusCode == 404 &&
+            error.code == 'device_not_joined') {
+          Navigator.pop(context, true);
+          return;
+        }
         setState(() => _busy = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(_sharingError(error), style: BloomType.body)),
-        );
+        final message =
+            error is BloomApiException && error.statusCode == 401
+                ? '登录已失效，请重新登录后操作。'
+                : error is BloomApiException &&
+                    error.code == 'owner_cannot_leave'
+                ? '设备主人无法通过此入口停止供图。'
+                : error is BloomApiException && error.statusCode == 403
+                ? '当前账号没有操作权限，请返回设备列表确认。'
+                : '暂时无法确认退出结果，请检查网络后重试，也可返回设备列表查看。';
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(message, style: BloomType.body)));
       }
     }
   }

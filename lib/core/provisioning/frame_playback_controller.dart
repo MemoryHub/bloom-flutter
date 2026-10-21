@@ -17,6 +17,7 @@ class FramePlaybackJob {
   int get totalBytes => (data['total_bytes'] as num?)?.toInt() ?? 0;
   double? get progress {
     if (totalBytes <= 0 || receivedBytes < 0) return null;
+    if (active && receivedBytes == 0) return null;
     return ((receivedBytes / totalBytes).clamp(0.0, 1.0)).toDouble();
   }
 

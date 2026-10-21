@@ -14,10 +14,12 @@ class BloomFrameNetworkPage extends StatefulWidget {
     required this.api,
     required this.token,
     required this.device,
+    this.controller,
   });
   final BloomApiClient api;
   final String token;
   final BloomDevice device;
+  final FrameNetworkController? controller;
   @override
   State<BloomFrameNetworkPage> createState() => _BloomFrameNetworkPageState();
 }
@@ -32,11 +34,14 @@ class _BloomFrameNetworkPageState extends State<BloomFrameNetworkPage>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    c = FrameNetworkController(
-      api: widget.api,
-      token: widget.token,
-      deviceId: widget.device.deviceId,
-    )..addListener(_changed);
+    c =
+        (widget.controller ??
+              FrameNetworkController(
+                api: widget.api,
+                token: widget.token,
+                deviceId: widget.device.deviceId,
+              ))
+          ..addListener(_changed);
     unawaited(_load()); // HTTP/cache only. Never scan or connect on page entry.
   }
 
@@ -125,12 +130,23 @@ class _BloomFrameNetworkPageState extends State<BloomFrameNetworkPage>
       return;
     }
     if (!mounted) return;
-    if (await c.removeNetwork(ssid) && mounted) {
-      setState(() {
-        _network = c.summary;
-        _error = null;
-      });
-    }
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder:
+          (_) => _RemoveWifiDialog(
+            controller: c,
+            ssid: ssid,
+            last: last,
+            onRemoved: () {
+              if (!mounted) return;
+              setState(() {
+                _network = c.summary;
+                _error = null;
+              });
+            },
+          ),
+    );
   }
 
   @override
@@ -157,6 +173,9 @@ class _BloomFrameNetworkPageState extends State<BloomFrameNetworkPage>
         Text(
           _network?['wifi_ssid'] != null
               ? '最近连接 · ${_network!['wifi_ssid']}'
+              : _network != null &&
+                  (_network!['saved_networks'] as List? ?? []).isEmpty
+              ? '尚未配置 Wi-Fi'
               : '尚未收到网络状态',
           style: BloomType.body,
         ),
@@ -165,6 +184,11 @@ class _BloomFrameNetworkPageState extends State<BloomFrameNetworkPage>
             '信息更新时间：${DateTime.tryParse(_network!['seen_at'] as String)?.toLocal() ?? _network!['seen_at']}',
             style: BloomType.meta,
           ),
+        const SizedBox(height: 8),
+        const Text(
+          '相框按计划联网，待机时会断开 Wi-Fi。这里展示最近一次读取的网络信息。',
+          style: BloomType.meta,
+        ),
         const SizedBox(height: 20),
         const Text('已保存网络', style: BloomType.rowTitle),
         const SizedBox(height: 12),
@@ -200,6 +224,119 @@ class _BloomFrameNetworkPageState extends State<BloomFrameNetworkPage>
             child: Text(message, style: BloomType.body),
           ),
       ],
+    ),
+  );
+}
+
+class _RemoveWifiDialog extends StatefulWidget {
+  const _RemoveWifiDialog({
+    required this.controller,
+    required this.ssid,
+    required this.last,
+    required this.onRemoved,
+  });
+  final FrameNetworkController controller;
+  final String ssid;
+  final bool last;
+  final VoidCallback onRemoved;
+  @override
+  State<_RemoveWifiDialog> createState() => _RemoveWifiDialogState();
+}
+
+class _RemoveWifiDialogState extends State<_RemoveWifiDialog> {
+  bool _finished = false, _removed = false;
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_changed);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_remove());
+    });
+  }
+
+  void _changed() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _remove() async {
+    final removed = await widget.controller.removeNetwork(widget.ssid);
+    if (!mounted) return;
+    if (removed) widget.onRemoved();
+    setState(() {
+      _removed = removed;
+      _finished = true;
+    });
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_changed);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => PopScope(
+    canPop: _finished,
+    child: Dialog(
+      backgroundColor: Colors.transparent,
+      child: BloomPanel(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 220),
+              child: SizedBox(
+                key: ValueKey(_finished ? _removed : null),
+                height: 52,
+                child: Center(
+                  child:
+                      _finished
+                          ? Icon(
+                            _removed
+                                ? Icons.check_circle_outline_rounded
+                                : Icons.error_outline_rounded,
+                            size: 40,
+                            color: BloomInk.text,
+                          )
+                          : const CircularProgressIndicator(),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              !_finished
+                  ? '正在移除 Wi-Fi'
+                  : _removed
+                  ? 'Wi-Fi 已移除'
+                  : '尚未确认移除',
+              style: BloomType.sectionTitle,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              !_finished
+                  ? widget.controller.progress
+                  : _removed
+                  ? widget.last
+                      ? '相框已确认移除「${widget.ssid}」。当前没有已保存网络，靠近相框可重新添加。'
+                      : '相框已确认移除「${widget.ssid}」。'
+                  : widget.controller.error ?? '未收到相框的移除确认，请重新连接后核对已保存网络。',
+              style: BloomType.body,
+            ),
+            if (_finished) ...[
+              const SizedBox(height: 24),
+              BloomPrimaryButton(
+                label: '知道了',
+                onPressed: () => Navigator.pop(context),
+              ),
+            ] else ...[
+              const SizedBox(height: 12),
+              const Text('请保持手机靠近相框。', style: BloomType.meta),
+            ],
+          ],
+        ),
+      ),
     ),
   );
 }
@@ -291,6 +428,13 @@ class _BloomFrameWifiAddPageState extends State<BloomFrameWifiAddPage>
           ),
           const SizedBox(height: 20),
           const Text('Wi-Fi 配置成功', style: BloomType.sectionTitle),
+          const SizedBox(height: 12),
+          Text(
+            c.serverCheckRequested
+                ? '相框已连接并保存此网络，已请求它检查服务器计划。屏幕按相框取得的计划更新，联网检查完成前请保持热点开启。'
+                : '相框已连接并保存此网络。即时联网检查尚未确认，下次计划唤醒时会重新连接；请保持热点开启。',
+            style: BloomType.body,
+          ),
           const SizedBox(height: 24),
           BloomPrimaryButton(
             label: '完成',
@@ -528,7 +672,7 @@ class _BloomFrameResetPageState extends State<BloomFrameResetPage> {
     final result =
         done
             ? '相框已重置，服务器已确认解绑，云端照片保留。'
-            : '尚未完成：${controller.error ?? '请重新连接继续'}。任务已保留，重新连接会从已完成的步骤继续。';
+            : '蓝牙接手未完成：${controller.error ?? '请重新连接继续'}。本次蓝牙尝试已停止，服务器任务仍保留；相框接手后才会执行重置。';
     controller.removeListener(progress);
     controller.dispose();
     if (_resetController == controller) _resetController = null;

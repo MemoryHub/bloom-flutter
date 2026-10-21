@@ -1813,7 +1813,7 @@ void main() {
 
       expect(selectedId, frame.deviceId);
       // No confirmed cache yet: never show this phone's picture as the frame.
-      expect(find.text('正在从设备拉取图片'), findsOneWidget);
+      expect(find.text('正在加载计划预览'), findsOneWidget);
       expect(find.text('登录后可查看此设备的照片'), findsNothing);
 
       await tester.tap(find.byKey(const ValueKey('bloom-device-switcher')));

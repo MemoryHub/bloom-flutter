@@ -136,31 +136,20 @@ class _BloomFrameSetupPageState extends State<BloomFrameSetupPage>
         setState(() => c.error = '请扫描相框或 App 中的设备二维码。');
         return;
       }
-      try {
-        final result = await widget.api.userRequest(
-          widget.token,
-          'device-invitations/join',
-          method: 'POST',
-          body: {'token': token},
-        );
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              '已加入${result['device_type'] == 'eink' ? '相框' : '小组件'}「${result['name'] ?? '设备'}」',
-            ),
-          ),
-        );
-        Navigator.pop(
-          context,
-          FrameSetupResult(
-            result['device_id'] as String,
-            result['name'] as String? ?? '设备',
-          ),
-        );
-      } catch (e) {
-        if (mounted) setState(() => c.error = frameSetupError(e));
-      }
+      final result = await joinBloomDeviceInvitation(
+        context,
+        widget.api,
+        widget.token,
+        raw,
+      );
+      if (!mounted || result == null) return;
+      Navigator.pop(
+        context,
+        FrameSetupResult(
+          result['device_id'] as String,
+          result['name'] as String? ?? '设备',
+        ),
+      );
     } catch (e) {
       if (mounted) setState(() => c.error = frameSetupError(e));
     } finally {
@@ -304,7 +293,11 @@ class _BloomFrameSetupPageState extends State<BloomFrameSetupPage>
                   style: style(14, color: muted),
                 ),
                 Text(
-                  c.busy ? '正在通过蓝牙连接这台相框。' : '请重新连接这台相框。',
+                  c.busy
+                      ? '正在确认相框状态并连接。'
+                      : c.error != null
+                      ? c.error!
+                      : '请重新连接这台相框。',
                   style: style(14, color: muted),
                 ),
               ],
@@ -368,7 +361,7 @@ class _BloomFrameSetupPageState extends State<BloomFrameSetupPage>
               ),
             ),
           ),
-        if (c.nearby.isEmpty && !c.scanning)
+        if (c.nearby.isEmpty && !c.scanning && !c.busy && c.error == null)
           Text(
             c.scannedCode != null
                 ? '尚未连接这台相框。请确认相框已开启，并靠近手机后重试。'

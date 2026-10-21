@@ -1,6 +1,6 @@
 # Bloom BLE provisioning bridge
 
-Android/iOS Flutter method channel using Espressif Security1. Wi-Fi credentials and PoP are passed in memory; bridge logging and persistence are disabled. `bloom-setup` carries device-scoped, nonce-bound server authorization. The bridge never uses the stock unauthenticated configuration endpoint.
+Android/iOS Flutter method channel using Espressif Security1. Wi-Fi credentials and PoP are passed in memory; credentials and handshake payloads are never logged or persisted. Android diagnostics contain only exception types/code locations, scan counts and a dummy-PoP serialization self-check. `bloom-setup` carries device-scoped, nonce-bound server authorization. The bridge never uses the stock unauthenticated configuration endpoint.
 
 - Android: API 23+, Java 11; Android 12+ Bluetooth scan/connect permission, earlier systems location permission. Official SDK source and provenance: `vendor/android/UPSTREAM.txt`.
 - iOS: iOS 14+, Swift 5; Bluetooth usage descriptions in the host app. Official SDK source and provenance: `ios/Vendor/UPSTREAM.txt`. Vendor files reside within the local podspec root so CocoaPods includes them in its compile sources.

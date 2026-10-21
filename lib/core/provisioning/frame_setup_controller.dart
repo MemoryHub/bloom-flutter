@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:bloom_provision/bloom_provision.dart';
@@ -66,6 +67,7 @@ String frameSetupError(Object error) {
     'frame_not_prepared' ||
     'provision_baseline_required' => '相框需要先完成电脑预装，请使用新版准备工具。',
     'frame_setup_in_progress' => '这台相框正在由另一台手机添加，请稍后再试。',
+    'frame_first_playback_in_progress' => '这台相框正在准备首次播放，请在原手机查看初始化进度，完成后再操作。',
     'firmware_update_in_progress' => '相框正在更新，完成后再连接 Wi-Fi。',
     'device_reset_in_progress' => '相框正在重置，请等待完成。',
     'reset_relay_unsupported' => '相框固件尚不支持手机协助重置，请先更新固件。',
@@ -78,6 +80,7 @@ String frameSetupError(Object error) {
     'wifi_failed' => '未能连接 Wi-Fi，请检查密码及 2.4 GHz 网络后重试。',
     'storage_failed' => '网络未能保存，请重试。已有网络会保留。',
     'network_full' => '已保存 6 个网络，请先移除一个不再使用的网络。',
+    'network_remove_failed' => '相框仍保存着这个 Wi-Fi，尚未确认移除，请重新连接后重试。',
     'device_not_found' => '暂未发现这台相框，请确认它已开机并靠近手机。',
     'setup_session_expired' || 'session_expired' => '连接已中断，请重新连接相框后继续。',
     'identity_verification_failed' ||
@@ -111,7 +114,106 @@ class FrameSetupController extends ChangeNotifier {
   final List<String> savedNetworks = [];
   bool _closed = false;
   int _generation = 0;
-  Timer? _rescan;
+  Timer? _rescan, _leaseTimer;
+  String? _setupAttempt;
+  String? _leaseDeviceId, _renewingAttempt;
+  DateTime? _leaseValidUntil;
+  bool _leaseLost = false;
+
+  Future<void> _endSetupAttempt({String? only}) async {
+    final attempt = _setupAttempt, id = _leaseDeviceId;
+    if (attempt == null || (only != null && attempt != only)) return;
+    _setupAttempt = null;
+    _leaseDeviceId = null;
+    _leaseValidUntil = null;
+    _leaseTimer?.cancel();
+    if (id != null) await _releaseAttempt(attempt, id);
+  }
+
+  Future<Map<String, dynamic>?> _reserveCredentials(
+    String selectedName,
+    int g,
+  ) async {
+    await _endSetupAttempt();
+    if (!_valid(g)) return null;
+    final random = Random.secure();
+    final attempt =
+        List.generate(
+          16,
+          (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0'),
+        ).join();
+    _setupAttempt = attempt;
+    final requestedAt = DateTime.now();
+    try {
+      final credentials = await api.userRequest(
+        token,
+        'frame-setup/${Uri.encodeComponent(selectedName)}/session',
+        method: 'POST',
+        body: {'attempt_id': attempt},
+      );
+      final id = credentials['device_id'] as String;
+      if (!_valid(g) || _setupAttempt != attempt) {
+        // Disposal can precede the response that grants the lease.
+        await _releaseAttempt(attempt, id);
+        return null;
+      }
+      _leaseDeviceId = id;
+      _leaseValidUntil = requestedAt.add(const Duration(seconds: 60));
+      _leaseLost = false;
+      _startLeaseHeartbeat(attempt, id);
+      return credentials;
+    } catch (_) {
+      await _endSetupAttempt(only: attempt);
+      rethrow;
+    }
+  }
+
+  Future<void> _releaseAttempt(String attempt, String id) async {
+    try {
+      await api
+          .userRequest(
+            token,
+            'devices/${Uri.encodeComponent(id)}/setup-lease/release',
+            method: 'POST',
+            body: {'attempt_id': attempt},
+          )
+          .timeout(const Duration(seconds: 3));
+    } catch (_) {
+      // A killed/offline phone cannot promise cleanup. The lease expires.
+    }
+  }
+
+  void _startLeaseHeartbeat(String attempt, String id) {
+    _leaseTimer?.cancel();
+    _leaseTimer = Timer.periodic(const Duration(seconds: 15), (_) async {
+      if (_closed || _setupAttempt != attempt || _renewingAttempt == attempt) {
+        return;
+      }
+      _renewingAttempt = attempt;
+      final requestedAt = DateTime.now();
+      try {
+        await api.userRequest(
+          token,
+          'devices/${Uri.encodeComponent(id)}/setup-lease/renew',
+          method: 'POST',
+          body: {'attempt_id': attempt},
+        );
+        if (!_closed && _setupAttempt == attempt) {
+          _leaseValidUntil = requestedAt.add(const Duration(seconds: 60));
+        }
+      } catch (e) {
+        if (!_closed &&
+            _setupAttempt == attempt &&
+            e is BloomApiException &&
+            e.statusCode == 409) {
+          _leaseLost = true;
+        }
+      } finally {
+        if (_renewingAttempt == attempt) _renewingAttempt = null;
+      }
+    });
+  }
+
   bool get managing => existingDeviceId != null;
   void _notify() {
     if (!_closed) notifyListeners();
@@ -171,11 +273,8 @@ class FrameSetupController extends ChangeNotifier {
     final g = _generation;
     _notify();
     try {
-      final credentials = await api.userRequest(
-        token,
-        'frame-setup/${Uri.encodeComponent(code.bleName)}',
-      );
-      if (!_valid(g)) return;
+      final credentials = await _reserveCredentials(code.bleName, g);
+      if (!_valid(g) || credentials == null) return;
       if (credentials['pop'] != code.pop ||
           (existingDeviceId != null &&
               credentials['device_id'] != existingDeviceId)) {
@@ -203,6 +302,7 @@ class FrameSetupController extends ChangeNotifier {
         error = frameSetupError(e);
         connected = false;
         await bridge.disconnect();
+        await _endSetupAttempt();
       }
     } finally {
       if (_valid(g)) {
@@ -222,11 +322,8 @@ class FrameSetupController extends ChangeNotifier {
     if (_closed) return;
     final g = _generation;
     try {
-      final credentials = await api.userRequest(
-        token,
-        'frame-setup/${Uri.encodeComponent(selectedName)}',
-      );
-      if (!_valid(g)) return;
+      final credentials = await _reserveCredentials(selectedName, g);
+      if (!_valid(g) || credentials == null) return;
       if (expectedPop != null && credentials['pop'] != expectedPop) {
         throw PlatformException(code: 'identity_mismatch');
       }
@@ -255,6 +352,7 @@ class FrameSetupController extends ChangeNotifier {
         error = frameSetupError(e);
         connected = false;
         await bridge.disconnect();
+        await _endSetupAttempt();
       }
     } finally {
       if (_valid(g)) {
@@ -398,18 +496,46 @@ class FrameSetupController extends ChangeNotifier {
     phase = 'wifi_connecting';
     _notify();
     final g = _generation;
+    final id = deviceId!;
+    String? attempt;
     try {
+      // Wi-Fi retries may follow a released failed attempt. Reserve again
+      // before issuing a new ticket, while the normal wizard keeps one lease.
+      if (_setupAttempt == null) {
+        final credentials = await _reserveCredentials(bleName!, g);
+        if (!_valid(g) || credentials == null) return;
+        attempt = _setupAttempt;
+        if (credentials['device_id'] != id ||
+            credentials['pop'] != _credentials?['pop']) {
+          throw PlatformException(code: 'identity_mismatch');
+        }
+      }
+      attempt = _setupAttempt;
+      if (attempt == null ||
+          _leaseLost ||
+          _leaseValidUntil == null ||
+          !DateTime.now().isBefore(_leaseValidUntil!)) {
+        throw PlatformException(code: 'setup_session_expired');
+      }
       final hello = await bridge.data({'op': 'hello'});
+      if (!_valid(g)) return;
       if (hello['device_id'] != deviceId) {
         throw PlatformException(code: 'identity_mismatch');
       }
+      final requestedAt = DateTime.now();
       final ticket = await api.userRequest(
         token,
         'devices/${Uri.encodeComponent(deviceId!)}/setup-ticket',
         method: 'POST',
-        body: {'nonce': hello['nonce'], 'action': 'wifi'},
+        body: {
+          'nonce': hello['nonce'],
+          'action': 'wifi',
+          'attempt_id': attempt,
+        },
       );
       if (!_valid(g)) return;
+      _leaseValidUntil = requestedAt.add(const Duration(seconds: 60));
+      _startLeaseHeartbeat(attempt, id);
       await bridge.data({
         'op': 'connect',
         'ssid': ssid,
@@ -421,6 +547,10 @@ class FrameSetupController extends ChangeNotifier {
       final started = DateTime.now();
       while (_valid(g) &&
           DateTime.now().difference(started) < const Duration(seconds: 150)) {
+        if (!claimed &&
+            (_leaseLost || !DateTime.now().isBefore(_leaseValidUntil!))) {
+          throw PlatformException(code: 'setup_session_expired');
+        }
         final status = await bridge.data({'op': 'status'});
         if (status['device_id'] != deviceId) {
           throw PlatformException(code: 'identity_mismatch');
@@ -428,9 +558,15 @@ class FrameSetupController extends ChangeNotifier {
         if (!_valid(g)) return;
         phase = status['phase'] as String? ?? 'service_connecting';
         _notify();
-        if (phase == 'wifi_failed' ||
-            phase == 'storage_failed' ||
-            phase == 'network_full') {
+        if (const {
+          'wifi_failed',
+          'wifi_auth_failed',
+          'wifi_not_found',
+          'wifi_ip_failed',
+          'storage_failed',
+          'network_full',
+          'playback_interrupted',
+        }.contains(phase)) {
           throw PlatformException(code: phase);
         }
         if (!claimed &&
@@ -442,6 +578,7 @@ class FrameSetupController extends ChangeNotifier {
             method: 'POST',
             body: {
               'name': name,
+              'attempt_id': attempt,
               'pairing_code': status['pairing_code'] ?? '000000',
               'first_playback_capable': true,
             },
@@ -449,6 +586,8 @@ class FrameSetupController extends ChangeNotifier {
           if (!_valid(g)) return;
           hasExistingPhotos = completedSetup['has_existing_photos'] == true;
           claimed = true;
+          _leaseTimer?.cancel();
+          _leaseLost = false;
           // Optional for older firmware/backends; it must not invalidate pairing.
           try {
             await FrameLocalAdmin(
@@ -484,6 +623,13 @@ class FrameSetupController extends ChangeNotifier {
         }
       }
     } finally {
+      if (_setupAttempt == attempt) {
+        _leaseTimer?.cancel();
+        _setupAttempt = null;
+        _leaseDeviceId = null;
+        _leaseValidUntil = null;
+      }
+      if (attempt != null) await _releaseAttempt(attempt, id);
       if (_valid(g)) {
         busy = false;
         _notify();
@@ -505,6 +651,8 @@ class FrameSetupController extends ChangeNotifier {
     } else {
       step = 0;
       connected = false;
+      _generation++;
+      unawaited(_endSetupAttempt());
       unawaited(bridge.disconnect());
     }
     error = null;
@@ -516,6 +664,8 @@ class FrameSetupController extends ChangeNotifier {
     _closed = true;
     _generation++;
     _rescan?.cancel();
+    _leaseTimer?.cancel();
+    unawaited(_endSetupAttempt());
     unawaited(bridge.disconnect());
     super.dispose();
   }

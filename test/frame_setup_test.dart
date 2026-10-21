@@ -107,6 +107,16 @@ class PendingScanBridge extends LocalBridge {
       ++scans == 1 ? first.future : super.scan();
 }
 
+class WifiFailureBridge extends LocalBridge {
+  WifiFailureBridge(this.failure);
+  final String failure;
+  @override
+  Future<Map<String, dynamic>> data(Map<String, dynamic> value) async {
+    final result = await super.data(value);
+    return value['op'] == 'status' ? {...result, 'phase': failure} : result;
+  }
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   const pop = '0123456789abcdef0123456789abcdef';
@@ -116,6 +126,8 @@ void main() {
     bool denied = false,
     bool hasPhotos = false,
     String? existing,
+    Future<void> Function(http.Request)? beforeSession,
+    Future<void> Function(http.Request)? beforeTicket,
   }) {
     final api = BloomApiClient(
       client: MockClient((request) async {
@@ -124,6 +136,9 @@ void main() {
           return http.Response(jsonEncode({'detail': 'device_not_owned'}), 403);
         }
         if (request.url.path.contains('frame-setup')) {
+          expect(request.method, 'POST');
+          expect(request.url.path, endsWith('/session'));
+          await beforeSession?.call(request);
           return http.Response(
             jsonEncode({
               'device_id': 'frame-one',
@@ -141,6 +156,7 @@ void main() {
           );
         }
         if (request.url.path.endsWith('setup-ticket')) {
+          await beforeTicket?.call(request);
           return http.Response(
             jsonEncode({
               'message': 'signed-session',
@@ -148,6 +164,9 @@ void main() {
             }),
             200,
           );
+        }
+        if (request.url.path.contains('/setup-lease/')) {
+          return http.Response(jsonEncode({'status': 'released'}), 200);
         }
         if (request.url.path.endsWith('complete-setup')) {
           bridge.claimed = true;
@@ -171,6 +190,195 @@ void main() {
     );
   }
 
+  test(
+    'naming holds a setup lease and going back releases its exact attempt',
+    () async {
+      final requests = <http.Request>[];
+      final c = controller(LocalBridge(), requests);
+      await c.select('BLOOM_001122334455');
+      expect(c.step, 1);
+      final first = jsonDecode(requests.single.body)['attempt_id'];
+      expect(first, matches(RegExp(r'^[a-f0-9]{32}$')));
+      c.back();
+      await Future<void>.delayed(Duration.zero);
+      expect(jsonDecode(requests.last.body)['attempt_id'], first);
+      expect(requests.last.url.path, endsWith('/setup-lease/release'));
+      await c.select('BLOOM_001122334455');
+      final sessions = requests.where((r) => r.url.path.endsWith('/session'));
+      expect(sessions.length, 2);
+      expect(jsonDecode(sessions.last.body)['attempt_id'], isNot(first));
+      c.dispose();
+      await Future<void>.delayed(Duration.zero);
+    },
+  );
+
+  test(
+    'late credential grant after disposal is released before BLE connection',
+    () async {
+      final pending = Completer<void>(), requested = Completer<void>();
+      final requests = <http.Request>[];
+      final bridge = LocalBridge();
+      final c = controller(
+        bridge,
+        requests,
+        beforeSession: (_) {
+          requested.complete();
+          return pending.future;
+        },
+      );
+      final operation = c.select('BLOOM_001122334455');
+      await requested.future;
+      c.dispose();
+      pending.complete();
+      await operation;
+      expect(bridge.messages, isEmpty);
+      expect(requests.length, 2);
+      expect(requests.last.url.path, endsWith('/setup-lease/release'));
+      expect(
+        jsonDecode(requests.last.body)['attempt_id'],
+        jsonDecode(requests.first.body)['attempt_id'],
+      );
+    },
+  );
+
+  testWidgets(
+    'lease heartbeat continues during naming before any Wi-Fi ticket',
+    (tester) async {
+      final requests = <http.Request>[];
+      final c = controller(LocalBridge(), requests);
+      await c.select('BLOOM_001122334455');
+      await tester.pump(const Duration(seconds: 15));
+      await tester.pump();
+      expect(c.step, 1);
+      expect(requests.any((r) => r.url.path.endsWith('setup-ticket')), isFalse);
+      final renewal = requests.singleWhere(
+        (r) => r.url.path.endsWith('/setup-lease/renew'),
+      );
+      expect(
+        jsonDecode(renewal.body)['attempt_id'],
+        jsonDecode(requests.first.body)['attempt_id'],
+      );
+      c.dispose();
+      await tester.pump();
+    },
+  );
+
+  test(
+    'Wi-Fi retries reserve a fresh session after a terminal failure',
+    () async {
+      final requests = <http.Request>[];
+      final c = controller(LocalBridge(failWifi: true), requests);
+      await c.select('BLOOM_001122334455');
+      await c.chooseName('Frame');
+      await c.connectWifi('Home', 'wrong');
+      await c.connectWifi('Home', 'another');
+      final sessions =
+          requests.where((r) => r.url.path.endsWith('/session')).toList();
+      final tickets =
+          requests.where((r) => r.url.path.endsWith('setup-ticket')).toList();
+      expect(sessions.length, 2);
+      expect(tickets.length, 2);
+      for (var i = 0; i < 2; i++) {
+        expect(
+          jsonDecode(tickets[i].body)['attempt_id'],
+          jsonDecode(sessions[i].body)['attempt_id'],
+        );
+      }
+      expect(
+        jsonDecode(sessions[0].body)['attempt_id'],
+        isNot(jsonDecode(sessions[1].body)['attempt_id']),
+      );
+      c.dispose();
+    },
+  );
+
+  test(
+    'late setup ticket after page disposal is released without BLE write',
+    () async {
+      final pending = Completer<void>();
+      final requested = Completer<void>();
+      final requests = <http.Request>[];
+      final bridge = LocalBridge();
+      final c = controller(
+        bridge,
+        requests,
+        beforeTicket: (_) {
+          requested.complete();
+          return pending.future;
+        },
+      );
+      await c.select('BLOOM_001122334455');
+      await c.chooseName('Frame');
+      final operation = c.connectWifi('Office', 'private-password');
+      await requested.future;
+      c.dispose();
+      await Future<void>.delayed(Duration.zero);
+      pending.complete();
+      await operation;
+      expect(bridge.messages.any((m) => m['op'] == 'connect'), isFalse);
+      final ticket =
+          jsonDecode(
+                requests
+                    .singleWhere((r) => r.url.path.endsWith('setup-ticket'))
+                    .body,
+              )
+              as Map;
+      final releases = requests.where(
+        (r) => r.url.path.endsWith('setup-lease/release'),
+      );
+      expect(releases.length, 2);
+      expect(
+        releases.every(
+          (r) =>
+              (jsonDecode(r.body) as Map)['attempt_id'] == ticket['attempt_id'],
+        ),
+        isTrue,
+      );
+    },
+  );
+
+  test(
+    'each terminal Wi-Fi failure releases only its own setup attempt',
+    () async {
+      for (final failure in [
+        'wifi_failed',
+        'wifi_auth_failed',
+        'wifi_not_found',
+        'wifi_ip_failed',
+      ]) {
+        final requests = <http.Request>[];
+        final c = controller(WifiFailureBridge(failure), requests);
+        await c.select('BLOOM_001122334455');
+        await c.chooseName('Frame');
+        await c.connectWifi('Office', 'private-password');
+        expect(c.completed, isFalse);
+        expect(c.busy, isFalse);
+        expect(c.phase, failure);
+        final grant =
+            jsonDecode(
+                  requests
+                      .singleWhere((r) => r.url.path.endsWith('setup-ticket'))
+                      .body,
+                )
+                as Map;
+        final release =
+            jsonDecode(
+                  requests
+                      .singleWhere(
+                        (r) => r.url.path.endsWith('setup-lease/release'),
+                      )
+                      .body,
+                )
+                as Map;
+        expect(release['attempt_id'], grant['attempt_id']);
+        expect(
+          requests.any((r) => r.url.path.endsWith('complete-setup')),
+          isFalse,
+        );
+        c.dispose();
+      }
+    },
+  );
   test(
     'new setup can finish a lost reset seal without local admin access',
     () async {
@@ -315,6 +523,35 @@ void main() {
       contains('开启手机蓝牙'),
     );
   });
+  test(
+    'QR checks cloud setup and playback occupancy before searching BLE',
+    () async {
+      for (final code in [
+        'frame_setup_in_progress',
+        'frame_first_playback_in_progress',
+      ]) {
+        final bridge = LocalBridge();
+        var scans = 0;
+        final api = BloomApiClient(
+          client: MockClient((request) async {
+            scans++;
+            return http.Response(jsonEncode({'detail': code}), 409);
+          }),
+        );
+        final c = FrameSetupController(api: api, token: 'test', bridge: bridge);
+        await c.recognizeQr(FrameSetupCode('BLOOM_001122334455', 'a' * 32));
+        expect(c.step, 0);
+        expect(c.connected, isFalse);
+        expect(
+          c.error,
+          contains(code == 'frame_setup_in_progress' ? '另一台手机' : '首次播放'),
+        );
+        expect(bridge.messages, isEmpty);
+        expect(scans, 1);
+        c.dispose();
+      }
+    },
+  );
   testWidgets(
     'scanner and found card stay enabled during an automatic rescan',
     (tester) async {

@@ -230,7 +230,7 @@ class _BloomFramePlaybackPageState extends State<BloomFramePlaybackPage> {
                           Text(
                             job?.percent != null
                                 ? '正在下载第一张照片 · ${job!.percent}%'
-                                : '正在下载第一张照片',
+                                : '正在连接图片下载，等待相框回报进度…',
                             style: const TextStyle(color: muted),
                           ),
                         ],

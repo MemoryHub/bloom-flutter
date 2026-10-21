@@ -20,8 +20,8 @@ void main() {
     readToken: (key) async => secure[key],
     writeToken: (key, value) async => secure[key] = value,
     // 记下镜像调用，用来钉住"什么时候该把令牌交给原生小组件"。
-    mirrorToWidget: (deviceId, deviceToken) async =>
-        mirrored?.add([deviceId, deviceToken]),
+    mirrorToWidget:
+        (deviceId, deviceToken) async => mirrored?.add([deviceId, deviceToken]),
     // 默认没有原生侧稳定身份（widget 测试里没有平台通道）。
     stableCredentials: stable ?? () async => null,
   );
@@ -96,7 +96,10 @@ void main() {
     final secure = <String, String>{};
     final repository = build(secure);
     final local = await repository.initialize();
-    await repository.saveIssued(deviceId: local.deviceId, deviceToken: 'f' * 64);
+    await repository.saveIssued(
+      deviceId: local.deviceId,
+      deviceToken: 'f' * 64,
+    );
 
     await repository.clear();
 
@@ -114,7 +117,10 @@ void main() {
     final secure = <String, String>{};
     final repository = build(secure);
     final before = await repository.initialize();
-    await repository.saveIssued(deviceId: before.deviceId, deviceToken: 'f' * 64);
+    await repository.saveIssued(
+      deviceId: before.deviceId,
+      deviceToken: 'f' * 64,
+    );
 
     await repository.clear();
     final after = await repository.initialize();
@@ -158,7 +164,10 @@ void main() {
     final mirrored = <List<String>>[];
     final repository = build(<String, String>{}, mirrored: mirrored);
     final local = await repository.initialize();
-    await repository.saveIssued(deviceId: local.deviceId, deviceToken: 'f' * 64);
+    await repository.saveIssued(
+      deviceId: local.deviceId,
+      deviceToken: 'f' * 64,
+    );
 
     await repository.clear();
 
@@ -172,13 +181,15 @@ void main() {
     // 设备名、历史都在。
     SharedPreferences.setMockInitialValues({});
     final secure = <String, String>{};
-    final result = await build(
-      secure,
-      stable: () async => {
-        'deviceId': 'bloom-mobile-from-native',
-        'deviceToken': 'a' * 64,
-      },
-    ).initialize();
+    final result =
+        await build(
+          secure,
+          stable:
+              () async => {
+                'deviceId': 'bloom-mobile-from-native',
+                'deviceToken': 'a' * 64,
+              },
+        ).initialize();
 
     expect(result.deviceId, 'bloom-mobile-from-native');
   });
@@ -189,10 +200,11 @@ void main() {
     // 稳定性是加分项，不是启动的前提。
     SharedPreferences.setMockInitialValues({});
     final secure = <String, String>{};
-    final result = await build(
-      secure,
-      stable: () async => throw StateError('平台通道还没装上'),
-    ).initialize();
+    final result =
+        await build(
+          secure,
+          stable: () async => throw StateError('平台通道还没装上'),
+        ).initialize();
 
     expect(result.deviceId, startsWith('bloom-mobile-'));
     expect(result.deviceToken.length, 64);
@@ -201,15 +213,77 @@ void main() {
   test('已存的 ID 优先于原生侧（登出/重启都要复用同一个）', () async {
     SharedPreferences.setMockInitialValues({'bloom.device_id': 'stored-id'});
     final secure = {'bloom.device_token': 'b' * 64};
-    final result = await build(
-      secure,
-      stable: () async => {
-        'deviceId': 'bloom-mobile-from-native',
-        'deviceToken': 'c' * 64,
-      },
-    ).initialize();
+    final result =
+        await build(
+          secure,
+          stable:
+              () async => {
+                'deviceId': 'bloom-mobile-from-native',
+                'deviceToken': 'c' * 64,
+              },
+        ).initialize();
 
     expect(result.deviceId, 'stored-id');
     expect(result.deviceToken, 'b' * 64);
+  });
+
+  const unsafeId = 'bloom-mobile-f2fbb3dc522950761a02bcb0f89b77fe';
+  const publicSecret =
+      '836c2ff4a260473a6cfa77729cc91c6a80e936773e0247f73970712ee3fa7c72';
+
+  test('零安卓标识不能用于后台读图或认领前绘制旧缓存', () async {
+    SharedPreferences.setMockInitialValues({
+      'bloom.device_id': unsafeId,
+      'bloom.device_token_issued': true,
+    });
+    final repository = build({'bloom.device_token': 'b' * 64});
+    expect(await repository.read(), isNull);
+    expect(await repository.hasServerToken(), isFalse);
+    // 保留旧 ID 仅用于已登录账号向服务端兑换独立记录。
+    expect((await repository.initialize()).deviceId, unsafeId);
+    await repository.saveIssued(
+      deviceId: 'bloom-mobile-repaired-grandma',
+      deviceToken: 'c' * 64,
+    );
+    expect(
+      (await repository.read())!.deviceId,
+      'bloom-mobile-repaired-grandma',
+    );
+    expect(await repository.hasServerToken(), isTrue);
+  });
+
+  test('原生通道仍返回公共零身份时不接受这份身份或凭据', () async {
+    SharedPreferences.setMockInitialValues({});
+    final repository = build(
+      {},
+      stable: () async => {'deviceId': unsafeId, 'deviceToken': publicSecret},
+    );
+    expect((await repository.initialize()).deviceId, isNot(unsafeId));
+    expect(await repository.installClaimSecret(), isNot(publicSecret));
+  });
+
+  test('已存公共认领凭据更换为本安装私有凭据并持久化', () async {
+    SharedPreferences.setMockInitialValues({});
+    final secure = {'bloom.install_claim_secret': publicSecret};
+    final repository = build(secure);
+    final first = await repository.installClaimSecret();
+    expect(first, isNot(publicSecret));
+    expect(first.length, 64);
+    expect(await repository.installClaimSecret(), first);
+  });
+
+  test('同样零安卓标识的两个安装得到不同身份与凭据', () async {
+    Future<Map<String, String>?> oldNative() async => {
+      'deviceId': unsafeId,
+      'deviceToken': publicSecret,
+    };
+    SharedPreferences.setMockInitialValues({});
+    final a = build({}, stable: oldNative);
+    final idA = (await a.initialize()).deviceId;
+    final secretA = await a.installClaimSecret();
+    SharedPreferences.setMockInitialValues({});
+    final b = build({}, stable: oldNative);
+    expect((await b.initialize()).deviceId, isNot(idA));
+    expect(await b.installClaimSecret(), isNot(secretA));
   });
 }

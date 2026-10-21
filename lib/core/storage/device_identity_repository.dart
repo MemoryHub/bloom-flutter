@@ -34,6 +34,27 @@ class DeviceIdentityRepository {
   static const _deviceTokenKey = 'bloom.device_token';
   static const _identityVersionKey = 'bloom.identity_version';
   static const _serverTokenKey = 'bloom.device_token_issued';
+  // Historical IDs produced by missing/placeholder ANDROID_ID values. The
+  // server exchanges them for separate account records; never use them to fetch
+  // photos or paint cached content before that authenticated exchange.
+  static const _unsafeDeviceIds = {
+    'bloom-mobile-6d232e0cc5ef640b47be5f0d4e165ca9',
+    'bloom-mobile-319919c35df54bf52e7b953d4336e0c0',
+    'bloom-mobile-ac6f77ceea71190a672ae281af552ba0',
+    'bloom-mobile-81a7d379b96476bf78ab3f0823d9fb68',
+    'bloom-mobile-f2fbb3dc522950761a02bcb0f89b77fe',
+    'bloom-mobile-20ffb07fb43a20201d0b8e3a5f3d0ffc',
+    'bloom-mobile-4bb4da93b0ea3798089de4e5d4df7e6d',
+  };
+  static const _unsafeClaimSecrets = {
+    '4ab674d1167e36b6601e398da23a1435a7cdeeb8afdca0a8270fe05c63868e95',
+    '434162c7c597a653d1edf0d61cd2c8049ecd6bdc2b1242934cdb56eeea6c9385',
+    '42b6ad32ba1685a5a5962188d7be879507bc1d69527203662ae78f835e586f7a',
+    'af22cdb8e37f258d100887185e2b5c88491c89ba7e054182e3bd0090beef3053',
+    '836c2ff4a260473a6cfa77729cc91c6a80e936773e0247f73970712ee3fa7c72',
+    '4a0e1eb85b09b7e61f81c44b56872c0bbc83f27c71e8e06970455e3dfdfbd548',
+    '39f85c1d6c418dc9cdf8e3abd49e3fcb31169613218ce701a5756ff1a34b7047',
+  };
   SharedPreferences? _preferences;
   final FlutterSecureStorage _secureStorage;
   final Future<String?> Function(String key)? _readToken;
@@ -55,7 +76,12 @@ class DeviceIdentityRepository {
     final token =
         await (_readToken?.call(_deviceTokenKey) ??
             _secureStorage.read(key: _deviceTokenKey));
-    if (id == null || token == null || token.length < 32) return null;
+    if (id == null ||
+        _unsafeDeviceIds.contains(id) ||
+        token == null ||
+        token.length < 32) {
+      return null;
+    }
     return DeviceCredentials(deviceId: id, deviceToken: token);
   }
 
@@ -117,7 +143,9 @@ class DeviceIdentityRepository {
   /// 问原生侧要稳定的设备身份。**任何失败都返回 null**（见 [initialize]）。
   Future<Map<String, String>?> _stableCredentials() async {
     try {
-      return await _stableCredentialsOf();
+      final value = await _stableCredentialsOf();
+      if (_unsafeDeviceIds.contains(value?['deviceId'])) return null;
+      return value;
     } catch (_) {
       // 平台通道还没装上、或原生侧拒绝了。退回随机，启动照常。
       return null;
@@ -133,11 +161,19 @@ class DeviceIdentityRepository {
     const key = 'bloom.install_claim_secret';
     final saved =
         await (_readToken?.call(key) ?? _secureStorage.read(key: key));
-    if (saved != null && saved.length >= 32) return saved;
+    if (saved != null &&
+        saved.length >= 32 &&
+        !_unsafeClaimSecrets.contains(saved)) {
+      return saved;
+    }
     final stable = await _stableCredentials();
     final secret = stable?['deviceToken'];
     final value =
-        secret != null && secret.length >= 32 ? secret : _randomHex(32);
+        secret != null &&
+                secret.length >= 32 &&
+                !_unsafeClaimSecrets.contains(secret)
+            ? secret
+            : _randomHex(32);
     await (_writeToken?.call(key, value) ??
         _secureStorage.write(key: key, value: value));
     return value;
@@ -176,8 +212,11 @@ class DeviceIdentityRepository {
   /// 用来回答"要不要再调一次认领接口"：注册那一刻服务端还在异步建 Immich
   /// 用户，登录响应里必然没有设备令牌，所以那一次必须补。没有这个标记的话，
   /// 客户端只能盲目地每次刷新都去认领一遍，而每次认领都会换一枚新令牌。
-  Future<bool> hasServerToken() async =>
-      (await _prefs).getBool(_serverTokenKey) ?? false;
+  Future<bool> hasServerToken() async {
+    final prefs = await _prefs;
+    return !_unsafeDeviceIds.contains(prefs.getString(_deviceIdKey)) &&
+        (prefs.getBool(_serverTokenKey) ?? false);
+  }
 
   /// 保存服务端下发的设备令牌，并镜像给原生侧。
   ///

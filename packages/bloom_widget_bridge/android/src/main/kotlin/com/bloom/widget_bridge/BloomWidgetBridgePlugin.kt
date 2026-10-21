@@ -161,6 +161,14 @@ class BloomWidgetBridgePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             }
             "stableDeviceCredentials" -> {
                 val androidId = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+                if (!BloomInstallIdentity.usableAndroidId(androidId)) {
+                    try {
+                        result.success(BloomInstallIdentity.credentials(context.noBackupFilesDir))
+                    } catch (error: Exception) {
+                        result.error("identity_storage_unavailable", "Unable to save installation identity", null)
+                    }
+                    return
+                }
                 val identity = sha256("bloom-device-id-v2:$androidId")
                 val token = sha256("bloom-device-token-v2:$androidId")
                 result.success(mapOf(

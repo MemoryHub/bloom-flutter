@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.Activity;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.le.ScanResult;
+import android.bluetooth.le.ScanSettings;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
@@ -49,6 +50,11 @@ public final class BloomProvisionPlugin implements FlutterPlugin, ActivityAware,
         channel=new MethodChannel(binding.getBinaryMessenger(),"bloom/provision");
         channel.setMethodCallHandler(this);
         EventBus.getDefault().register(this);
+        // Local first-message check uses a dummy PoP and never touches BLE.
+        try {
+            byte[] request = new com.espressif.provisioning.security.Security1("bloom-local-self-check").getNextRequestInSession(null);
+            android.util.Log.i("BloomProvision", "local_security1_first_request="+(request!=null && request.length>0));
+        } catch(Exception e) { logSessionFailure(e); }
     }
     @Override public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
         close();channel.setMethodCallHandler(null);EventBus.getDefault().unregister(this);
@@ -65,6 +71,13 @@ public final class BloomProvisionPlugin implements FlutterPlugin, ActivityAware,
             MethodChannel.Result result=pending;pending=null;pendingOperation=null;
             if(error==null)result.success(data);else result.error(error,error,null);
         });
+    }
+    private static void logSessionFailure(Exception e) {
+        android.util.Log.w("BloomProvision","session_failed type="+e.getClass().getSimpleName());
+        for(StackTraceElement frame:e.getStackTrace())
+            android.util.Log.w("BloomProvision","session_frame "+frame.toString());
+        if(e.getCause() instanceof Exception && e.getCause()!=e)
+            logSessionFailure((Exception)e.getCause());
     }
     private void close(){generation++;if(scanner!=null)scanner.stopScan();if(selected!=null)selected.disconnectDevice();selected=null;
         if(pending!=null){pending.error("cancelled","cancelled",null);pending=null;}pendingOperation=null;}
@@ -127,6 +140,7 @@ public final class BloomProvisionPlugin implements FlutterPlugin, ActivityAware,
         scanner=new BleScanner(context,"BLOOM_",new BleScanListener(){
             public void scanStartFailed(){finish(null,"bluetooth_off",current);}
             public void onPeripheralFound(BluetoothDevice device,ScanResult scan){
+                if(current!=generation || !"scan".equals(pendingOperation))return;
                 String name=scan.getScanRecord()==null?null:scan.getScanRecord().getDeviceName();
                 if(name==null || !name.matches("BLOOM_[A-F0-9]{12}"))return;
                 devices.put(name,device);Map<String,Object> item=new HashMap<>();item.put("ble_name",name);item.put("rssi",scan.getRssi());
@@ -134,16 +148,25 @@ public final class BloomProvisionPlugin implements FlutterPlugin, ActivityAware,
                 item.put("busy",manufacturer!=null && manufacturer.length==1 && manufacturer[0]==1);
                 found.put(name,item);
             }
-            public void scanCompleted(){finish(new ArrayList<>(found.values()),null,current);}
+            public void scanCompleted(){
+                if(current!=generation || !"scan".equals(pendingOperation))return;
+                android.util.Log.i("BloomProvision","scan_completed count="+found.size());
+                finish(new ArrayList<>(found.values()),null,current);
+            }
             public void onFailure(Exception e){finish(null,"scan_failed",current);}
-        });scanner.startScan();
+        });scanner.startScan(new ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build());
     }
     @Subscribe(threadMode=ThreadMode.MAIN) public void onDeviceConnection(DeviceConnectionEvent event){
         if(!"connect".equals(pendingOperation) || selected==null || !selected.ownsConnectionEvent(event))return;final int current=generation;
         if(event.getEventType()==ESPConstants.EVENT_DEVICE_CONNECTED && selected!=null){
             selected.initSession(new ResponseListener(){
                 public void onSuccess(byte[] data){finish(true,null,current);}
-                public void onFailure(Exception e){finish(null,"identity_verification_failed",current);}
+                public void onFailure(Exception e){
+                    // Only exception types and code locations: never log the
+                    // message, handshake bytes, QR contents or credentials.
+                    logSessionFailure(e);
+                    finish(null,"identity_verification_failed",current);
+                }
             });
         }else finish(null,"connection_failed",current);
     }
